@@ -121,19 +121,18 @@ functions with no network dependency and the highest cost-of-being-wrong.
    re-signs every `POLL_STATE_REPREPARE_INTERVAL_SECS` for as long as it's
    armed, since its arm-to-trigger window is unbounded and a single
    prepare at arm time could go stale for minutes or hours.
-7. **A transaction that lands on-chain but reverts is still reported as a
-   success.** `fire_prepared`'s `.watch()` call only waits for inclusion in
-   a block, not execution status — a `send_raw_transaction` rejection
-   (stale nonce, `maxFeePerGas` below current base fee) surfaces correctly
-   as a per-wallet failure with the real RPC error string, but a tx that's
-   included and then reverts (wrong calldata, an on-chain state change
-   between prepare and inclusion, etc.) currently gets logged as `mint
-   confirmed` / `success: true`. Pre-dates the prepare/fire split — the
-   original `fire_all_wallets` had the same gap. Noticed while tracing
-   failure-visibility for the prepare/fire split; not fixed here since it
-   wasn't part of that task and touches result-reporting semantics beyond
-   it — flagging per this repo's own convention of surfacing gaps rather
-   than working around them silently.
+7. ~~A transaction that lands on-chain but reverts was reported as a
+   success.~~ Fixed — see git history. `fire_prepared` now calls
+   `.get_receipt()` instead of `.watch()` and checks the receipt's
+   `status()` (EVM semantics: `1`/`true` = success, `0`/`false` =
+   reverted) before reporting `MintResult { success: true }`. A revert
+   reports `success: false` with the tx hash, block number, and gas used
+   in `detail` — no revert-reason decoding (would need an extra `eth_call`
+   trace replay; out of scope, "false success" was the bug, not missing
+   diagnostics). The extra `eth_getTransactionReceipt` call this adds
+   happens after `send_raw_transaction` has already dispatched the bytes,
+   in the same post-dispatch wait `.watch()` was already doing — nothing
+   added to the broadcast/dispatch step itself.
 
 ## Explicitly out of scope
 

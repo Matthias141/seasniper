@@ -5,7 +5,7 @@ use alloy::eips::eip2718::Encodable2718;
 use alloy::network::{EthereumWallet, TransactionBuilder};
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::{Provider, ProviderBuilder, ReqwestProvider};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use rand::Rng;
@@ -233,18 +233,33 @@ pub async fn fire_prepared(
             // base fee" is exactly what someone watching the control deck
             // needs to see, per wallet, not an arbitrary single provider's
             // opinion when providers disagree on why it failed.
+            //
+            // get_receipt() (not watch()) deliberately: watch() only
+            // confirms inclusion in a block, not execution status, so a
+            // transaction that lands but reverts (insufficient payment,
+            // maxTotalMintable already hit, drop ended between prepare and
+            // fire, ...) was being reported as success — the single most
+            // important number this tool reports being wrong. This is one
+            // more RPC call than watch() makes, but it happens here, after
+            // send_raw_transaction has already dispatched the bytes and
+            // we're already waiting on confirmation either way — nothing
+            // is added to the actual broadcast/dispatch step itself.
             let sends = providers.iter().enumerate().map(|(i, provider)| {
                 let raw_tx = raw_tx.clone();
                 async move {
                     // Inner block explicitly typed as anyhow::Result so `?`
                     // has one concrete error type to convert both
-                    // send_raw_transaction's and watch()'s errors into;
-                    // the index is attached after, on the way out, since
-                    // neither of those error types otherwise unify with
-                    // (usize, anyhow::Error) directly.
-                    let result: Result<TxHash, anyhow::Error> = async {
-                        let tx_hash = provider.send_raw_transaction(&raw_tx).await?.watch().await?;
-                        Ok(tx_hash)
+                    // send_raw_transaction's and get_receipt()'s errors
+                    // into; the index is attached after, on the way out,
+                    // since neither of those error types otherwise unify
+                    // with (usize, anyhow::Error) directly.
+                    let result: Result<TransactionReceipt, anyhow::Error> = async {
+                        let receipt = provider
+                            .send_raw_transaction(&raw_tx)
+                            .await?
+                            .get_receipt()
+                            .await?;
+                        Ok(receipt)
                     }
                     .await;
                     result.map_err(|e| (i, e))
@@ -253,7 +268,8 @@ pub async fn fire_prepared(
 
             let results = join_all(sends).await;
 
-            if let Some(tx_hash) = results.iter().find_map(|r| r.as_ref().ok().copied()) {
+            if let Some(receipt) = results.iter().find_map(|r| r.as_ref().ok()) {
+                let tx_hash = receipt.transaction_hash;
                 // The RPC's returned hash should always equal the hash
                 // computed at prepare time — raw_tx fully determines it,
                 // nothing about broadcast can change it. A mismatch would
@@ -263,12 +279,35 @@ pub async fn fire_prepared(
                 if tx_hash != expected_hash {
                     error!(%address, %tx_hash, %expected_hash, "broadcast tx hash does not match the one computed at prepare time");
                 }
-                info!(%address, %tx_hash, "mint confirmed");
-                let _ = bus.send(ServerEvent::MintResult {
-                    address: format!("{address:#x}"),
-                    success: true,
-                    detail: format!("{tx_hash:#x}"),
-                });
+
+                if receipt.status() {
+                    info!(%address, %tx_hash, "mint confirmed");
+                    let _ = bus.send(ServerEvent::MintResult {
+                        address: format!("{address:#x}"),
+                        success: true,
+                        detail: format!("{tx_hash:#x}"),
+                    });
+                } else {
+                    // Included, but reverted. Not a broadcast failure —
+                    // every RPC accepted it — so it doesn't belong in the
+                    // "no reason attached" aggregation below; it's a
+                    // distinct, confirmed-on-chain outcome. No revert-
+                    // reason decoding here (would need an extra eth_call
+                    // trace replay); block number + gas used is enough to
+                    // confirm "this really happened" without a whole
+                    // subsystem for why.
+                    let detail = format!(
+                        "reverted on-chain — tx {tx_hash:#x}, block {}, gas used {}",
+                        receipt.block_number.map_or("?".to_string(), |b| b.to_string()),
+                        receipt.gas_used,
+                    );
+                    error!(%address, %tx_hash, "mint tx included but reverted");
+                    let _ = bus.send(ServerEvent::MintResult {
+                        address: format!("{address:#x}"),
+                        success: false,
+                        detail,
+                    });
+                }
             } else {
                 let detail = results
                     .iter()
