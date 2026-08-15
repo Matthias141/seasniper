@@ -335,3 +335,41 @@ fn apply_pct_jitter(value: u128, pct: i64) -> u128 {
     let delta = (value as i128 * pct as i128) / 100;
     (value as i128 + delta).max(0) as u128
 }
+
+#[cfg(test)]
+mod tests {
+    use super::apply_pct_jitter;
+
+    #[test]
+    fn zero_jitter_is_a_noop() {
+        assert_eq!(apply_pct_jitter(1_000_000, 0), 1_000_000);
+        assert_eq!(apply_pct_jitter(0, 0), 0);
+    }
+
+    #[test]
+    fn positive_jitter_increases_by_percent() {
+        assert_eq!(apply_pct_jitter(1_000_000, 8), 1_080_000);
+        // +100% doubles it — the boundary where delta equals the base value.
+        assert_eq!(apply_pct_jitter(1_000_000, 100), 2_000_000);
+    }
+
+    #[test]
+    fn negative_jitter_decreases_by_percent() {
+        assert_eq!(apply_pct_jitter(1_000_000, -8), 920_000);
+        // -100% is the boundary where delta exactly cancels the base value.
+        assert_eq!(apply_pct_jitter(1_000_000, -100), 0);
+    }
+
+    #[test]
+    fn negative_jitter_never_produces_a_negative_gas_value() {
+        // Anything more negative than -100% must saturate at 0, not
+        // underflow/wrap. This function returns u128 specifically to feed
+        // maxPriorityFeePerGas — a wrapped-around near-u128::MAX value from
+        // an unsigned underflow here is exactly the kind of bug that burns
+        // real money on a live mint, not a theoretical concern.
+        assert_eq!(apply_pct_jitter(1_000_000, -150), 0);
+        assert_eq!(apply_pct_jitter(1_000_000, -1_000), 0);
+        assert_eq!(apply_pct_jitter(0, -100), 0);
+        assert_eq!(apply_pct_jitter(0, -1_000), 0);
+    }
+}

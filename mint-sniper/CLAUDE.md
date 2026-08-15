@@ -81,6 +81,7 @@ only cross the API boundary, by design (see api.rs's doc comment).
 # Backend
 cargo build              # first thing to run in a new session
 cargo check               # faster iteration once building works
+cargo test                 # calldata encoding + gas jitter math
 cargo run                 # starts bot + API on 127.0.0.1:4117
 
 # Frontend
@@ -91,10 +92,14 @@ npm run typecheck
 npm run build               # outputs ui/dist/
 ```
 
-No test suite exists yet. If you add one: unit-test calldata encoding
-(`encode_mint_calldata`/`encode_selector_only` in main.rs) and the gas
-jitter math (`apply_pct_jitter` in executor.rs) first — those are pure
-functions with no network dependency and the highest cost-of-being-wrong.
+Test suite covers calldata encoding (`encode_mint_calldata`/
+`encode_selector_only` in main.rs, `seadrop::encode_mint_public`) and gas
+jitter math (`apply_pct_jitter` in executor.rs) — `cargo test`. Encoding
+tests assert byte-identical output against independently-built expected
+calldata (real mainnet addresses/selectors, cross-checked outside the
+crate — see each test's comment), not just "doesn't panic." Jitter tests
+cover zero/positive/negative/over-negative boundaries and confirm it
+can't produce a negative (wrapped) gas value.
 
 ## Known gaps (fix before relying on this for a real mint)
 
@@ -103,17 +108,40 @@ functions with no network dependency and the highest cost-of-being-wrong.
    below, `RpcHealth` unconstructed). If drift resurfaces after a
    dependency bump, same rule as before: fix in place, don't rewrite
    around it unless a function genuinely no longer exists.
-2. **`mempool_watch` trigger mode is not implemented** — `watcher.rs` only
-   has `run_state_poll_watcher` and `run_timestamp_watcher`. Selecting it
-   in config currently falls through to poll_state in `control_loop`.
-3. **RPC health is a type stub.** `ServerEvent::RpcHealth` exists and the
-   UI renders it, but nothing on the Rust side pings RPC latency and emits
-   it. The UI's "LINK OK/NO LINK" pill only reflects the browser's own
-   WebSocket connection to the bot, not per-provider RPC health.
+2. ~~`mempool_watch` trigger mode was not implemented (silent fallthrough
+   to poll_state).~~ Fixed — see git history. `watcher::run_mempool_watcher`
+   subscribes via `Provider::subscribe_full_pending_transactions` and
+   fires on a pending (pre-confirmation) tx from `mint_enable_admin` to
+   the watched contract. **Scope note, not a full implementation of every
+   possible interpretation:** matches on (from, to) address pair only, not
+   on decoding which function is being called — see the doc comment on
+   `run_mempool_watcher` for why (SeaDrop's `updatePublicDrop` is called
+   by the nft contract itself, not directly by a human admin, so there's
+   no single reliable selector to match on across projects either way).
+   Needs a WebSocket RPC with full mempool visibility (Geth 1.11+); many
+   free/public RPCs don't expose this even over WS — arming fails loudly
+   (auto-disarm + a clear error) rather than silently watching nothing if
+   the subscription isn't supported. Any unrecognized `trigger_mode`
+   string, or `mempool_watch` with `mint_enable_admin` unset/invalid, also
+   now logs an error and falls back to poll_state instead of silently
+   doing so with no warning.
+3. ~~RPC health was a type stub — nothing pinged it.~~ Fixed — see git
+   history. `rpc_health_poll_loop` in main.rs pings every configured HTTP
+   RPC every 15s (`eth_blockNumber`, same cadence as `balance_poll_loop`)
+   and emits `ServerEvent::RpcHealth` per endpoint with round-trip
+   latency. Confirmed (not assumed) that this makes the `RpcHealth`
+   unused-variant warning disappear — `cargo build`/`cargo check` produce
+   zero warnings as of this fix.
 4. **No auth on the control API.** Binds to `127.0.0.1` only, on purpose.
    If you ever need remote access, put it behind Tailscale/SSH tunnel —
    do not change the bind address to `0.0.0.0` without adding auth first.
-5. **No test coverage at all.** See "Commands" above for where to start.
+5. ~~No test coverage at all.~~ Partially fixed — see git history and
+   "Commands" above. Calldata encoding and gas jitter math are covered
+   (the two things this note originally pointed at as highest
+   cost-of-being-wrong). Everything else — watcher trigger logic, the
+   prepare/fire split, the control_loop state machine, the API routes —
+   still has zero coverage; those need integration-style tests (mock RPC
+   or testnet) rather than the pure-function unit tests added here.
 6. ~~Pre-signing was fetching gas price once at arm-time and never
    revisiting it.~~ Fixed — see git history. `timestamp` mode still signs
    once, `PREPARE_LEAD_SECS` before the known trigger instant (bounded,

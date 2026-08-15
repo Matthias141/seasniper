@@ -612,3 +612,56 @@ fn encode_selector_only(signature: &str) -> Result<Vec<u8>> {
     let func = Function::parse(signature).context("parsing state fn signature")?;
     Ok(func.selector().to_vec())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_mint_calldata_matches_known_good_calldata() {
+        let calldata = encode_mint_calldata("mint(uint256)", &["1".to_string()]).unwrap();
+
+        // Built independently of encode_mint_calldata's own logic — plain
+        // byte concatenation, not a round-trip through the same encoder
+        // being tested.
+        //
+        // Selector: keccak256("mint(uint256)")[..4] = 0xa0712d68 — this is
+        // one of the most widely-referenced function selectors in the NFT
+        // space (mint(uint256) is an extremely common signature), and it's
+        // also cross-checked independently via alloy::primitives::keccak256
+        // in a standalone scratch binary (see step 4c's report), not just
+        // trusted from memory.
+        let mut expected: Vec<u8> = vec![0xa0, 0x71, 0x2d, 0x68];
+        expected.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+
+        assert_eq!(calldata, expected);
+        assert_eq!(calldata.len(), 4 + 32);
+    }
+
+    #[test]
+    fn encode_mint_calldata_encodes_multiple_args_in_order() {
+        // Two uint256 args, to catch an arg-ordering bug that a
+        // single-argument test can't — coerce_str/DynSolType encoding
+        // could accidentally swap or misalign args and a 1-arg test would
+        // still pass.
+        let calldata =
+            encode_mint_calldata("mint(uint256,uint256)", &["1".to_string(), "2".to_string()])
+                .unwrap();
+
+        // keccak256("mint(uint256,uint256)")[..4] = 0x1b2ef1ca, computed and
+        // cross-checked independently the same way as the selector above.
+        let mut expected: Vec<u8> = vec![0x1b, 0x2e, 0xf1, 0xca];
+        expected.extend_from_slice(&U256::from(1u64).to_be_bytes::<32>());
+        expected.extend_from_slice(&U256::from(2u64).to_be_bytes::<32>());
+
+        assert_eq!(calldata, expected);
+    }
+
+    #[test]
+    fn encode_selector_only_matches_known_selector() {
+        // keccak256("mintActive()")[..4] = 0x25fd90f3, cross-checked
+        // independently the same way as the selectors above.
+        let sel = encode_selector_only("mintActive()").unwrap();
+        assert_eq!(sel, vec![0x25, 0xfd, 0x90, 0xf3]);
+    }
+}

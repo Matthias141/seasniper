@@ -151,3 +151,39 @@ pub fn encode_mint_public(
     ];
     Ok(func.abi_encode_input(&values)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_mint_public_matches_known_good_calldata() {
+        // Real mainnet SeaDrop collection — EVERYBODYS, verified against
+        // getPublicDrop on-chain in step 2's audit (see git history for
+        // that verification's full trace against an independent manual
+        // ABI decode). Fee recipient is OpenSea's documented common
+        // default, also from config.example.toml.
+        let nft_contract: Address = "0x603a481580c8Cf85ee169b315653bd9D33C39e52".parse().unwrap();
+        let fee_recipient: Address = "0x0000a26b00c1F0DF003000390027140000fAa719".parse().unwrap();
+        let quantity = 3u64;
+
+        let calldata = encode_mint_public(nft_contract, fee_recipient, quantity).unwrap();
+
+        // Built independently of encode_mint_public's own logic — plain
+        // byte concatenation against the ABI spec, not a round-trip
+        // through the same encoder being tested.
+        //
+        // Selector: keccak256("mintPublic(address,address,address,uint256)")[..4]
+        // = 0x161ac21f, computed and cross-checked independently via
+        // alloy::primitives::keccak256 in a standalone scratch binary
+        // (see step 4c's report) rather than trusted from memory.
+        let mut expected: Vec<u8> = vec![0x16, 0x1a, 0xc2, 0x1f];
+        expected.extend_from_slice(nft_contract.into_word().as_slice()); // arg0: nftContract
+        expected.extend_from_slice(fee_recipient.into_word().as_slice()); // arg1: feeRecipient
+        expected.extend_from_slice(&[0u8; 32]); // arg2: minterIfNotPayer = Address::ZERO
+        expected.extend_from_slice(&U256::from(quantity).to_be_bytes::<32>()); // arg3: quantity
+
+        assert_eq!(calldata, expected);
+        assert_eq!(calldata.len(), 4 + 4 * 32); // selector + 4 words, no more no less
+    }
+}
