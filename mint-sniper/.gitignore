@@ -3,3 +3,4 @@
 /ui/dist
 config.toml
 .env
+.testnet-keys/
