@@ -484,7 +484,7 @@ async fn control_loop(
                 let cfg = state.config.read().await.clone();
                 match executor::prepare_fire(
                     &cfg,
-                    &mut wallets,
+                    &wallets,
                     contract,
                     &mint_calldata,
                     mint_value,
@@ -505,7 +505,15 @@ async fn control_loop(
                         });
                     }
                     Err(e) => {
-                        bus::log(&state.bus, "error", format!("prepare failed: {e}"));
+                        // {:#} (anyhow's alternate Display), not {} — {}
+                        // only prints the outermost .context() frame
+                        // ("estimating gas"), hiding the actual RPC/revert
+                        // reason underneath it. Confirmed live during the
+                        // step 5 dry run: a genuine "execution reverted:
+                        // not active" was reduced to an opaque "prepare
+                        // failed: estimating gas" with no way to tell from
+                        // the event feed alone what was actually wrong.
+                        bus::log(&state.bus, "error", format!("prepare failed: {e:#}"));
                     }
                 }
             }
@@ -532,6 +540,10 @@ async fn control_loop(
                 bus::log(&state.bus, "warn", "FIRING all wallets");
 
                 let fire_result = if let Some(pf) = prepared_fire.take() {
+                    // Committing to broadcast this batch now — this is the
+                    // one place next_nonce advances (see prepare_fire's doc
+                    // comment for why it doesn't advance on its own).
+                    advance_nonces(&mut wallets, &pf.wallets);
                     executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus).await
                 } else {
                     // Manual fire (UI "Fire Now") without a prior arm, or a
@@ -552,7 +564,7 @@ async fn control_loop(
                     };
                     match executor::prepare_fire(
                         &cfg,
-                        &mut wallets,
+                        &wallets,
                         contract,
                         &mint_calldata,
                         mint_value,
@@ -561,13 +573,18 @@ async fn control_loop(
                     )
                     .await
                     {
-                        Ok(w) => executor::fire_prepared(&cfg, &w, &providers, &state.bus).await,
+                        Ok(w) => {
+                            advance_nonces(&mut wallets, &w);
+                            executor::fire_prepared(&cfg, &w, &providers, &state.bus).await
+                        }
                         Err(e) => Err(e),
                     }
                 };
 
                 if let Err(e) = fire_result {
-                    bus::log(&state.bus, "error", format!("fire sequence error: {e}"));
+                    // {:#} for the same reason as the Prepare handler above
+                    // — the full context chain, not just the outermost frame.
+                    bus::log(&state.bus, "error", format!("fire sequence error: {e:#}"));
                 }
 
                 // Disarm after firing — a completed mint attempt shouldn't
@@ -586,6 +603,20 @@ async fn control_loop(
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
             }
+        }
+    }
+}
+
+/// Advances `next_nonce` for exactly the wallets present in `prepared` —
+/// called once, right at the point control_loop commits to broadcasting a
+/// prepared batch. `prepare_fire` itself never advances the nonce (see its
+/// doc comment): it can be called many times before anything is fired,
+/// and every one of those calls has to sign the same still-unused nonce,
+/// not a fresh one each time.
+fn advance_nonces(wallets: &mut [wallet::ManagedWallet], prepared: &[executor::PreparedWallet]) {
+    for w in wallets.iter_mut() {
+        if prepared.iter().any(|pw| pw.address == w.address) {
+            w.next_nonce += 1;
         }
     }
 }
