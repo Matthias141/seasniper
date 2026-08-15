@@ -213,9 +213,24 @@ async fn balance_poll_loop(state: SharedState, http_url: String, addrs: Vec<Addr
     }
 }
 
+/// How long before a known `timestamp`-mode trigger to run the prepare
+/// (sign) phase. Long enough that gas price / gas estimate are still
+/// fresh at fire time, short enough that "prepare" and "trigger" stay
+/// distinct events a human watching the log can tell apart. Not tuned
+/// against real mint data — a few seconds is enough to eliminate the
+/// signing+lookup latency from the fire path, which is the actual goal;
+/// shaving this further is a real but separate optimization.
+const PREPARE_LEAD_SECS: u64 = 5;
+
 /// Owns wallet signers and the watcher task. All arm/disarm/fire commands
 /// from the API funnel through here as a single-writer loop — avoids any
 /// question of two fires racing each other from concurrent API calls.
+///
+/// Also owns the prepare phase (connection warming + pre-signing, see
+/// executor.rs): both read wallet signers, so both have to happen here,
+/// for the same single-writer reason as firing itself. `Prepare` is a
+/// `ControlMsg` for that reason too — it's never sent from api.rs, only
+/// self-sent the same way auto-fire already self-sends `FireNow`.
 async fn control_loop(
     state: SharedState,
     mut control_rx: mpsc::Receiver<ControlMsg>,
@@ -229,6 +244,15 @@ async fn control_loop(
     // anyhow::Result<()>, not (); the handle type has to match whichever the
     // `match` below spawns, and it's the same for either arm.
     let mut watcher_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
+    // The lead-time sleep-then-send-Prepare task for timestamp mode. Tracked
+    // separately from watcher_handle so disarming cancels it even though
+    // it's not the watcher itself.
+    let mut prepare_timer_handle: Option<tokio::task::JoinHandle<()>> = None;
+    // Warmed at Arm time (or just-in-time in FireNow's fallback path below);
+    // cleared on Disarm and after firing so a stale connection list can
+    // never be paired with a fresh prepare, or vice versa.
+    let mut warmed_providers: Vec<executor::HttpProvider> = Vec::new();
+    let mut prepared_fire: Option<executor::PreparedFire> = None;
 
     while let Some(msg) = control_rx.recv().await {
         match msg {
@@ -238,6 +262,14 @@ async fn control_loop(
                     continue;
                 }
                 let cfg = state.config.read().await.clone();
+
+                // Connection warming happens first and synchronously, before
+                // the watcher spawns or the UI sees "armed" — so every
+                // endpoint has had its TCP/TLS handshake done at least once
+                // before we're relying on it, not at broadcast time.
+                warmed_providers = executor::warm_connections(&cfg, &state.bus).await;
+                prepared_fire = None;
+
                 state.armed.store(true, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: true });
 
@@ -273,13 +305,83 @@ async fn control_loop(
                     }
                 });
 
+                // Schedule the prepare (sign) phase. poll_state can't predict
+                // when its own trigger fires, so there's no lead time to
+                // wait out — prepare right away, immediately after warming.
+                // timestamp mode knows the exact instant, so it waits until
+                // PREPARE_LEAD_SECS before that instant, trading a little
+                // gas-price freshness for a real "prepare" event distinct
+                // from "trigger" in the log.
+                match cfg.trigger_mode.as_str() {
+                    "timestamp" if cfg.trigger_timestamp_unix > 0 => {
+                        let control_tx = state.control_tx.clone();
+                        let target = cfg.trigger_timestamp_unix;
+                        prepare_timer_handle = Some(tokio::spawn(async move {
+                            let now = bus::now_ts();
+                            let sleep_secs = target
+                                .saturating_sub(now)
+                                .saturating_sub(PREPARE_LEAD_SECS);
+                            if sleep_secs > 0 {
+                                tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+                            }
+                            let _ = control_tx.send(ControlMsg::Prepare).await;
+                        }));
+                    }
+                    _ => {
+                        let _ = state.control_tx.send(ControlMsg::Prepare).await;
+                    }
+                }
+
                 bus::log(&state.bus, "info", format!("armed, mode={}", cfg.trigger_mode));
+            }
+
+            ControlMsg::Prepare => {
+                if warmed_providers.is_empty() {
+                    bus::log(
+                        &state.bus,
+                        "error",
+                        "prepare requested but no warmed RPC providers are available",
+                    );
+                    continue;
+                }
+                let cfg = state.config.read().await.clone();
+                match executor::prepare_fire(
+                    &cfg,
+                    &mut wallets,
+                    contract,
+                    &mint_calldata,
+                    mint_value,
+                    &warmed_providers,
+                    &state.bus,
+                )
+                .await
+                {
+                    Ok(prepared_wallets) => {
+                        bus::log(
+                            &state.bus,
+                            "info",
+                            format!("{} wallet(s) pre-signed and ready to fire", prepared_wallets.len()),
+                        );
+                        prepared_fire = Some(executor::PreparedFire {
+                            wallets: prepared_wallets,
+                            providers: warmed_providers.clone(),
+                        });
+                    }
+                    Err(e) => {
+                        bus::log(&state.bus, "error", format!("prepare failed: {e}"));
+                    }
+                }
             }
 
             ControlMsg::Disarm => {
                 if let Some(h) = watcher_handle.take() {
                     h.abort();
                 }
+                if let Some(h) = prepare_timer_handle.take() {
+                    h.abort();
+                }
+                prepared_fire = None;
+                warmed_providers.clear();
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
                 bus::log(&state.bus, "warn", "disarmed");
@@ -288,23 +390,56 @@ async fn control_loop(
             ControlMsg::FireNow => {
                 let cfg = state.config.read().await.clone();
                 bus::log(&state.bus, "warn", "FIRING all wallets");
-                if let Err(e) = executor::fire_all_wallets(
-                    &cfg,
-                    &mut wallets,
-                    contract,
-                    mint_calldata.clone(),
-                    mint_value,
-                    &state.bus,
-                )
-                .await
-                {
+
+                let fire_result = if let Some(pf) = prepared_fire.take() {
+                    executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus).await
+                } else {
+                    // Manual fire (UI "Fire Now") without a prior arm, or a
+                    // prepare that failed above — fall back to signing right
+                    // here rather than refusing to fire. Slower (this is
+                    // exactly the round-trip-in-the-critical-path prepare
+                    // exists to avoid), but a working fire beats a fire that
+                    // silently no-ops because nothing was pre-signed.
+                    bus::log(
+                        &state.bus,
+                        "warn",
+                        "firing without a prior prepare — signing now, this will be slower",
+                    );
+                    let providers = if warmed_providers.is_empty() {
+                        executor::warm_connections(&cfg, &state.bus).await
+                    } else {
+                        warmed_providers.clone()
+                    };
+                    match executor::prepare_fire(
+                        &cfg,
+                        &mut wallets,
+                        contract,
+                        &mint_calldata,
+                        mint_value,
+                        &providers,
+                        &state.bus,
+                    )
+                    .await
+                    {
+                        Ok(w) => executor::fire_prepared(&cfg, &w, &providers, &state.bus).await,
+                        Err(e) => Err(e),
+                    }
+                };
+
+                if let Err(e) = fire_result {
                     bus::log(&state.bus, "error", format!("fire sequence error: {e}"));
                 }
+
                 // Disarm after firing — a completed mint attempt shouldn't
                 // silently stay "armed" and re-fire on a stale watcher signal.
                 if let Some(h) = watcher_handle.take() {
                     h.abort();
                 }
+                if let Some(h) = prepare_timer_handle.take() {
+                    h.abort();
+                }
+                prepared_fire = None;
+                warmed_providers.clear();
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
             }

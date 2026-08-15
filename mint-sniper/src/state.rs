@@ -21,6 +21,13 @@ pub enum ControlMsg {
     Arm,
     Disarm,
     FireNow,
+    /// Internal-only: sign+cache every wallet's tx ahead of the actual
+    /// trigger. Never sent from api.rs / the UI — control_loop sends this
+    /// to itself (immediately for poll_state, after a lead-time sleep for
+    /// timestamp mode) the same way it already self-sends FireNow when the
+    /// watcher trips. Routing it through control_tx like everything else
+    /// keeps wallets touched from exactly one place.
+    Prepare,
 }
 
 pub struct AppState {

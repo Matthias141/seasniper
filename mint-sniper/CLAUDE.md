@@ -31,9 +31,16 @@ src/
   wallet.rs    — ManagedWallet: signer + locally-tracked nonce per wallet
   watcher.rs   — detects the mint-live trigger (poll_state | timestamp;
                  mempool_watch is stubbed, not implemented)
-  executor.rs  — fire_all_wallets: concurrent, jittered, multi-RPC broadcast
-                 of the mint tx per wallet, with a per-wallet ETH value
-                 (0 for free mints, SeaDrop public-stage price otherwise)
+  executor.rs  — prepare/fire split, ported from a reference sniper's
+                 pre-sign pattern (see git history for the audit this was
+                 ported from): warm_connections() opens+verifies every RPC
+                 endpoint ahead of arm-time; prepare_fire() fetches nonce/
+                 gas/chain-id once and signs one raw tx per wallet, with a
+                 per-wallet ETH value (0 for free mints, SeaDrop
+                 public-stage price otherwise) and jittered gas; fire_
+                 prepared() only broadcasts the already-signed bytes over
+                 the already-warmed connections — no RPC round trip and no
+                 signing left in the fire-time path.
   seadrop.rs   — SeaDrop 1.0 ABI: reads getPublicDrop (price/timing) and
                  builds mintPublic calldata. Public stage only — see its
                  doc comment for why allowlist/signed/token-gated stages
@@ -41,7 +48,9 @@ src/
   bus.rs       — ServerEvent enum + broadcast channel, single source of
                  truth for everything the UI displays in real time
   state.rs     — AppState (shared config/wallet-status/armed flag/bus/
-                 control channel), ControlMsg enum (Arm/Disarm/FireNow)
+                 control channel), ControlMsg enum (Arm/Disarm/FireNow/
+                 Prepare — Prepare is internal-only, never sent from
+                 api.rs, see control_loop's doc comment in main.rs)
   api.rs       — axum router: GET/PUT /api/config, GET /api/status,
                  POST /api/arm|/api/abort|/api/trigger, WS /ws/events
 
@@ -54,8 +63,11 @@ the watcher's own auto-trigger, funnel through the single `control_loop`
 task in `main.rs` via `ControlMsg` over an mpsc channel. This is
 intentional — it's the one thing preventing two fires racing each other
 if the UI double-clicks and the watcher triggers in the same instant.
-**Do not add a second path that calls `executor::fire_all_wallets`
-directly; route everything through `control_tx`.**
+**Do not add a second path that calls `executor::prepare_fire` or
+`executor::fire_prepared` directly; route everything through
+`control_tx`.** This now covers the prepare (pre-sign) phase too, not
+just firing — both touch wallet signers, so both have to stay inside
+`control_loop`.
 
 Wallet signers (i.e. private key material in memory) live only in
 `control_loop`'s local scope in `main.rs` and inside `executor.rs`. They
@@ -86,9 +98,11 @@ functions with no network dependency and the highest cost-of-being-wrong.
 
 ## Known gaps (fix before relying on this for a real mint)
 
-1. **Nothing compiled yet.** Alloy 0.9.x / axum 0.7.x API drift is
-   expected. Fix in place, don't rewrite around it unless a function
-   genuinely no longer exists.
+1. ~~Nothing compiled yet.~~ Fixed — see git history. `cargo build` /
+   `cargo check` are clean (one pre-existing, expected warning: gap #3
+   below, `RpcHealth` unconstructed). If drift resurfaces after a
+   dependency bump, same rule as before: fix in place, don't rewrite
+   around it unless a function genuinely no longer exists.
 2. **`mempool_watch` trigger mode is not implemented** — `watcher.rs` only
    has `run_state_poll_watcher` and `run_timestamp_watcher`. Selecting it
    in config currently falls through to poll_state in `control_loop`.
