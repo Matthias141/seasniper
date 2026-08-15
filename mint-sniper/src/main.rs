@@ -177,6 +177,16 @@ async fn main() -> Result<()> {
         wallet_addrs,
     ));
 
+    // Background: ping every configured HTTP RPC every 15s and push
+    // ServerEvent::RpcHealth so the UI's "LINK OK/NO LINK" pill reflects
+    // real per-provider health, not just the browser's own WebSocket
+    // connection to the bot (see gap #3 in CLAUDE.md). Same 15s cadence
+    // as balance_poll_loop — both are low-stakes background telemetry
+    // with no reason to disagree on how often they check in. Doesn't
+    // touch wallets or the control channel, so it runs standalone rather
+    // than through control_loop, same reasoning as balance_poll_loop.
+    tokio::spawn(rpc_health_poll_loop(app_state.clone(), cfg.http_rpc_urls.clone()));
+
     // Background: owns the watcher lifecycle and executes fires. Wallets
     // (with their private key material) live only here and in the executor
     // call it makes — never cross into the API/UI layer.
@@ -217,6 +227,42 @@ async fn balance_poll_loop(state: SharedState, http_url: String, addrs: Vec<Addr
                     healthy: true,
                 });
             }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+    }
+}
+
+/// Pings each configured HTTP RPC every 15s with a cheap read call
+/// (`eth_blockNumber`) and reports round-trip latency + success/failure
+/// as `ServerEvent::RpcHealth`. Providers are built once up front and
+/// reused for every tick, same reasoning as executor.rs's connection
+/// warming — measuring "latency of a fresh TCP/TLS handshake" every 15s
+/// would systematically overstate the latency these endpoints actually
+/// have once warm, which is the number that matters at fire time.
+async fn rpc_health_poll_loop(state: SharedState, http_rpc_urls: Vec<String>) {
+    let providers: Vec<(String, executor::HttpProvider)> = http_rpc_urls
+        .into_iter()
+        .filter_map(|url| match url.parse() {
+            Ok(parsed) => Some((url, ProviderBuilder::new().on_http(parsed))),
+            Err(e) => {
+                // A malformed URL in config is a config error, not an RPC
+                // health event — nothing to ping, so nothing to report.
+                tracing::warn!(%url, error = %e, "rpc_health_poll_loop: skipping unparseable RPC url");
+                None
+            }
+        })
+        .collect();
+
+    loop {
+        for (url, provider) in &providers {
+            let start = std::time::Instant::now();
+            let healthy = provider.get_block_number().await.is_ok();
+            let latency_ms = start.elapsed().as_millis() as u64;
+            let _ = state.bus.send(bus::ServerEvent::RpcHealth {
+                url: url.clone(),
+                healthy,
+                latency_ms,
+            });
         }
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
