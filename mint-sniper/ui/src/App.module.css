@@ -1,0 +1,53 @@
+.shell {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.banner {
+  background: color-mix(in srgb, var(--color-danger) 15%, var(--color-surface-1));
+  color: var(--color-danger);
+  padding: var(--space-2) var(--space-4);
+  font-size: var(--text-sm);
+}
+
+.grid {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-3);
+  padding: var(--space-3);
+}
+
+.left,
+.right {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* Desktop / tablet landscape: asymmetric split, wallets+log get the wider column */
+@media (min-width: 860px) {
+  .grid {
+    grid-template-columns: 1.618fr 1fr;
+    padding: var(--space-4);
+  }
+  .left {
+    order: 1;
+  }
+  .right {
+    order: 2;
+  }
+}
+
+/* Mobile: trigger console first (thumb reach, no scrolling to arm), then
+   status, then config buried at the bottom where it belongs day-to-day. */
+@media (max-width: 859px) {
+  .right {
+    order: 1;
+  }
+  .left {
+    order: 2;
+  }
+}

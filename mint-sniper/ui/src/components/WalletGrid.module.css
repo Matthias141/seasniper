@@ -1,0 +1,91 @@
+.panel {
+  padding: var(--space-3);
+}
+
+.heading {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.16em;
+  color: var(--color-text-tertiary);
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
+}
+
+.count {
+  color: var(--color-accent);
+}
+
+.empty {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: var(--space-2);
+}
+
+.card {
+  background: var(--color-surface-1);
+  border: var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-2);
+  transition: border-color 0.15s ease;
+}
+
+.card:hover {
+  border-color: var(--color-surface-4);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
+}
+
+.healthDot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.healthy {
+  background: var(--color-success);
+  box-shadow: 0 0 6px var(--color-success-glow);
+}
+.unhealthy {
+  background: var(--color-danger);
+  box-shadow: 0 0 6px var(--color-danger-glow);
+}
+
+.address {
+  font-size: var(--text-sm);
+  color: var(--color-text-primary);
+  cursor: pointer;
+}
+.address:hover {
+  color: var(--color-accent);
+}
+
+.metrics {
+  display: flex;
+  justify-content: space-between;
+}
+
+.metricLabel {
+  display: block;
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  color: var(--color-text-tertiary);
+}
+
+.metricValue {
+  display: block;
+  font-size: var(--text-base);
+  font-variant-numeric: tabular-nums;
+  color: var(--color-text-primary);
+}

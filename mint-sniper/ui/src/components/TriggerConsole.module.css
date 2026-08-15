@@ -1,0 +1,163 @@
+.console {
+  background: var(--color-surface-1);
+  border: var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* --- Arm toggle --- */
+.armRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.armLabel {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.armLabel span:first-child {
+  font-size: var(--text-xs);
+  letter-spacing: 0.14em;
+  color: var(--color-text-secondary);
+}
+.armSub {
+  font-size: 0.65rem;
+  color: var(--color-text-tertiary);
+}
+
+.armSwitch {
+  width: 56px;
+  height: 30px;
+  border-radius: 999px;
+  background: var(--color-surface-2);
+  border: var(--border-hairline);
+  position: relative;
+  padding: 3px;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+.armSwitchOn {
+  background: color-mix(in srgb, var(--color-accent) 25%, var(--color-surface-2));
+  border-color: var(--color-accent);
+  box-shadow: 0 0 14px var(--color-accent-glow);
+}
+
+.armKnob {
+  display: block;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--color-text-primary);
+  transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.armSwitchOn .armKnob {
+  transform: translateX(26px);
+  background: var(--color-accent);
+}
+
+/* --- Fire block: safety cover + button --- */
+.fireBlock {
+  position: relative;
+  height: 96px;
+  perspective: 600px;
+}
+
+.cover {
+  position: absolute;
+  inset: 0;
+  transform-origin: top center;
+  transform: rotateX(0deg);
+  transition: transform 0.35s cubic-bezier(0.65, 0, 0.35, 1);
+  z-index: 2;
+}
+
+.coverLifted {
+  transform: rotateX(-100deg);
+  pointer-events: none;
+}
+
+.coverBtn {
+  width: 100%;
+  height: 100%;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-surface-4);
+  border-radius: var(--radius-md);
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  letter-spacing: 0.1em;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+.coverBtn:hover:not(:disabled) {
+  border-color: var(--color-accent-dim);
+  color: var(--color-text-primary);
+}
+
+.coverIcon {
+  font-size: var(--text-lg);
+  filter: grayscale(1);
+}
+
+.fireBtn {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: var(--color-surface-2);
+  border: 2px solid var(--color-surface-4);
+  border-radius: var(--radius-md);
+  color: var(--color-text-tertiary);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--text-xl);
+  letter-spacing: 0.06em;
+  transition: all 0.2s ease;
+}
+
+.fireBtnLive {
+  border-color: var(--color-danger);
+  color: var(--color-danger);
+  background: radial-gradient(ellipse at center, rgba(255, 59, 48, 0.12), transparent 70%);
+  animation: chargePulse 1.1s ease-in-out infinite;
+}
+.fireBtnLive:hover {
+  background: var(--color-danger);
+  color: var(--color-surface-0);
+  box-shadow: 0 0 26px var(--color-danger-glow);
+}
+.fireBtnLive:active {
+  transform: scale(0.97);
+}
+
+@keyframes chargePulse {
+  0%,
+  100% {
+    box-shadow: 0 0 8px var(--color-danger-glow);
+  }
+  50% {
+    box-shadow: 0 0 20px var(--color-danger-glow);
+  }
+}
+
+.note {
+  font-size: 0.7rem;
+  color: var(--color-text-tertiary);
+  line-height: 1.5;
+  margin: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fireBtnLive {
+    animation: none;
+  }
+  .cover {
+    transition: none;
+  }
+}
