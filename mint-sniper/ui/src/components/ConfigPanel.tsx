@@ -85,9 +85,7 @@ export function ConfigPanel({
               >
                 <option value="poll_state">poll_state</option>
                 <option value="timestamp">timestamp</option>
-                <option value="mempool_watch" disabled>
-                  mempool_watch (not implemented)
-                </option>
+                <option value="mempool_watch">mempool_watch</option>
               </select>
             </label>
 
@@ -98,6 +96,18 @@ export function ConfigPanel({
                   type="number"
                   value={draft.trigger_timestamp_unix}
                   onChange={(e) => update('trigger_timestamp_unix', Number(e.target.value))}
+                />
+              </label>
+            )}
+
+            {draft.trigger_mode === 'mempool_watch' && (
+              <label className={styles.field}>
+                <span>Admin address (fires on pending tx from this address)</span>
+                <input
+                  value={draft.mint_enable_admin}
+                  onChange={(e) => update('mint_enable_admin', e.target.value)}
+                  placeholder="0x..."
+                  spellCheck={false}
                 />
               </label>
             )}

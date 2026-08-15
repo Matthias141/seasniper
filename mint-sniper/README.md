@@ -90,11 +90,16 @@ firing your wallets.
 - Does not touch a non-SeaDrop project's bespoke frontend/API flow if one
   exists outside the on-chain contract (rare now that SeaDrop covers most
   OpenSea-launched drops, but some projects still run custom infra).
-- Does not do mempool-based frontrunning of an admin's "enable mint" tx —
-  `trigger_mode = "mempool_watch"` is stubbed but not implemented. For a
-  free mint there's little upside to this over block-level state polling
-  since there's no value to extract by landing in the *same* block as the
-  enable tx versus the next one.
+- `trigger_mode = "mempool_watch"` fires on a pending (not yet confirmed)
+  tx from a configured admin address to the watched contract — see
+  `mint_enable_admin` in `config.example.toml` and `watcher.rs`'s
+  `run_mempool_watcher` doc comment for exactly which contract that is in
+  seadrop mode, and for why it matches on (from, to) rather than decoding
+  a specific function call. Needs a WebSocket RPC with full mempool
+  visibility (Geth 1.11+, `newPendingTransactions` with full tx bodies) —
+  many free/public RPC providers don't expose this even over WS, and
+  arming fails loudly (auto-disarm + a clear error) rather than silently
+  watching nothing if the subscription isn't supported.
 - Does not manage wallet funding/withdrawal logistics — that's a separate,
   equally important operational concern (gas top-ups, consolidating minted
   NFTs to a single wallet post-mint, etc.) left out of scope here.

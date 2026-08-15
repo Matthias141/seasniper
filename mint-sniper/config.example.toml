@@ -29,6 +29,18 @@ mint_state_fn_signature = "mintActive()"
 trigger_mode = "poll_state"      # "poll_state" | "timestamp" | "mempool_watch"
 trigger_timestamp_unix = 0        # used only if trigger_mode = "timestamp"
 
+# Required only if trigger_mode = "mempool_watch": the project's known
+# admin/owner wallet. Fires the moment a pending tx FROM this address TO
+# the watched contract is seen — before it's even confirmed. Needs
+# ws_rpc_url to be a node that exposes full mempool visibility (Geth
+# 1.11+, newPendingTransactions with full tx bodies); many free/public
+# RPCs don't support this even over WS, and arming will fail loudly
+# (auto-disarm + a clear error) rather than silently watching nothing if
+# the subscription isn't available. See watcher.rs's run_mempool_watcher
+# doc comment for exactly which contract "watched contract" means in
+# seadrop mode (it's the nft contract, not the SeaDrop singleton).
+mint_enable_admin = ""
+
 # --- seadrop-mode-only fields, ignored when mint_mode = "custom" ---
 seadrop_address = ""              # blank = mainnet/Polygon default, see seadrop.rs
 nft_contract = ""                 # the actual collection contract for this drop

@@ -11,6 +11,7 @@ export interface Config {
   mint_state_fn_signature: string;
   trigger_mode: 'poll_state' | 'timestamp' | 'mempool_watch';
   trigger_timestamp_unix: number;
+  mint_enable_admin: string;
   priority_fee_multiplier: number;
   max_priority_fee_gwei_cap: number;
   gas_limit_headroom_pct: number;

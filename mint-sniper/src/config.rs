@@ -24,6 +24,15 @@ pub struct Config {
     pub mint_state_fn_signature: String,
     pub trigger_mode: String,
     pub trigger_timestamp_unix: u64,
+    /// Required only for trigger_mode = "mempool_watch": the project's
+    /// known admin/owner EOA. The watcher fires the moment it sees a
+    /// pending tx FROM this address TO the watched contract (see
+    /// watcher.rs's run_mempool_watcher doc comment for exactly which
+    /// contract that is in seadrop mode). Empty by default — arming with
+    /// trigger_mode = "mempool_watch" and this unset fails loudly rather
+    /// than silently falling back to poll_state.
+    #[serde(default)]
+    pub mint_enable_admin: String,
 
     /// --- seadrop-mode-only fields, ignored when mint_mode = "custom" ---
     /// SeaDrop singleton contract address. Defaults to the mainnet/Polygon

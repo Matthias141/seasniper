@@ -1,10 +1,11 @@
 use crate::bus::{self, EventBus};
+use crate::state::ControlMsg;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
-use alloy::rpc::types::TransactionRequest;
+use alloy::rpc::types::{TransactionRequest, TransactionTrait};
 use anyhow::Result;
 use futures::StreamExt;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 /// Fires exactly once (watch channel flips to `true`) the moment the mint
@@ -43,6 +44,97 @@ pub async fn run_state_poll_watcher(
                 }
             }
             Err(e) => warn!(error = %e, "state check call failed, retrying next block"),
+        }
+    }
+    Ok(())
+}
+
+/// Watches the mempool for a pending transaction FROM the configured admin
+/// address TO the watched contract, and fires the instant it's SEEN
+/// pending — before it's even confirmed in a block, which is the entire
+/// point of this mode versus `run_state_poll_watcher`'s confirmed-block
+/// check.
+///
+/// SCOPE NOTE — matches on (from, to) only, not on decoding which function
+/// is being called. In seadrop mode, the on-chain call that actually
+/// flips a drop live (`SeaDrop.updatePublicDrop`) is made BY the nft
+/// contract itself — `msg.sender` is required to be the nft contract via
+/// SeaDrop.sol's `onlyINonFungibleSeaDropToken` modifier, it is not called
+/// directly by a human admin — so the transaction actually visible in the
+/// mempool is the admin's call to *their nft contract's own* admin-only
+/// wrapper (whatever that's named on their specific token contract), never
+/// a transaction whose `to` is the SeaDrop singleton. `watch_target` is
+/// therefore the nft contract in seadrop mode, not the singleton (see
+/// main.rs's `admin_watch_target` computation). Matching only on the
+/// address pair, not also requiring a specific selector, is a deliberate
+/// simplification: in custom mode there's no way to know a project's
+/// "enable" function signature ahead of time, and in seadrop mode the
+/// admin wrapper's exact selector isn't guaranteed to be the same across
+/// different SeaDrop-token base contracts either. The cost is that ANY tx
+/// from admin to watch_target fires the trigger, not just the specific one
+/// that flips the drop live — acceptable for a wallet that's presumably
+/// only sending drop-related transactions to that contract around the
+/// mint window, not a general concern.
+///
+/// REQUIRES a full pending-transaction subscription
+/// (`eth_subscribe("newPendingTransactions", true)`), which alloy exposes
+/// as `Provider::subscribe_full_pending_transactions` — needs (a) a
+/// WebSocket RPC, since this is a pubsub-only method, and (b) a node that
+/// actually exposes full mempool visibility, which per alloy's own docs
+/// requires Geth 1.11+ and which many public/free RPC providers disable
+/// entirely (mempool visibility is valuable and commonly rate-limited or
+/// turned off even over WS). If the subscription itself fails, this does
+/// NOT sit there "armed" while watching nothing: it logs a loud error,
+/// disarms via `control_tx`, and returns `Err` so the failure is visible
+/// immediately rather than a control panel that says ARMED indefinitely.
+pub async fn run_mempool_watcher(
+    ws_url: String,
+    admin: Address,
+    watch_target: Address,
+    trigger_tx: watch::Sender<bool>,
+    event_bus: EventBus,
+    control_tx: mpsc::Sender<ControlMsg>,
+) -> Result<()> {
+    let ws = WsConnect::new(ws_url);
+    let provider = ProviderBuilder::new().on_ws(ws).await?;
+
+    let sub = match provider.subscribe_full_pending_transactions().await {
+        Ok(sub) => sub,
+        Err(e) => {
+            let msg = format!(
+                "mempool_watch failed to subscribe to full pending transactions ({e}). \
+                 This mode needs a WebSocket RPC on a node that exposes full mempool \
+                 visibility (Geth 1.11+, newPendingTransactions with full-tx bodies \
+                 enabled) — many public/free RPC endpoints don't support this even over \
+                 WS. Disarming rather than staying armed while watching nothing; switch \
+                 ws_rpc_url to a provider with mempool access, or use trigger_mode = \
+                 \"poll_state\" or \"timestamp\" instead."
+            );
+            bus::log(&event_bus, "error", msg.clone());
+            let _ = control_tx.send(ControlMsg::Disarm).await;
+            anyhow::bail!(msg);
+        }
+    };
+
+    info!(%admin, %watch_target, "watcher: subscribed to full pending transactions");
+    bus::log(
+        &event_bus,
+        "info",
+        format!("mempool watcher armed — watching for pending tx from {admin:#x} to {watch_target:#x}"),
+    );
+
+    let mut stream = sub.into_stream();
+    while let Some(tx) = stream.next().await {
+        if tx.from == admin && tx.to() == Some(watch_target) {
+            let tx_hash = *tx.inner.tx_hash();
+            info!(%tx_hash, "TRIGGER: admin tx seen pending (unconfirmed)");
+            bus::log(
+                &event_bus,
+                "warn",
+                format!("TRIGGER: pending tx {tx_hash:#x} from admin to {watch_target:#x} seen — firing"),
+            );
+            let _ = trigger_tx.send(true);
+            break;
         }
     }
     Ok(())

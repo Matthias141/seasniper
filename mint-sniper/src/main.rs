@@ -37,7 +37,15 @@ async fn main() -> Result<()> {
     let mut cfg = config::Config::load(CONFIG_PATH).context("loading config.toml")?;
     let event_bus = bus::new_bus();
 
-    let (contract, mint_calldata, mint_value): (Address, Vec<u8>, U256) = match cfg.mint_mode.as_str()
+    // admin_watch_target is only used by mempool_watch (see
+    // watcher::run_mempool_watcher's doc comment for why it's not always
+    // the same as `contract`): in seadrop mode, the admin's visible
+    // mempool tx targets the nft contract itself, not the SeaDrop
+    // singleton `contract` gets set to below for firing. In custom mode
+    // there's no such split — the admin's enabling tx and our mint tx
+    // target the same contract.
+    let (contract, mint_calldata, mint_value, admin_watch_target): (Address, Vec<u8>, U256, Address) =
+        match cfg.mint_mode.as_str()
     {
         "seadrop" => {
             let seadrop_addr: Address = if cfg.seadrop_address.is_empty() {
@@ -121,7 +129,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            (seadrop_addr, calldata, value)
+            (seadrop_addr, calldata, value, nft_contract)
         }
         _ => {
             let contract: Address = cfg
@@ -129,7 +137,7 @@ async fn main() -> Result<()> {
                 .parse()
                 .context("bad contract address")?;
             let calldata = encode_mint_calldata(&cfg.mint_fn_signature, &cfg.mint_fn_args_template)?;
-            (contract, calldata, U256::ZERO)
+            (contract, calldata, U256::ZERO, contract)
         }
     };
 
@@ -176,6 +184,7 @@ async fn main() -> Result<()> {
         app_state.clone(),
         control_rx,
         contract,
+        admin_watch_target,
         mint_calldata,
         mint_value,
         mint_state_selector,
@@ -244,6 +253,7 @@ async fn control_loop(
     state: SharedState,
     mut control_rx: mpsc::Receiver<ControlMsg>,
     contract: Address,
+    admin_watch_target: Address,
     mint_calldata: Vec<u8>,
     mint_value: U256,
     mint_state_selector: Vec<u8>,
@@ -295,9 +305,56 @@ async fn control_loop(
                         let target = cfg.trigger_timestamp_unix;
                         tokio::spawn(watcher::run_timestamp_watcher(target, trigger_tx))
                     }
-                    _ => {
-                        // default to poll_state; mempool_watch not implemented
-                        // in this skeleton (see README).
+                    "mempool_watch" => match cfg.mint_enable_admin.trim().parse::<Address>() {
+                        Ok(admin) => tokio::spawn(watcher::run_mempool_watcher(
+                            cfg.ws_rpc_url.clone(),
+                            admin,
+                            admin_watch_target,
+                            trigger_tx,
+                            bus_clone,
+                            state.control_tx.clone(),
+                        )),
+                        Err(e) => {
+                            // Fail loudly and fall back rather than silently
+                            // watching nothing — this is exactly the trap
+                            // the old unconditional fallthrough to
+                            // poll_state fell into (selecting mempool_watch
+                            // used to silently do poll_state instead, with
+                            // no warning at all).
+                            bus::log(
+                                &state.bus,
+                                "error",
+                                format!(
+                                    "trigger_mode = \"mempool_watch\" requires mint_enable_admin \
+                                     to be a valid address ({e}) — falling back to poll_state"
+                                ),
+                            );
+                            tokio::spawn(watcher::run_state_poll_watcher(
+                                cfg.ws_rpc_url.clone(),
+                                contract,
+                                mint_state_selector.clone(),
+                                trigger_tx,
+                                bus_clone,
+                            ))
+                        }
+                    },
+                    "poll_state" => tokio::spawn(watcher::run_state_poll_watcher(
+                        cfg.ws_rpc_url.clone(),
+                        contract,
+                        mint_state_selector.clone(),
+                        trigger_tx,
+                        bus_clone,
+                    )),
+                    other => {
+                        // Unrecognized trigger_mode string — same fail-
+                        // loud-and-fall-back principle as the mempool_watch
+                        // misconfiguration case above, rather than the old
+                        // silent fallthrough.
+                        bus::log(
+                            &state.bus,
+                            "warn",
+                            format!("unrecognized trigger_mode {other:?} — falling back to poll_state"),
+                        );
                         tokio::spawn(watcher::run_state_poll_watcher(
                             cfg.ws_rpc_url.clone(),
                             contract,
