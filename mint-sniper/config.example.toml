@@ -1,0 +1,93 @@
+# Copy to config.toml. NEVER commit config.toml — it holds private keys.
+
+# Copy to config.toml. NEVER commit config.toml — it holds private keys.
+
+ws_rpc_url = "wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+# Multiple HTTP RPCs raced in parallel on broadcast — redundancy against a single
+# provider lagging at the exact moment mint flips.
+http_rpc_urls = [
+  "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY",
+  "https://rpc.flashbots.net/fast",
+  "https://mainnet.infura.io/v3/YOUR_KEY",
+]
+
+# "custom" (arbitrary project mint(), config below) or "seadrop" (fixed
+# ISeaDrop.mintPublic ABI — see src/seadrop.rs, and the seadrop-mode
+# example commented out at the bottom of this file).
+mint_mode = "custom"
+
+contract_address = "0x0000000000000000000000000000000000dEaD"
+
+# ABI fragment for the mint call you'll actually send. Adjust selector + args
+# per-project — this is the single most common reason a sniper silently fails.
+mint_fn_signature = "mint(uint256)"
+mint_fn_args_template = ["1"]   # quantity per wallet, as strings
+
+# View function polled every block to detect the mint flipping live.
+# Leave empty and set trigger_mode = "timestamp" to fire on a known block time instead.
+mint_state_fn_signature = "mintActive()"
+trigger_mode = "poll_state"      # "poll_state" | "timestamp" | "mempool_watch"
+trigger_timestamp_unix = 0        # used only if trigger_mode = "timestamp"
+
+# Required only if trigger_mode = "mempool_watch": the project's known
+# admin/owner wallet. Fires the moment a pending tx FROM this address TO
+# the watched contract is seen — before it's even confirmed. Needs
+# ws_rpc_url to be a node that exposes full mempool visibility (Geth
+# 1.11+, newPendingTransactions with full tx bodies); many free/public
+# RPCs don't support this even over WS, and arming will fail loudly
+# (auto-disarm + a clear error) rather than silently watching nothing if
+# the subscription isn't available. See watcher.rs's run_mempool_watcher
+# doc comment for exactly which contract "watched contract" means in
+# seadrop mode (it's the nft contract, not the SeaDrop singleton).
+#
+# HOW TO FIND THIS FOR A PROJECT YOU DON'T CONTROL — do NOT use the
+# contract's deployer address from Etherscan's "Contract Creator" field.
+# Verified directly against SeaDrop's source (ERC721ContractMetadata.sol
+# inherits TwoStepOwnable from ProjectOpenSea/utility-contracts): ownership
+# is explicitly transferable, and it's routine practice to deploy from a
+# disposable hot wallet and then move ownership to a cold wallet or
+# multisig before the drop goes live — exactly the scenario TwoStepOwnable
+# exists to make safe. The deployer address only tells you who paid gas to
+# deploy; it says nothing about who holds owner() now or who will call the
+# enable function later. Instead, call the nft contract's owner() view
+# function (standard on any Ownable-family contract, which this is)
+# yourself, as close to arm-time as practical — ownership can change again
+# after you check, so this is a live fact to verify, not a historical one
+# to look up once.
+mint_enable_admin = ""
+
+# --- seadrop-mode-only fields, ignored when mint_mode = "custom" ---
+seadrop_address = ""              # blank = mainnet/Polygon default, see seadrop.rs
+nft_contract = ""                 # the actual collection contract for this drop
+fee_recipient = ""                # must be project-approved if restrictFeeRecipients=true
+quantity_per_wallet = 1
+
+# Gas strategy. Free mint = no backrun risk, so bias aggressive.
+priority_fee_multiplier = 6.0     # multiplies current suggested priority fee
+max_priority_fee_gwei_cap = 15.0
+gas_limit_headroom_pct = 20        # added on top of eth_estimateGas dry run
+
+# Anti-clustering jitter applied per-wallet at broadcast time.
+jitter_ms_min = 40
+jitter_ms_max = 400
+gas_jitter_pct = 8
+
+[[wallets]]
+private_key_env = "SNIPER_PK_1"   # read from environment, never stored in this file
+
+[[wallets]]
+private_key_env = "SNIPER_PK_2"
+
+[[wallets]]
+private_key_env = "SNIPER_PK_3"
+
+# --- Example: targeting a SeaDrop public-stage free mint instead ---
+# mint_mode = "seadrop"
+# nft_contract = "0xTheProjectsCollectionContract"
+# fee_recipient = "0x0000a26b00c1F0DF003000390027140000fAa719"  # OpenSea's official recipient, common default
+# quantity_per_wallet = 1
+# trigger_timestamp_unix left at 0 — the bot reads the real startTime from
+# getPublicDrop(nftContract) at boot and arms for that exact second.
+# contract_address / mint_fn_signature / mint_state_fn_signature are unused
+# in this mode (mint target is the SeaDrop singleton, ABI is fixed).
+

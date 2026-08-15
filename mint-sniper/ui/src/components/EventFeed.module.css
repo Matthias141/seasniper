@@ -1,0 +1,70 @@
+.panel {
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.heading {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.16em;
+  color: var(--color-text-tertiary);
+  margin-bottom: var(--space-2);
+}
+
+.feed {
+  background: var(--color-surface-1);
+  border: var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-2);
+  overflow-y: auto;
+  flex: 1;
+  min-height: 220px;
+  font-size: var(--text-sm);
+  line-height: 1.6;
+}
+
+.placeholder {
+  color: var(--color-text-tertiary);
+}
+
+.line {
+  display: grid;
+  grid-template-columns: 72px 44px 1fr;
+  gap: var(--space-1);
+  padding: 2px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.ts {
+  color: var(--color-text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.level {
+  font-size: 0.65rem;
+  letter-spacing: 0.05em;
+}
+
+.message {
+  color: var(--color-text-primary);
+  word-break: break-word;
+}
+
+.info .level {
+  color: var(--color-text-tertiary);
+}
+.warn .level {
+  color: var(--color-accent);
+}
+.warn .message {
+  color: var(--color-accent);
+}
+.error .level {
+  color: var(--color-danger);
+}
+.error .message {
+  color: var(--color-danger);
+}
