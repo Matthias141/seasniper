@@ -114,6 +114,26 @@ functions with no network dependency and the highest cost-of-being-wrong.
    If you ever need remote access, put it behind Tailscale/SSH tunnel —
    do not change the bind address to `0.0.0.0` without adding auth first.
 5. **No test coverage at all.** See "Commands" above for where to start.
+6. ~~Pre-signing was fetching gas price once at arm-time and never
+   revisiting it.~~ Fixed — see git history. `timestamp` mode still signs
+   once, `PREPARE_LEAD_SECS` before the known trigger instant (bounded,
+   short window — an explicit, accepted trade-off). `poll_state` mode now
+   re-signs every `POLL_STATE_REPREPARE_INTERVAL_SECS` for as long as it's
+   armed, since its arm-to-trigger window is unbounded and a single
+   prepare at arm time could go stale for minutes or hours.
+7. **A transaction that lands on-chain but reverts is still reported as a
+   success.** `fire_prepared`'s `.watch()` call only waits for inclusion in
+   a block, not execution status — a `send_raw_transaction` rejection
+   (stale nonce, `maxFeePerGas` below current base fee) surfaces correctly
+   as a per-wallet failure with the real RPC error string, but a tx that's
+   included and then reverts (wrong calldata, an on-chain state change
+   between prepare and inclusion, etc.) currently gets logged as `mint
+   confirmed` / `success: true`. Pre-dates the prepare/fire split — the
+   original `fire_all_wallets` had the same gap. Noticed while tracing
+   failure-visibility for the prepare/fire split; not fixed here since it
+   wasn't part of that task and touches result-reporting semantics beyond
+   it — flagging per this repo's own convention of surfacing gaps rather
+   than working around them silently.
 
 ## Explicitly out of scope
 

@@ -226,41 +226,64 @@ pub async fn fire_prepared(
             tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 
             // Race the same raw bytes across every warmed RPC; first to
-            // land wins, duplicates just get dropped as already-known.
-            let sends = providers.iter().map(|provider| {
+            // land wins. Unlike the old select_ok-based version, every
+            // provider's result is collected (not just whichever error
+            // `select_ok` happened to return last) — a rejection reason
+            // like "nonce too low" or "max fee per gas less than block
+            // base fee" is exactly what someone watching the control deck
+            // needs to see, per wallet, not an arbitrary single provider's
+            // opinion when providers disagree on why it failed.
+            let sends = providers.iter().enumerate().map(|(i, provider)| {
                 let raw_tx = raw_tx.clone();
                 async move {
-                    let tx_hash = provider.send_raw_transaction(&raw_tx).await?.watch().await?;
-                    Ok::<_, anyhow::Error>(tx_hash)
+                    // Inner block explicitly typed as anyhow::Result so `?`
+                    // has one concrete error type to convert both
+                    // send_raw_transaction's and watch()'s errors into;
+                    // the index is attached after, on the way out, since
+                    // neither of those error types otherwise unify with
+                    // (usize, anyhow::Error) directly.
+                    let result: Result<TxHash, anyhow::Error> = async {
+                        let tx_hash = provider.send_raw_transaction(&raw_tx).await?.watch().await?;
+                        Ok(tx_hash)
+                    }
+                    .await;
+                    result.map_err(|e| (i, e))
                 }
             });
 
-            match futures::future::select_ok(sends.map(Box::pin)).await {
-                Ok((tx_hash, _)) => {
-                    // The RPC's returned hash should always equal the hash
-                    // computed at prepare time — raw_tx fully determines it,
-                    // nothing about broadcast can change it. A mismatch would
-                    // mean raw_tx got corrupted (clone/serialize bug) between
-                    // prepare and fire, so it's worth surfacing loudly rather
-                    // than trusting whichever hash happened to come back.
-                    if tx_hash != expected_hash {
-                        error!(%address, %tx_hash, %expected_hash, "broadcast tx hash does not match the one computed at prepare time");
-                    }
-                    info!(%address, %tx_hash, "mint confirmed");
-                    let _ = bus.send(ServerEvent::MintResult {
-                        address: format!("{address:#x}"),
-                        success: true,
-                        detail: format!("{tx_hash:#x}"),
-                    });
+            let results = join_all(sends).await;
+
+            if let Some(tx_hash) = results.iter().find_map(|r| r.as_ref().ok().copied()) {
+                // The RPC's returned hash should always equal the hash
+                // computed at prepare time — raw_tx fully determines it,
+                // nothing about broadcast can change it. A mismatch would
+                // mean raw_tx got corrupted (clone/serialize bug) between
+                // prepare and fire, so it's worth surfacing loudly rather
+                // than trusting whichever hash happened to come back.
+                if tx_hash != expected_hash {
+                    error!(%address, %tx_hash, %expected_hash, "broadcast tx hash does not match the one computed at prepare time");
                 }
-                Err(e) => {
-                    error!(%address, error = %e, "all RPC broadcasts failed for this wallet");
-                    let _ = bus.send(ServerEvent::MintResult {
-                        address: format!("{address:#x}"),
-                        success: false,
-                        detail: e.to_string(),
-                    });
-                }
+                info!(%address, %tx_hash, "mint confirmed");
+                let _ = bus.send(ServerEvent::MintResult {
+                    address: format!("{address:#x}"),
+                    success: true,
+                    detail: format!("{tx_hash:#x}"),
+                });
+            } else {
+                let detail = results
+                    .iter()
+                    .map(|r| match r {
+                        Ok(_) => unreachable!("handled by the find_map above"),
+                        Err((i, e)) => format!("rpc[{i}]: {e}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                error!(%address, error = %detail, "all RPC broadcasts failed for this wallet");
+                let _ = bus.send(ServerEvent::MintResult {
+                    address: format!("{address:#x}"),
+                    success: false,
+                    detail,
+                });
             }
         }));
     }

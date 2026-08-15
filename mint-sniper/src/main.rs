@@ -222,6 +222,15 @@ async fn balance_poll_loop(state: SharedState, http_url: String, addrs: Vec<Addr
 /// shaving this further is a real but separate optimization.
 const PREPARE_LEAD_SECS: u64 = 5;
 
+/// How often to re-run the prepare (sign) phase while armed in poll_state
+/// mode. Unlike timestamp mode, poll_state has no known trigger instant to
+/// count down to — arm-to-trigger could be minutes or hours — so a single
+/// prepare-at-arm-time goes stale the longer the mint takes to go live.
+/// Fixed interval, not adaptive: 30s bounds the worst-case staleness to
+/// "still pretty fresh" without needing to reason about how fast gas
+/// moves on any given chain.
+const POLL_STATE_REPREPARE_INTERVAL_SECS: u64 = 30;
+
 /// Owns wallet signers and the watcher task. All arm/disarm/fire commands
 /// from the API funnel through here as a single-writer loop — avoids any
 /// question of two fires racing each other from concurrent API calls.
@@ -248,6 +257,11 @@ async fn control_loop(
     // separately from watcher_handle so disarming cancels it even though
     // it's not the watcher itself.
     let mut prepare_timer_handle: Option<tokio::task::JoinHandle<()>> = None;
+    // poll_state's periodic re-prepare loop (see POLL_STATE_REPREPARE_INTERVAL_SECS).
+    // Separate from prepare_timer_handle because the two are mutually
+    // exclusive (one mode or the other) but have different shapes — one
+    // fires once, this one repeats until aborted.
+    let mut reprepare_handle: Option<tokio::task::JoinHandle<()>> = None;
     // Warmed at Arm time (or just-in-time in FireNow's fallback path below);
     // cleared on Disarm and after firing so a stale connection list can
     // never be paired with a fresh prepare, or vice versa.
@@ -329,6 +343,26 @@ async fn control_loop(
                     }
                     _ => {
                         let _ = state.control_tx.send(ControlMsg::Prepare).await;
+
+                        // No known trigger instant to count down to, so
+                        // instead of a single prepare there's a standing
+                        // loop that keeps re-signing (fresh nonce is a
+                        // no-op here since nothing was broadcast yet, fresh
+                        // gas price is the actual point) for as long as
+                        // we're armed. Disarm and FireNow both abort this —
+                        // see reprepare_handle's cleanup below.
+                        let control_tx = state.control_tx.clone();
+                        reprepare_handle = Some(tokio::spawn(async move {
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_secs(
+                                    POLL_STATE_REPREPARE_INTERVAL_SECS,
+                                ))
+                                .await;
+                                if control_tx.send(ControlMsg::Prepare).await.is_err() {
+                                    break; // control_loop is gone
+                                }
+                            }
+                        }));
                     }
                 }
 
@@ -378,6 +412,9 @@ async fn control_loop(
                     h.abort();
                 }
                 if let Some(h) = prepare_timer_handle.take() {
+                    h.abort();
+                }
+                if let Some(h) = reprepare_handle.take() {
                     h.abort();
                 }
                 prepared_fire = None;
@@ -436,6 +473,9 @@ async fn control_loop(
                     h.abort();
                 }
                 if let Some(h) = prepare_timer_handle.take() {
+                    h.abort();
+                }
+                if let Some(h) = reprepare_handle.take() {
                     h.abort();
                 }
                 prepared_fire = None;
