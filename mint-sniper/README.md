@@ -99,7 +99,14 @@ firing your wallets.
   visibility (Geth 1.11+, `newPendingTransactions` with full tx bodies) —
   many free/public RPC providers don't expose this even over WS, and
   arming fails loudly (auto-disarm + a clear error) rather than silently
-  watching nothing if the subscription isn't supported.
+  watching nothing if the subscription isn't supported. **Finding
+  `mint_enable_admin` for a project you don't control:** don't use the
+  deployer address from Etherscan's "Contract Creator" field — verified
+  against SeaDrop's actual source that ownership is a `TwoStepOwnable`
+  (transferable), and moving ownership from a deploy wallet to a cold
+  wallet/multisig before the drop goes live is routine, not an edge case.
+  Call the nft contract's `owner()` view function yourself, close to
+  arm-time, since it can change again after you check.
 - Does not manage wallet funding/withdrawal logistics — that's a separate,
   equally important operational concern (gas top-ups, consolidating minted
   NFTs to a single wallet post-mint, etc.) left out of scope here.

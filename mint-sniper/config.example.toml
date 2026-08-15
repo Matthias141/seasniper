@@ -39,6 +39,21 @@ trigger_timestamp_unix = 0        # used only if trigger_mode = "timestamp"
 # the subscription isn't available. See watcher.rs's run_mempool_watcher
 # doc comment for exactly which contract "watched contract" means in
 # seadrop mode (it's the nft contract, not the SeaDrop singleton).
+#
+# HOW TO FIND THIS FOR A PROJECT YOU DON'T CONTROL — do NOT use the
+# contract's deployer address from Etherscan's "Contract Creator" field.
+# Verified directly against SeaDrop's source (ERC721ContractMetadata.sol
+# inherits TwoStepOwnable from ProjectOpenSea/utility-contracts): ownership
+# is explicitly transferable, and it's routine practice to deploy from a
+# disposable hot wallet and then move ownership to a cold wallet or
+# multisig before the drop goes live — exactly the scenario TwoStepOwnable
+# exists to make safe. The deployer address only tells you who paid gas to
+# deploy; it says nothing about who holds owner() now or who will call the
+# enable function later. Instead, call the nft contract's owner() view
+# function (standard on any Ownable-family contract, which this is)
+# yourself, as close to arm-time as practical — ownership can change again
+# after you check, so this is a live fact to verify, not a historical one
+# to look up once.
 mint_enable_admin = ""
 
 # --- seadrop-mode-only fields, ignored when mint_mode = "custom" ---
