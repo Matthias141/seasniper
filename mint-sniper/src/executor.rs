@@ -1,7 +1,7 @@
 use crate::bus::{EventBus, ServerEvent};
 use crate::config::Config;
 use crate::wallet::{wallet_to_eth_wallet, ManagedWallet};
-use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
@@ -70,10 +70,16 @@ pub async fn fire_all_wallets(
                 let eth_wallet = eth_wallet.clone();
                 let url = url.clone();
                 async move {
-                    let provider = ProviderBuilder::new()
-                        .wallet(eth_wallet)
-                        .on_http(url.parse()?);
-                    provider.send_transaction(tx).await?.watch().await
+                    // Explicit `anyhow::Result` here (rather than inferring from
+                    // `.watch()`'s own error type) because this block also has to
+                    // convert `url::ParseError` from the RPC URL parse below — the
+                    // two error types don't otherwise unify.
+                    let parsed_url = url
+                        .parse()
+                        .map_err(|e| anyhow::anyhow!("invalid RPC url {url}: {e}"))?;
+                    let provider = ProviderBuilder::new().wallet(eth_wallet).on_http(parsed_url);
+                    let tx_hash = provider.send_transaction(tx).await?.watch().await?;
+                    Ok::<_, anyhow::Error>(tx_hash)
                 }
             });
 

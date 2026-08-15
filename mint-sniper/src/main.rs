@@ -15,7 +15,7 @@ mod state;
 mod wallet;
 mod watcher;
 
-use alloy::dyn_abi::DynSolValue;
+use alloy::dyn_abi::{DynSolValue, JsonAbiExt};
 use alloy::json_abi::Function;
 use alloy::primitives::utils::format_units;
 use alloy::primitives::{Address, U256};
@@ -225,7 +225,10 @@ async fn control_loop(
     mint_state_selector: Vec<u8>,
     mut wallets: Vec<wallet::ManagedWallet>,
 ) {
-    let mut watcher_handle: Option<tokio::task::JoinHandle<()>> = None;
+    // Both watcher fns (run_timestamp_watcher, run_state_poll_watcher) return
+    // anyhow::Result<()>, not (); the handle type has to match whichever the
+    // `match` below spawns, and it's the same for either arm.
+    let mut watcher_handle: Option<tokio::task::JoinHandle<Result<()>>> = None;
 
     while let Some(msg) = control_rx.recv().await {
         match msg {

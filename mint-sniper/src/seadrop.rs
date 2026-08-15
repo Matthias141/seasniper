@@ -22,7 +22,7 @@
 //! have. If a drop you're targeting isn't in its public stage, this module
 //! doesn't help you snipe it.
 
-use alloy::dyn_abi::DynSolValue;
+use alloy::dyn_abi::{DynSolValue, FunctionExt, JsonAbiExt};
 use alloy::json_abi::Function;
 use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
