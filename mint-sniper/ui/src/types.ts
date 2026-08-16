@@ -58,6 +58,13 @@ export interface OfficialLinks {
   project_url: string | null;
 }
 
+export interface SearchHit {
+  slug: string;
+  name: string;
+  image_url: string | null;
+  opensea_url: string | null;
+}
+
 export interface ResolvedTarget {
   nft_contract: string;
   name: string | null;

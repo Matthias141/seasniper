@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import styles from './TargetResolver.module.css';
 import { api } from '../lib/api';
-import type { ResolvedTarget } from '../types';
+import type { ResolvedTarget, SearchHit } from '../types';
 
 // Simple BigInt-based wei -> ETH string, avoids Number precision loss on
 // large wei values (a plain `Number(wei) / 1e18` can silently round).
@@ -22,12 +22,25 @@ function fmtTime(unix: number): string {
 }
 
 /**
- * step 8b: paste a contract address or an OpenSea collection URL,
- * resolve + verify it (price/timing/maxPerWallet via a fresh
+ * step 8b/8c: paste a contract address or an OpenSea collection URL (or
+ * pick a candidate from a name search — see the SEARCH BY NAME section
+ * below), resolve + verify it (price/timing/maxPerWallet via a fresh
  * getPublicDrop, on the backend), and — as a deliberately separate,
  * explicit second action — confirm it as the bot's active target.
  * Resolving never changes bot state on its own; see api.rs's
  * post_target_resolve doc comment for why that split exists.
+ *
+ * Search is a visually and functionally DISTINCT section from the paste
+ * box, not a single mode-detected input, on purpose (8c): a name search
+ * returns ambiguous candidates a namesquatter could plant a fake among,
+ * where a pasted address/URL is something the operator already had in
+ * hand and trusted enough to paste. Blurring those two into one "smart"
+ * input would blur exactly the distinction that matters — the operator
+ * should consciously know which kind of trust they're extending. Picking
+ * a search result routes through this SAME resolve pipeline (fills the
+ * paste box with the selected candidate's OpenSea URL and resolves it)
+ * rather than skipping straight to a set — a search hit is not
+ * pre-verified just because it came from OpenSea's index.
  */
 export function TargetResolver({ onTargetSet }: { onTargetSet: (nftContract: string) => void }) {
   const [input, setInput] = useState('');
@@ -37,14 +50,20 @@ export function TargetResolver({ onTargetSet }: { onTargetSet: (nftContract: str
   const [setting, setSetting] = useState(false);
   const [confirmedContract, setConfirmedContract] = useState<string | null>(null);
 
-  async function resolve() {
-    if (!input.trim()) return;
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [searchResults, setSearchResults] = useState<SearchHit[] | null>(null);
+  const [searchError, setSearchError] = useState<string | null>(null);
+
+  async function resolve(overrideInput?: string) {
+    const value = (overrideInput ?? input).trim();
+    if (!value) return;
     setResolving(true);
     setError(null);
     setResolved(null);
     setConfirmedContract(null);
     try {
-      const r = await api.resolveTarget(input.trim());
+      const r = await api.resolveTarget(value);
       setResolved(r);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'resolve failed');
@@ -69,6 +88,33 @@ export function TargetResolver({ onTargetSet }: { onTargetSet: (nftContract: str
     }
   }
 
+  async function search() {
+    if (!searchQuery.trim()) return;
+    setSearching(true);
+    setSearchError(null);
+    setSearchResults(null);
+    try {
+      const hits = await api.searchTargets(searchQuery.trim());
+      setSearchResults(hits);
+    } catch (e) {
+      setSearchError(e instanceof Error ? e.message : 'search failed');
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function pickSearchResult(hit: SearchHit) {
+    // Reuses the exact same resolve pipeline the paste box uses — a
+    // search hit only ever has a slug/name/image (confirmed against
+    // OpenSea's own response shape, see opensea.rs), never a contract
+    // address or official links, so it MUST go through a real
+    // getPublicDrop verification before it's shown as anything more than
+    // a name to pick.
+    const url = `https://opensea.io/collection/${hit.slug}`;
+    setInput(url);
+    void resolve(url);
+  }
+
   const links = resolved?.links;
   const hasLinks =
     links && (links.twitter_username || links.discord_url || links.instagram_username || links.telegram_url || links.project_url);
@@ -85,7 +131,7 @@ export function TargetResolver({ onTargetSet }: { onTargetSet: (nftContract: str
           placeholder="0x... contract address, or an OpenSea collection URL"
           spellCheck={false}
         />
-        <button className={styles.resolveBtn} onClick={resolve} disabled={resolving || !input.trim()}>
+        <button className={styles.resolveBtn} onClick={() => resolve()} disabled={resolving || !input.trim()}>
           {resolving ? 'RESOLVING…' : 'RESOLVE'}
         </button>
       </div>
@@ -151,6 +197,54 @@ export function TargetResolver({ onTargetSet }: { onTargetSet: (nftContract: str
               {setting ? 'SETTING…' : 'SET AS ACTIVE TARGET'}
             </button>
           )}
+        </div>
+      )}
+
+      <hr className={styles.divider} />
+
+      <h2 className={styles.heading}>SEARCH BY NAME</h2>
+      <p className={styles.warningBox}>
+        ⚠ Search results are NOT verified and may include fake/namesquatted collections.
+        Confirm official links (below, once resolved) before treating a result as the real
+        project — and never arm on a search result alone.
+      </p>
+
+      <div className={styles.row}>
+        <input
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && search()}
+          placeholder="collection name…"
+          spellCheck={false}
+        />
+        <button className={styles.resolveBtn} onClick={search} disabled={searching || !searchQuery.trim()}>
+          {searching ? 'SEARCHING…' : 'SEARCH'}
+        </button>
+      </div>
+      <p className={styles.hint}>Requires opensea_api_key_env — no zero-key path for name search.</p>
+
+      {searchError && <p className={styles.error}>{searchError}</p>}
+
+      {searchResults && (
+        <div className={styles.pickList}>
+          {searchResults.length === 0 && <p className={styles.hint}>no results</p>}
+          {searchResults.map((hit) => (
+            <button key={hit.slug} className={styles.pickItem} onClick={() => pickSearchResult(hit)}>
+              {hit.image_url && <img src={hit.image_url} alt="" className={styles.pickImage} />}
+              <span className={styles.pickName}>{hit.name || hit.slug}</span>
+              {hit.opensea_url && (
+                <a
+                  href={hit.opensea_url}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                  className={styles.pickLink}
+                >
+                  view on OpenSea
+                </a>
+              )}
+            </button>
+          ))}
         </div>
       )}
     </section>

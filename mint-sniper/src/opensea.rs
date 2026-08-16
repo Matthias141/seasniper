@@ -25,6 +25,34 @@
 //! has no documented turnaround. See `opensea_api_key_env`'s doc comment
 //! in `config.rs`: an instant key is not a "set once and forget"
 //! credential.
+//!
+//! NAMESQUATTING RISK (8c) — a free-text search returns AMBIGUOUS
+//! candidates, unlike 8b's address/URL resolve where the operator
+//! already has one specific thing in hand. Deploying a fake collection
+//! with a name identical or near-identical to a real drop, timed to
+//! catch people searching for it, is a standard scam pattern in this
+//! space — designed around explicitly, not incidentally:
+//!   - `search_collections` never auto-selects anything; it returns a
+//!     picklist. OpenSea's result ordering is NOT treated as a trust
+//!     signal anywhere in this file or in `api.rs`'s handler — first
+//!     isn't "most likely correct," it's just whatever OpenSea's search
+//!     ranking returned.
+//!   - No Twitter/X search or scraping integration exists here, and none
+//!     should be added. Real-time X search needs a paid API tier,
+//!     scraping would violate X's ToS, and — the more fundamental reason
+//!     — X is itself a common vector for spreading fake mint links, so
+//!     using it as an input to a system that decides where to send money
+//!     is exactly backwards. What this does instead: `resolve_slug`'s
+//!     `OfficialLinks` surfaces whatever social links a project put on
+//!     their OWN OpenSea collection page, so the operator can go verify
+//!     on X themselves, using their own judgment — this codebase never
+//!     treats those links as verified, only as a pointer.
+//!   - Every candidate a search returns is still just a slug/name/image
+//!     — no contract address, confirmed directly against OpenSea's own
+//!     schema (see `search_collections`'s doc comment). It MUST go
+//!     through `target::resolve_address` (the same verification 8b's
+//!     direct paste flow uses) before it's a usable target — a search
+//!     hit is not pre-verified just because it came from OpenSea's index.
 
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
@@ -172,10 +200,90 @@ pub async fn resolve_slug(client: &reqwest::Client, api_key: Option<&str>, slug:
     })
 }
 
-// Free-text collection search (step 8c: SearchHit, search_collections,
-// and their response types) lands in its own commit, deliberately not
-// here — see this file's tests and CLAUDE.md for why 8c is scoped as a
-// separate, more cautious feature than 8b's direct resolve.
+/// One unverified search hit — name/slug/image only, per OpenSea's
+/// actual search response shape (confirmed directly against
+/// docs.opensea.io/reference/search: no contract address or social links
+/// are included in search results, only in the single-collection
+/// endpoint `resolve_slug` calls). This is exactly why every candidate
+/// still needs a separate `resolve_slug` call before it's usable — see
+/// this file's and CLAUDE.md's 8c reasoning on namesquatting risk.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    pub slug: String,
+    pub name: String,
+    pub image_url: Option<String>,
+    pub opensea_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    results: Vec<SearchResultEntry>,
+}
+
+#[derive(Deserialize)]
+struct SearchResultEntry {
+    #[serde(rename = "type")]
+    kind: String,
+    collection: Option<SearchCollectionEntry>,
+}
+
+#[derive(Deserialize)]
+struct SearchCollectionEntry {
+    // OpenSea's own schema names this field "collection" too (it's the
+    // slug) — confirmed directly against docs.opensea.io/reference/search,
+    // not a typo here.
+    #[serde(rename = "collection")]
+    slug: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    image_url: Option<String>,
+    #[serde(default)]
+    opensea_url: Option<String>,
+}
+
+/// Free-text collection search via `GET /v2/search?asset_types=collection`
+/// — 8c. Returns the top `limit` hits in whatever order OpenSea returns
+/// them; that order is NOT a trust signal (see this module's and
+/// CLAUDE.md's namesquatting-risk reasoning) and callers must not
+/// auto-select the first result. Requires an API key — unlike 8b's
+/// address/URL resolve, there is no zero-key path for a name search at
+/// all.
+pub async fn search_collections(client: &reqwest::Client, api_key: &str, query: &str, limit: u8) -> Result<Vec<SearchHit>> {
+    let resp = client
+        .get(format!("{OPENSEA_API_BASE}/search"))
+        .header("X-API-KEY", api_key)
+        .query(&[
+            ("query", query),
+            ("asset_types", "collection"),
+            ("limit", &limit.to_string()),
+        ])
+        .send()
+        .await
+        .context("calling OpenSea's search endpoint")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("OpenSea search returned {status}: {body}");
+    }
+
+    let parsed: SearchResponse = resp.json().await.context("parsing OpenSea search response")?;
+
+    Ok(parsed
+        .results
+        .into_iter()
+        .filter(|r| r.kind == "collection")
+        .filter_map(|r| r.collection)
+        .map(|c| SearchHit {
+            slug: c.slug,
+            name: c.name,
+            image_url: c.image_url,
+            opensea_url: c.opensea_url,
+        })
+        .collect())
+}
 
 #[cfg(test)]
 mod tests {

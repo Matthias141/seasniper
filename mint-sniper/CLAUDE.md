@@ -61,7 +61,8 @@ src/
                  mint-result events — see its doc comment and
                  RUNBOOK.md's post-fire-verification section
   api.rs       — axum router: GET/PUT /api/config, GET /api/status,
-                 POST /api/arm|/api/abort|/api/trigger|/api/copymint/fire,
+                 POST /api/arm|/api/abort|/api/trigger|/api/copymint/fire|
+                 /api/target/resolve|/api/target/set|/api/target/search,
                  WS /ws/events, GET /api/token (unauthenticated bootstrap
                  route)
   copymint.rs  — step 6: watches tracked_wallets for SeaDrop mintPublic
@@ -70,6 +71,18 @@ src/
                  trigger_mode/armed state — see its own doc comment and
                  the "copymint" section below for the full design and
                  safety model.
+  opensea.rs   — step 8: OpenSea REST API integration (not the SeaDrop
+                 contract) — parses a pasted address/URL, resolves an
+                 OpenSea collection slug to a contract address + official
+                 links (8b), and free-text collection search (8c). See
+                 its own doc comment for the API-key reality check and
+                 the namesquatting-risk reasoning behind 8c's design.
+  target.rs    — step 8b: orchestrates opensea.rs + seadrop.rs into a
+                 verified target (getPublicDrop + a fee_recipient
+                 allow-check) — the shared logic behind both
+                 /api/target/resolve (read-only) and /api/target/set
+                 (which re-runs it fresh rather than trusting an earlier
+                 /resolve result).
 
 ui/            — Vite + React + TS PWA, "Terminal Command Deck" design
                  (see ui/src/styles/tokens.css for the token system)
@@ -88,6 +101,28 @@ just firing — both touch wallet signers, so both have to stay inside
 rule for a dynamically-discovered mint target: `copymint.rs` and
 `api.rs`'s `/api/copymint/fire` route both only ever *send* it, never
 touch wallets directly themselves.
+
+**`contract`/`admin_watch_target`/`mint_calldata`/`mint_value` are
+runtime-mutable, not fixed at startup (as of step 8a/8b).** Originally
+these were `control_loop` function parameters, set once in `main()` from
+the config that existed at boot and never revisited. Two changes broke
+that assumption on purpose:
+- 8a: `mint_value` is re-derived from a fresh `getPublicDrop` call on
+  every `ControlMsg::Prepare` outside `timestamp` mode (SeaDrop's
+  `updatePublicDrop` can change `mintPrice` — including free → paid —
+  at any time between arm and fire).
+- 8b: `ControlMsg::SetTarget` (sent only by `api.rs`'s
+  `/api/target/set`, itself always re-verifying fresh — see `target.rs`)
+  updates `admin_watch_target`/`mint_calldata`/`mint_value` when the
+  operator swaps the active `nft_contract` from the UI. `contract` (the
+  SeaDrop singleton address) is the one exception that stays fixed —
+  8b only swaps the `nftContract` argument within singleton calls, never
+  the singleton itself, and is scoped to `mint_mode = "seadrop"` only.
+
+Both changes shadow the original parameter with a `let mut` at the top
+of `control_loop` — search for `// step 8a` / `// step 8b` there before
+assuming any of these four values are the boot-time constants they used
+to be.
 
 Wallet signers (i.e. private key material in memory) live only in
 `control_loop`'s local scope in `main.rs` and inside `executor.rs`. They
@@ -343,6 +378,71 @@ validation — tracked-wallet detection actually firing, an opportunity
 actually surfacing in the UI, manual fire actually working — from an
 environment without this sandbox's WS/TLS limitation before it's
 trustworthy for a real drop.**
+
+## Target resolution (step 8b/8c)
+
+Lets the operator point the bot at a SeaDrop collection from the UI —
+paste an address/URL and confirm (8b), or search by name first (8c) —
+instead of hand-editing `nft_contract` in `config.toml`. Full design
+lives in `src/opensea.rs`/`src/target.rs`'s doc comments; summary here.
+
+**Two-step shape, same as copymint's**: resolving/searching never
+changes bot state. Only `/api/target/set` commits, and it always
+re-verifies fresh (never trusts an earlier `/resolve` result or a
+client-echoed price) before sending `ControlMsg::SetTarget` through
+`control_loop` and persisting to `config.toml`.
+
+**8b vs 8c — deliberately different risk postures, not the same feature
+with an extra search box bolted on:**
+- 8b (paste an address or OpenSea URL): the operator already has one
+  specific thing in hand. A raw address needs zero external calls; an
+  OpenSea URL needs `opensea_api_key_env` configured (see the API-key
+  correction below) to resolve the slug to a contract address.
+- 8c (search by name): returns AMBIGUOUS candidates — this is
+  meaningfully riskier, because namesquatting (a fake collection
+  deployed with an identical or near-identical name to catch people
+  searching for a real drop) is a standard scam pattern in this space,
+  not a hypothetical. Designed around explicitly:
+  - `opensea::search_collections` never auto-selects a result; the UI
+    (`TargetResolver.tsx`'s "SEARCH BY NAME" section) renders a picklist,
+    with a visible, deliberately louder-than-routine warning that results
+    are unverified. OpenSea's result ordering is never treated as a
+    trust signal anywhere in this codebase.
+  - **No Twitter/X search or scraping integration exists, and none
+    should be added.** Real-time X search needs a paid API tier,
+    scraping violates X's ToS, and — the more fundamental reason — X is
+    itself a common vector for spreading fake mint links, so using it as
+    an input to a system that decides where to send money is backwards.
+    Instead: `resolve_slug` surfaces whatever official links (X, Discord,
+    website, etc.) a project put on their OWN OpenSea collection page,
+    so the operator can go verify on X themselves, using their own
+    judgment — those links are a pointer, never treated as verified.
+  - Picking a search result does NOT skip straight to `/api/target/set`
+    — it feeds the candidate's slug back into the exact same
+    resolve-then-verify pipeline 8b's paste box uses (see
+    `TargetResolver.tsx`'s `pickSearchResult`). A search hit is not
+    pre-verified just because it came from OpenSea's index; every
+    candidate still needs a real `getPublicDrop` call before it means
+    anything.
+
+**API key reality check, found by checking rather than assuming.** This
+feature's original framing was "8b's slug/URL resolution needs no API
+key" — that's out of date. Confirmed directly against docs.opensea.io:
+OpenSea's v2 `/collections/{slug}` endpoint (8b) and `/search` (8c) both
+now require an `x-api-key` header. Only a raw `0x` address (8b) needs
+zero external calls. Also confirmed directly, not assumed still the old
+multi-day-manual-only process: OpenSea now also offers an instant
+self-serve key (one API call, no signup) alongside the traditional
+application-form key — but the instant key expires after 7 days, so it's
+not a set-once-and-forget credential (see `opensea_api_key_env`'s doc
+comment in `config.rs`).
+
+**Scope**: seadrop mode only, same as copymint — no `getPublicDrop`/
+collection concept exists for `mint_mode = "custom"`. **Not step-up-auth
+gated yet**: `/api/target/set` changes where the bot's next mint sends
+money, the same sensitivity class as `/api/arm`/`/api/trigger`, but step
+10 (identity) isn't merged as of this writing — there's a TODO comment
+directly on that route so this isn't missed when 10f lands.
 
 ## Alloy 0.9 → 2.4.1 upgrade (step 9)
 

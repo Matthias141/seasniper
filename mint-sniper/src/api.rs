@@ -2,6 +2,7 @@ use crate::auth;
 use crate::bus;
 use crate::config::Config;
 use crate::copymint;
+use crate::opensea;
 use crate::state::{ControlMsg, SharedState};
 use crate::target;
 use alloy::primitives::Address;
@@ -47,6 +48,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/copymint/fire", post(post_copymint_fire))
         .route("/api/target/resolve", post(post_target_resolve))
         .route("/api/target/set", post(post_target_set))
+        .route("/api/target/search", post(post_target_search))
         .route("/ws/events", get(ws_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_token));
 
@@ -323,6 +325,53 @@ async fn post_target_set(
         .await;
 
     Json(resolved_target_json(&resolved, now)).into_response()
+}
+
+#[derive(Deserialize)]
+struct TargetSearchRequest {
+    query: String,
+}
+
+/// How many candidates to return, per 8c's "top 5-10 candidates"
+/// instruction — the low end of that range, since every candidate is
+/// unverified and the UI fetches full verification details only for
+/// whichever one the operator actually selects (see TargetSearch.tsx),
+/// so a larger number here only means more unverified noise in the
+/// picklist, not more safety.
+const SEARCH_RESULT_LIMIT: u8 = 8;
+
+/// Free-text collection name search (step 8c). Read-only, same as
+/// resolve — returns unverified candidates (name/slug/image only, per
+/// OpenSea's own search response shape) for the operator to pick from.
+/// NONE of these are pre-verified: picking one still requires a separate
+/// `/api/target/resolve` (or going straight to `/api/target/set`, which
+/// re-verifies regardless) before it means anything. See opensea.rs's
+/// doc comment for the full namesquatting-risk reasoning this design is
+/// built around — OpenSea's result order is never treated as a trust
+/// signal here or anywhere downstream of this handler.
+async fn post_target_search(
+    State(state): State<SharedState>,
+    Json(req): Json<TargetSearchRequest>,
+) -> impl IntoResponse {
+    let cfg = state.config.read().await.clone();
+    let api_key = match cfg.resolve_opensea_api_key() {
+        Some(k) => k,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "name search needs an OpenSea API key (opensea_api_key_env in config is unset or \
+                 the env var it names isn't set) — a name search has no zero-key path, unlike a \
+                 raw address or a pasted OpenSea URL"
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+
+    match opensea::search_collections(&state.http_client, &api_key, &req.query, SEARCH_RESULT_LIMIT).await {
+        Ok(hits) => Json(hits).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {

@@ -1,4 +1,4 @@
-import type { Config, ResolvedTarget, StatusResponse } from '../types';
+import type { Config, ResolvedTarget, SearchHit, StatusResponse } from '../types';
 
 // Bootstrapped once at app startup from GET /api/token — the one route the
 // Rust backend doesn't require the token on, since this is how the token
@@ -82,4 +82,14 @@ export const api = {
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ nft_contract: nftContract }),
     }).then((r) => json<ResolvedTarget>(r)),
+
+  // step 8c — returns unverified name-search candidates only; every one
+  // still needs resolveTarget before it's usable. See api.rs's
+  // post_target_search and opensea.rs's namesquatting-risk reasoning.
+  searchTargets: (query: string) =>
+    fetch('/api/target/search', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ query }),
+    }).then((r) => json<SearchHit[]>(r)),
 };
