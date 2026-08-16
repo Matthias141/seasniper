@@ -165,6 +165,19 @@ async fn promote_if_complete(pool: &SqlitePool, session_id: &str) -> Result<()> 
     Ok(())
 }
 
+/// Looks up a user's email by id — used wherever TOTP/WebAuthn need an
+/// account_name/display value (see totp.rs's `account_name` parameter).
+/// Not cached: this DB is tiny and local, and email can change (see
+/// `find_or_create_user`'s doc comment), so always reading it fresh here
+/// is simpler than inventing an invalidation story for a cache.
+pub async fn get_user_email(pool: &SqlitePool, user_id: &str) -> Result<String> {
+    sqlx::query_scalar::<_, String>("SELECT email FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .context("looking up user email")
+}
+
 /// Soft-revokes a session (10e's device revoke, and anywhere else a
 /// session needs to be killed server-side). Sets `revoked_at` rather than
 /// deleting the row, so a revoked device still shows up in a device

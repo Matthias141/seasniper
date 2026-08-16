@@ -2,7 +2,7 @@ use crate::auth;
 use crate::bus;
 use crate::config::Config;
 use crate::copymint;
-use crate::identity::session;
+use crate::identity::{session, totp};
 use crate::opensea;
 use crate::state::{ControlMsg, SharedState};
 use crate::target;
@@ -83,7 +83,10 @@ pub fn router(state: SharedState) -> Router {
         .route("/auth/google/login", get(get_auth_google_login))
         .route("/auth/google/callback", get(get_auth_google_callback))
         .route("/auth/logout", post(post_auth_logout))
-        .route("/auth/session", get(get_auth_session));
+        .route("/auth/session", get(get_auth_session))
+        .route("/auth/totp/setup/start", post(post_totp_setup_start))
+        .route("/auth/totp/setup/verify", post(post_totp_setup_verify))
+        .route("/auth/totp/verify", post(post_totp_verify));
 
     let dev_origin = HeaderValue::from_static("http://localhost:5173");
     let prod_origin_a = HeaderValue::from_static("http://127.0.0.1:4117");
@@ -542,6 +545,110 @@ async fn get_auth_session(State(state): State<SharedState>, headers: HeaderMap) 
             "webauthn_verified": s.webauthn_verified_at.is_some(),
         })),
         _ => Json(serde_json::json!({ "signed_in": false })),
+    }
+}
+
+/// Extracts the caller's active session from the session cookie, or a
+/// 401. Used by every route that needs "a signed-in user" but not
+/// necessarily admin_tier yet — TOTP/WebAuthn setup and per-login
+/// verification are exactly how a session PROGRESSES toward admin_tier,
+/// so they can't themselves require it. Routes that DO need admin_tier
+/// (once 10f's step-up auth exists) will check `session.admin_tier`
+/// explicitly on top of this, not replace it.
+async fn require_session(state: &SharedState, headers: &HeaderMap) -> Result<session::Session, (StatusCode, String)> {
+    let jar = PrivateCookieJar::from_headers(headers, state.identity_cookie_key.clone());
+    let cookie = jar
+        .get(SESSION_COOKIE)
+        .ok_or((StatusCode::UNAUTHORIZED, "not signed in".to_string()))?;
+    session::get_active(&state.identity_db, cookie.value())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
+        .ok_or((StatusCode::UNAUTHORIZED, "not signed in".to_string()))
+}
+
+/// Generates a fresh TOTP secret for the signed-in user and returns a QR
+/// code + base32 manual-entry fallback (step 10d). Does NOT enable
+/// anything yet — see totp.rs's start_setup doc comment.
+async fn post_totp_setup_start(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let session = match require_session(&state, &headers).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let email = match session::get_user_email(&state.identity_db, &session.user_id).await {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    };
+    match totp::start_setup(&state.identity_db, &state.identity_totp_cipher, &session.user_id, &email).await {
+        Ok(material) => Json(serde_json::json!({
+            "qr_data_uri": material.qr_data_uri,
+            "secret_base32": material.secret_base32,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TotpCodeRequest {
+    code: String,
+}
+
+/// Completes TOTP setup: proves the operator's authenticator app has a
+/// working copy of the secret from `start_setup`, before anything ever
+/// treats TOTP as "on". Also marks THIS session's TOTP stage done — the
+/// live verification a fresh setup requires doubles as this session's
+/// per-login TOTP check, since it's the exact same proof.
+async fn post_totp_setup_verify(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<TotpCodeRequest>,
+) -> impl IntoResponse {
+    let session = match require_session(&state, &headers).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let email = match session::get_user_email(&state.identity_db, &session.user_id).await {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    };
+    match totp::verify_setup(&state.identity_db, &state.identity_totp_cipher, &session.user_id, &email, &req.code).await {
+        Ok(true) => {
+            if let Err(e) = session::mark_totp_verified(&state.identity_db, &session.id).await {
+                bus::log(&state.bus, "error", format!("totp setup verified but marking session failed: {e:#}"));
+            }
+            bus::log(&state.bus, "info", "TOTP 2FA enabled");
+            StatusCode::OK.into_response()
+        }
+        Ok(false) => (StatusCode::UNAUTHORIZED, "incorrect code").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+/// Per-login TOTP check for a user whose secret is already enabled from
+/// a prior setup — see totp.rs's verify_login for the replay-protection
+/// details (a code can only ever be accepted once).
+async fn post_totp_verify(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<TotpCodeRequest>,
+) -> impl IntoResponse {
+    let session = match require_session(&state, &headers).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let email = match session::get_user_email(&state.identity_db, &session.user_id).await {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    };
+    match totp::verify_login(&state.identity_db, &state.identity_totp_cipher, &session.user_id, &email, &req.code).await {
+        Ok(true) => {
+            if let Err(e) = session::mark_totp_verified(&state.identity_db, &session.id).await {
+                bus::log(&state.bus, "error", format!("totp verified but marking session failed: {e:#}"));
+            }
+            StatusCode::OK.into_response()
+        }
+        Ok(false) => (StatusCode::UNAUTHORIZED, "incorrect or already-used code").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
 }
 
