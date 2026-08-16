@@ -113,6 +113,31 @@ pub struct Config {
     /// (no documented turnaround).
     #[serde(default)]
     pub opensea_api_key_env: String,
+
+    /// --- identity (step 10c) ---
+    /// Google Cloud Console OAuth 2.0 Client ID. Not a secret by itself
+    /// (Google's own docs treat it as public — it's embedded in the
+    /// authorization URL, which is visible to the browser), so it lives
+    /// directly in config.toml rather than behind an env-var-name
+    /// indirection.
+    #[serde(default)]
+    pub google_oauth_client_id: String,
+    /// Env var NAME holding the OAuth Client Secret — same
+    /// name-not-value convention as `WalletCfg::private_key_env` and
+    /// `opensea_api_key_env`. This one IS a real secret and must never
+    /// appear in config.toml or round-trip to the UI.
+    #[serde(default)]
+    pub google_oauth_client_secret_env: String,
+    /// Full callback URL Google redirects back to
+    /// (e.g. `https://<tailscale-magicdns-name>:4117/auth/google/callback`).
+    /// Must exactly match a Redirect URI registered on the OAuth client
+    /// in Google Cloud Console — Google rejects any mismatch. See
+    /// identity/oidc.rs's doc comment for why this can be a Tailscale
+    /// MagicDNS name without exposing anything to the public internet:
+    /// the OAuth server only needs the user's browser to be able to
+    /// reach it, not Google's own backend.
+    #[serde(default)]
+    pub google_oauth_redirect_url: String,
 }
 
 fn default_mint_mode() -> String {
@@ -193,6 +218,29 @@ impl Config {
             }
         }
 
+        // All-or-nothing: a config with google_oauth_client_id set but
+        // the secret env var name or redirect URL missing (or vice
+        // versa) is a half-configured identity setup that would fail
+        // confusingly at first-login time rather than at startup/save
+        // time — same "reject the bad shape early" principle as every
+        // other check in this function.
+        let google_fields = [
+            !self.google_oauth_client_id.is_empty(),
+            !self.google_oauth_client_secret_env.is_empty(),
+            !self.google_oauth_redirect_url.is_empty(),
+        ];
+        if google_fields.iter().any(|f| *f) && !google_fields.iter().all(|f| *f) {
+            anyhow::bail!(
+                "google_oauth_client_id, google_oauth_client_secret_env, and \
+                 google_oauth_redirect_url must all be set together, or all left empty \
+                 — partial Google Sign-In configuration would only fail later, at login time"
+            );
+        }
+        if !self.google_oauth_redirect_url.is_empty() {
+            url::Url::parse(&self.google_oauth_redirect_url)
+                .with_context(|| format!("invalid google_oauth_redirect_url: {}", self.google_oauth_redirect_url))?;
+        }
+
         Ok(())
     }
 
@@ -220,6 +268,19 @@ impl Config {
             return None;
         }
         env::var(&self.opensea_api_key_env).ok()
+    }
+
+    /// Resolves the Google OAuth client secret from
+    /// `google_oauth_client_secret_env`. Unlike `resolve_opensea_api_key`,
+    /// a configured-but-unresolvable var here is treated as fatal by the
+    /// caller (main.rs) — Google Sign-In being half-set-up (client_id
+    /// present, secret missing from the environment) should fail loudly
+    /// at startup, not silently leave the login route broken.
+    pub fn resolve_google_oauth_client_secret(&self) -> Option<String> {
+        if self.google_oauth_client_secret_env.is_empty() {
+            return None;
+        }
+        env::var(&self.google_oauth_client_secret_env).ok()
     }
 }
 
@@ -259,6 +320,9 @@ mod tests {
             copymint_auto_fire_paid: false,
             max_copymint_price_wei: 0,
             opensea_api_key_env: String::new(),
+            google_oauth_client_id: String::new(),
+            google_oauth_client_secret_env: String::new(),
+            google_oauth_redirect_url: String::new(),
         }
     }
 
@@ -373,6 +437,38 @@ mod tests {
         assert!(cfg.copymint_auto_fire_free, "free copymints must default to auto-fireable");
         assert!(!cfg.copymint_auto_fire_paid, "paid copymints must default to NOT auto-fireable");
         assert_eq!(cfg.max_copymint_price_wei, 0, "paid ceiling must default to 0 (nothing fireable until raised)");
+    }
+
+    #[test]
+    fn google_oauth_fields_all_empty_is_valid() {
+        assert!(valid_config().validate().is_ok());
+    }
+
+    #[test]
+    fn google_oauth_fields_all_set_is_valid() {
+        let mut cfg = valid_config();
+        cfg.google_oauth_client_id = "abc.apps.googleusercontent.com".to_string();
+        cfg.google_oauth_client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET".to_string();
+        cfg.google_oauth_redirect_url = "https://sniper.tailnet-name.ts.net:4117/auth/google/callback".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn google_oauth_partial_config_is_rejected() {
+        let mut cfg = valid_config();
+        cfg.google_oauth_client_id = "abc.apps.googleusercontent.com".to_string();
+        // secret env and redirect url left empty — must be rejected, not
+        // silently accepted and left to fail at login time.
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn google_oauth_bad_redirect_url_is_rejected() {
+        let mut cfg = valid_config();
+        cfg.google_oauth_client_id = "abc.apps.googleusercontent.com".to_string();
+        cfg.google_oauth_client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET".to_string();
+        cfg.google_oauth_redirect_url = "not a url".to_string();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

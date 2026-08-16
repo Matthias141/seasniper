@@ -59,7 +59,11 @@ axum-extra = { version = "0.9", default-features = false, features = ["cookie-pr
 sqlx = { version = "0.9", default-features = false, features = ["sqlite-bundled", "runtime-tokio", "migrate", "macros", "tls-none"] }
 # TOTP secrets and WebAuthn credential-adjacent fields at rest, encrypted
 # with the same key-file pattern auth.rs already uses for the bearer token.
-aes-gcm = "0.11"
+# Pinned to 0.10, not the newer 0.11 line: 0.11 reworked its Nonce/Key
+# types onto the newer `hybrid-array` crate (a real, documented API
+# change, not a guess) — 0.10.x's typenum/generic-array-based API is the
+# one actually used in identity/crypto.rs, checked live against docs.rs.
+aes-gcm = "0.10"
 # User IDs / session IDs, and webauthn-rs's own user-handle type.
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"

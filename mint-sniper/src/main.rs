@@ -14,6 +14,7 @@ mod config;
 mod copymint;
 mod db;
 mod executor;
+mod identity;
 mod opensea;
 mod seadrop;
 mod state;
@@ -38,6 +39,7 @@ const TOKEN_PATH: &str = ".sniper-token";
 const AUDIT_LOG_PATH: &str = "audit.log";
 const API_BIND_ADDR: &str = "127.0.0.1:4117";
 const IDENTITY_DB_PATH: &str = "identity.db";
+const SESSION_KEY_PATH: &str = ".session-key";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -183,6 +185,34 @@ async fn main() -> Result<()> {
     let identity_db = db::open(IDENTITY_DB_PATH)
         .await
         .context("opening identity DB")?;
+    let identity_keys =
+        identity::crypto::load_or_create(SESSION_KEY_PATH).context("loading/creating session key material")?;
+
+    // Google Sign-In (step 10c) is opt-in at the config level: an
+    // existing config.toml with none of the google_oauth_* fields set
+    // still starts up exactly as before, with identity routes returning
+    // a clear "not configured" error rather than the whole bot failing
+    // to boot. Once configured, a broken setup (bad client id, no
+    // network to accounts.google.com) DOES fail startup loudly — a
+    // deliberately-enabled identity feature that silently doesn't work
+    // is worse than a boot failure that says why.
+    let google_oidc = if !cfg.google_oauth_client_id.is_empty() {
+        let secret = cfg
+            .resolve_google_oauth_client_secret()
+            .context("google_oauth_client_id is set but google_oauth_client_secret_env is unset or unresolvable")?;
+        let oidc = identity::oidc::GoogleOidc::discover(
+            cfg.google_oauth_client_id.clone(),
+            secret,
+            cfg.google_oauth_redirect_url.clone(),
+        )
+        .await
+        .context("initializing Google Sign-In")?;
+        info!("Google Sign-In configured and discovery succeeded");
+        Some(Arc::new(oidc))
+    } else {
+        info!("Google Sign-In not configured (google_oauth_client_id unset) — /auth/google/* routes will 503");
+        None
+    };
 
     let app_state: SharedState = Arc::new(AppState {
         config: RwLock::new(cfg.clone()),
@@ -194,6 +224,9 @@ async fn main() -> Result<()> {
         api_token,
         http_client: reqwest::Client::new(),
         identity_db,
+        identity_cookie_key: identity_keys.cookie_key,
+        identity_totp_cipher: identity_keys.totp_cipher,
+        google_oidc,
     });
 
     // Background: refresh wallet ETH balances every 15s and push updates

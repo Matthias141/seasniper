@@ -119,3 +119,12 @@ copymint_auto_fire_paid = false
 # 0 = nothing paid is fireable until you raise this deliberately.
 max_copymint_price_wei = 0
 
+# --- identity (step 10c) — Google Sign-In. Leave all three empty/unset
+# to leave identity disabled entirely (existing bearer-token-only
+# behavior, unchanged) — the app boots and runs exactly as before.
+# All three must be set together or not at all (Config::validate rejects
+# a partial set). See CLAUDE.md's "Identity (step 10)" section.
+google_oauth_client_id = ""             # e.g. "123-abc.apps.googleusercontent.com" — NOT a secret, from Google Cloud Console
+google_oauth_client_secret_env = ""     # env var NAME (not the value) holding the OAuth Client Secret, e.g. "GOOGLE_OAUTH_CLIENT_SECRET"
+google_oauth_redirect_url = ""          # must exactly match a Redirect URI registered on the OAuth client, e.g. "https://sniper.your-tailnet.ts.net:4117/auth/google/callback"
+

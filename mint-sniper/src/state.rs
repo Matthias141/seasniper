@@ -94,6 +94,29 @@ pub struct AppState {
     /// so the connection/migration path is exercised by every startup and
     /// test run from this point on, not just whenever 10c first touches it.
     pub identity_db: sqlx::SqlitePool,
+    /// axum-extra `PrivateCookieJar` key — the session cookie (and the
+    /// short-lived OIDC flow-id cookie) are encrypted+signed with this.
+    /// See identity/crypto.rs.
+    pub identity_cookie_key: axum_extra::extract::cookie::Key,
+    /// AES-256-GCM cipher for TOTP secrets at rest. Same key file as
+    /// `identity_cookie_key` (see identity/crypto.rs's doc comment for
+    /// why one file, not two).
+    pub identity_totp_cipher: aes_gcm::Aes256Gcm,
+    /// `None` when Google Sign-In isn't configured (google_oauth_client_id
+    /// unset in config.toml) — every /auth/google/* route must check this
+    /// and return a clear "not configured" error rather than panic.
+    pub google_oidc: Option<Arc<crate::identity::oidc::GoogleOidc>>,
 }
+
+// NOTE: deliberately no `impl FromRef<SharedState> for cookie::Key` here.
+// SharedState is `Arc<AppState>` — Arc is a foreign type, so `Arc<AppState>`
+// doesn't count as "local" for Rust's orphan rules even though AppState
+// itself is local, and axum-extra's Key is also foreign. The usual
+// axum-extra FromRef-based PrivateCookieJar extractor pattern needs the
+// state type itself (not an Arc-wrapped one) to be local, which doesn't
+// fit this codebase's existing Arc<AppState> convention (used everywhere
+// else for cheap cloning into spawned tasks). Handlers that need the jar
+// build it manually instead: `PrivateCookieJar::from_headers(&headers,
+// state.identity_cookie_key.clone())` — see identity's usage in api.rs.
 
 pub type SharedState = Arc<AppState>;

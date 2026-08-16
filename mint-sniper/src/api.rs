@@ -2,6 +2,7 @@ use crate::auth;
 use crate::bus;
 use crate::config::Config;
 use crate::copymint;
+use crate::identity::session;
 use crate::opensea;
 use crate::state::{ControlMsg, SharedState};
 use crate::target;
@@ -9,17 +10,27 @@ use alloy::primitives::Address;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
-    http::{HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
     routing::{get, post},
     Json, Router,
 };
+use axum_extra::extract::cookie::{Cookie, PrivateCookieJar, SameSite};
 use serde::Deserialize;
 use std::sync::atomic::Ordering;
 use tower_http::cors::CorsLayer;
+
+/// Cookie names — both httponly, both Secure (requires HTTPS; see
+/// identity/oidc.rs's doc comment on why this flow assumes a Tailscale
+/// MagicDNS HTTPS origin, not plain-HTTP localhost). SESSION_COOKIE
+/// carries only the opaque session id (see identity/session.rs);
+/// FLOW_COOKIE is short-lived, scoped to /auth/google, and never
+/// outlives a single login attempt.
+const SESSION_COOKIE: &str = "sniper_session";
+const FLOW_COOKIE: &str = "sniper_oidc_flow";
 
 /// Note: PUT /api/config accepts `wallets: [{ private_key_env: "SNIPER_PK_1" }]`
 /// — env var *names* only. The UI never sees, sets, or transmits a raw
@@ -31,7 +42,14 @@ use tower_http::cors::CorsLayer;
 ///
 /// Auth: every route below requires the local bearer token (see auth.rs)
 /// except GET /api/token, which is how the UI bootstraps it in the first
-/// place. CORS is an explicit allow-list, not `Any` — an arm/fire-capable
+/// place, and the new /auth/google/* + /auth/logout routes (step 10c),
+/// which are how a *session* gets established/torn down in the first
+/// place and so can't themselves require one. The bearer token and
+/// session-cookie auth currently coexist without either gating the
+/// other — TODO(step 10g): make an explicit decision about whether the
+/// static token is retired in favor of sessions or kept as a narrower
+/// fallback; don't assume this dual-mechanism state is the final design.
+/// CORS is an explicit allow-list, not `Any` — an arm/fire-capable
 /// API bound to 127.0.0.1 is still reachable from any webpage open in the
 /// same browser if CORS says any origin may call it; DNS-rebinding and
 /// localhost-CSRF are real, known attack classes against exactly this
@@ -52,7 +70,20 @@ pub fn router(state: SharedState) -> Router {
         .route("/ws/events", get(ws_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_token));
 
-    let public = Router::new().route("/api/token", get(get_token));
+    let public = Router::new()
+        .route("/api/token", get(get_token))
+        // Identity routes (step 10c) are deliberately outside the bearer-
+        // token-protected `protected` router above: they're how a session
+        // is established in the first place, so nothing gates them yet
+        // except Google's own OAuth flow itself. Every route a session
+        // actually needs to DO anything (arm/fire/config/etc.) stays
+        // behind auth::require_token for now — see the TODO(step 10g) at
+        // the top of this file's doc comment once 10g decides how the
+        // bearer token and session auth coexist.
+        .route("/auth/google/login", get(get_auth_google_login))
+        .route("/auth/google/callback", get(get_auth_google_callback))
+        .route("/auth/logout", post(post_auth_logout))
+        .route("/auth/session", get(get_auth_session));
 
     let dev_origin = HeaderValue::from_static("http://localhost:5173");
     let prod_origin_a = HeaderValue::from_static("http://127.0.0.1:4117");
@@ -371,6 +402,146 @@ async fn post_target_search(
     match opensea::search_collections(&state.http_client, &api_key, &req.query, SEARCH_RESULT_LIMIT).await {
         Ok(hits) => Json(hits).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
+}
+
+// --- identity (step 10c) ---
+//
+// PrivateCookieJar is built manually via `from_headers` rather than as an
+// axum extractor argument — see state.rs's NOTE for why: SharedState is
+// `Arc<AppState>`, and axum-extra's FromRef-based extraction needs a
+// local (non-Arc-wrapped) state type, which would mean deviating from
+// this codebase's existing Arc<AppState> convention everywhere else.
+
+/// Redirects the browser to Google's consent screen. 503s with a clear
+/// message if Google Sign-In isn't configured, rather than 404ing (which
+/// would look like a routing bug) or panicking.
+async fn get_auth_google_login(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let Some(oidc) = &state.google_oidc else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Google Sign-In is not configured — set google_oauth_client_id/_secret_env/_redirect_url in config.toml",
+        )
+            .into_response();
+    };
+
+    let start = oidc.begin_login().await;
+    let jar = PrivateCookieJar::from_headers(&headers, state.identity_cookie_key.clone());
+    let flow_cookie = Cookie::build((FLOW_COOKIE, start.flow_id))
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Lax)
+        .path("/auth/google")
+        .build();
+    let jar = jar.add(flow_cookie);
+
+    (jar, Redirect::to(&start.auth_url)).into_response()
+}
+
+#[derive(Deserialize)]
+struct GoogleCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// Google's redirect target after the user approves/denies consent.
+/// Validates CSRF state + PKCE + the ID token's nonce (all inside
+/// `oidc.complete_login`), upserts the user by `google_sub`, and issues a
+/// new session at the "Google done, TOTP/WebAuthn pending" stage — see
+/// identity/session.rs's doc comment for how that session gets promoted
+/// to admin_tier by 10d/10e.
+async fn get_auth_google_callback(
+    State(state): State<SharedState>,
+    Query(q): Query<GoogleCallbackQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(oidc) = &state.google_oidc else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Google Sign-In is not configured").into_response();
+    };
+
+    if let Some(err) = q.error {
+        return (StatusCode::BAD_REQUEST, format!("Google sign-in was not completed: {err}")).into_response();
+    }
+    let (Some(code), Some(oauth_state)) = (q.code, q.state) else {
+        return (StatusCode::BAD_REQUEST, "callback missing code/state query params").into_response();
+    };
+
+    let jar = PrivateCookieJar::from_headers(&headers, state.identity_cookie_key.clone());
+    let Some(flow_cookie) = jar.get(FLOW_COOKIE) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "missing or expired login flow cookie — start over at /auth/google/login",
+        )
+            .into_response();
+    };
+    let flow_id = flow_cookie.value().to_string();
+    let jar = jar.remove(Cookie::from(FLOW_COOKIE));
+
+    let claims = match oidc.complete_login(&flow_id, code, oauth_state).await {
+        Ok(c) => c,
+        Err(e) => {
+            bus::log(&state.bus, "warn", format!("google sign-in attempt failed: {e:#}"));
+            return (StatusCode::UNAUTHORIZED, jar, format!("sign-in failed: {e:#}")).into_response();
+        }
+    };
+
+    let user_id = match session::find_or_create_user(&state.identity_db, &claims.google_sub, &claims.email).await {
+        Ok(id) => id,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, jar, format!("{e:#}")).into_response(),
+    };
+    let session_id = match session::create_google_verified_session(&state.identity_db, &user_id).await {
+        Ok(id) => id,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, jar, format!("{e:#}")).into_response(),
+    };
+
+    bus::log(&state.bus, "info", format!("google sign-in succeeded for {}", claims.email));
+
+    let session_cookie = Cookie::build((SESSION_COOKIE, session_id))
+        .http_only(true)
+        .secure(true)
+        .same_site(SameSite::Lax)
+        .path("/")
+        .build();
+    let jar = jar.add(session_cookie);
+
+    // Where the browser lands next (TOTP entry, WebAuthn prompt, or
+    // straight to the dashboard) is the SPA's job from here — it reads
+    // /auth/session below and decides what to show.
+    (jar, Redirect::to("/")).into_response()
+}
+
+async fn post_auth_logout(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let jar = PrivateCookieJar::from_headers(&headers, state.identity_cookie_key.clone());
+    if let Some(cookie) = jar.get(SESSION_COOKIE) {
+        if let Err(e) = session::revoke(&state.identity_db, cookie.value()).await {
+            bus::log(&state.bus, "error", format!("logout: revoking session failed: {e:#}"));
+        }
+    }
+    let jar = jar.remove(Cookie::from(SESSION_COOKIE));
+    (jar, StatusCode::OK)
+}
+
+/// Read-only session-state check for the SPA — "am I signed in, and how
+/// far through the Google/TOTP/WebAuthn chain is this session." Never
+/// requires the bearer token (a not-yet-admin-tier session has no token
+/// yet either), and deliberately returns the same "not signed in" shape
+/// whether the cookie is missing, unparseable, or points at a
+/// revoked/nonexistent session — same "don't distinguish absent from
+/// revoked" reasoning as identity/session.rs's get_active.
+async fn get_auth_session(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let jar = PrivateCookieJar::from_headers(&headers, state.identity_cookie_key.clone());
+    let Some(cookie) = jar.get(SESSION_COOKIE) else {
+        return Json(serde_json::json!({ "signed_in": false }));
+    };
+    match session::get_active(&state.identity_db, cookie.value()).await {
+        Ok(Some(s)) => Json(serde_json::json!({
+            "signed_in": true,
+            "admin_tier": s.admin_tier,
+            "totp_verified": s.totp_verified_at.is_some(),
+            "webauthn_verified": s.webauthn_verified_at.is_some(),
+        })),
+        _ => Json(serde_json::json!({ "signed_in": false })),
     }
 }
 
