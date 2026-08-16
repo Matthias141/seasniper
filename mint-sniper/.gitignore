@@ -3,3 +3,6 @@
 /ui/dist
 config.toml
 .env
+.sniper-token
+.testnet-keys/
+audit.log

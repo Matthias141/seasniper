@@ -1,11 +1,10 @@
 use crate::bus::{self, EventBus};
-use crate::state::ControlMsg;
 use alloy::primitives::Address;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::{TransactionRequest, TransactionTrait};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::StreamExt;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 /// Fires exactly once (watch channel flips to `true`) the moment the mint
@@ -19,9 +18,16 @@ pub async fn run_state_poll_watcher(
     event_bus: EventBus,
 ) -> Result<()> {
     let ws = WsConnect::new(ws_url);
-    let provider = ProviderBuilder::new().on_ws(ws).await?;
+    let provider = ProviderBuilder::new()
+        .on_ws(ws)
+        .await
+        .context("poll_state: opening the WebSocket RPC connection")?;
 
-    let mut stream = provider.subscribe_blocks().await?.into_stream();
+    let mut stream = provider
+        .subscribe_blocks()
+        .await
+        .context("poll_state: subscribing to new block headers")?
+        .into_stream();
     info!("watcher: subscribed to newHeads, polling mint state each block");
     bus::log(&event_bus, "info", "watcher armed — subscribed to new blocks");
 
@@ -83,38 +89,29 @@ pub async fn run_state_poll_watcher(
 /// actually exposes full mempool visibility, which per alloy's own docs
 /// requires Geth 1.11+ and which many public/free RPC providers disable
 /// entirely (mempool visibility is valuable and commonly rate-limited or
-/// turned off even over WS). If the subscription itself fails, this does
-/// NOT sit there "armed" while watching nothing: it logs a loud error,
-/// disarms via `control_tx`, and returns `Err` so the failure is visible
-/// immediately rather than a control panel that says ARMED indefinitely.
+/// turned off even over WS). If the connection or subscription fails,
+/// this does NOT sit there "armed" while watching nothing: it returns
+/// `Err`, and `main.rs`'s `spawn_supervised_watcher` (wraps every watcher
+/// spawn, not just this one — see its doc comment) logs it loudly and
+/// disarms so the control panel doesn't keep showing ARMED indefinitely.
 pub async fn run_mempool_watcher(
     ws_url: String,
     admin: Address,
     watch_target: Address,
     trigger_tx: watch::Sender<bool>,
     event_bus: EventBus,
-    control_tx: mpsc::Sender<ControlMsg>,
 ) -> Result<()> {
     let ws = WsConnect::new(ws_url);
-    let provider = ProviderBuilder::new().on_ws(ws).await?;
+    let provider = ProviderBuilder::new()
+        .on_ws(ws)
+        .await
+        .context("mempool_watch: opening the WebSocket RPC connection")?;
 
-    let sub = match provider.subscribe_full_pending_transactions().await {
-        Ok(sub) => sub,
-        Err(e) => {
-            let msg = format!(
-                "mempool_watch failed to subscribe to full pending transactions ({e}). \
-                 This mode needs a WebSocket RPC on a node that exposes full mempool \
-                 visibility (Geth 1.11+, newPendingTransactions with full-tx bodies \
-                 enabled) — many public/free RPC endpoints don't support this even over \
-                 WS. Disarming rather than staying armed while watching nothing; switch \
-                 ws_rpc_url to a provider with mempool access, or use trigger_mode = \
-                 \"poll_state\" or \"timestamp\" instead."
-            );
-            bus::log(&event_bus, "error", msg.clone());
-            let _ = control_tx.send(ControlMsg::Disarm).await;
-            anyhow::bail!(msg);
-        }
-    };
+    let sub = provider.subscribe_full_pending_transactions().await.context(
+        "mempool_watch: subscribing to full pending transactions — needs a WebSocket RPC on a \
+         node that exposes full mempool visibility (Geth 1.11+, newPendingTransactions with \
+         full-tx bodies enabled); many public/free RPC endpoints don't support this even over WS",
+    )?;
 
     info!(%admin, %watch_target, "watcher: subscribed to full pending transactions");
     bus::log(

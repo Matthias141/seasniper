@@ -36,6 +36,12 @@ pub enum ServerEvent {
         success: bool,
         detail: String,
     },
+    /// Emitted by `api::put_config` after a validated config write. Kept as
+    /// its own typed variant, not folded into `Log`, specifically so
+    /// `audit.rs`'s bus subscriber can persist config changes without also
+    /// persisting every routine `Log` message (RPC errors, info noise) —
+    /// see `audit.rs`'s doc comment.
+    ConfigChanged,
 }
 
 pub type EventBus = broadcast::Sender<ServerEvent>;

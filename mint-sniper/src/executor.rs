@@ -82,9 +82,17 @@ pub async fn warm_connections(cfg: &Config, bus: &EventBus) -> Vec<HttpProvider>
 /// round trip either), and every wallet's tx is signed via its own local
 /// signer. The result is cached raw bytes; `fire_prepared` does no
 /// signing and no RPC read.
+///
+/// Does NOT advance `next_nonce` — takes `&[ManagedWallet]`, not `&mut`,
+/// on purpose. This can be called repeatedly before anything it produces
+/// is ever broadcast (poll_state's periodic re-prepare loop calls it every
+/// `POLL_STATE_REPREPARE_INTERVAL_SECS` while armed), and only the most
+/// recent call's output is ever fired. The caller advances `next_nonce`
+/// exactly once, at the moment it actually commits to broadcasting a
+/// prepared batch — see `control_loop`'s `ControlMsg::FireNow` handler.
 pub async fn prepare_fire(
     cfg: &Config,
-    wallets: &mut [ManagedWallet],
+    wallets: &[ManagedWallet],
     contract: Address,
     calldata: &[u8],
     mint_value_per_wallet: U256,
@@ -129,9 +137,20 @@ pub async fn prepare_fire(
 
     let mut prepared = Vec::with_capacity(wallets.len());
 
-    for w in wallets.iter_mut() {
+    for w in wallets.iter() {
+        // Read only — do NOT advance next_nonce here. This function can be
+        // (and, in poll_state mode, routinely is) called multiple times
+        // before any of its output ever gets broadcast, via the periodic
+        // re-prepare loop in control_loop. Advancing on every prepare would
+        // burn a nonce slot per cycle that nothing ever fills on-chain —
+        // confirmed live against Sepolia during the step 5 dry run: two
+        // re-prepare cycles left this wallet's cached tx signed for nonce 1
+        // while its actual on-chain nonce was still 0, which would have
+        // left the eventual real broadcast stuck pending forever (Ethereum
+        // requires strictly sequential nonces per sender). The advance now
+        // happens exactly once, in control_loop, at the moment a prepared
+        // batch is actually committed to firing — see FireNow's handler.
         let nonce = w.next_nonce;
-        w.next_nonce += 1; // reserve immediately, same as before pre-signing existed
 
         // Jitter is intentional: identical gas price + identical block from
         // N wallets is a trivial sybil-clustering signature. A few % of gas

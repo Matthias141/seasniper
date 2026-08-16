@@ -46,13 +46,23 @@ src/
                  doc comment for why allowlist/signed/token-gated stages
                  aren't (and can't trivially be) covered.
   bus.rs       — ServerEvent enum + broadcast channel, single source of
-                 truth for everything the UI displays in real time
+                 truth for everything the UI displays in real time (and,
+                 via audit.rs's subscription, what gets persisted)
   state.rs     — AppState (shared config/wallet-status/armed flag/bus/
-                 control channel), ControlMsg enum (Arm/Disarm/FireNow/
-                 Prepare — Prepare is internal-only, never sent from
-                 api.rs, see control_loop's doc comment in main.rs)
+                 control channel/api_token), ControlMsg enum (Arm/Disarm/
+                 FireNow/Prepare — Prepare is internal-only, never sent
+                 from api.rs, see control_loop's doc comment in main.rs)
+  auth.rs      — local bearer-token auth: generates/persists the token to
+                 .sniper-token on first run, axum middleware that checks
+                 it on every route except GET /api/token (see "Security"
+                 section below)
+  audit.rs     — persistent append-only audit.log (JSON Lines), a bus.rs
+                 subscriber that records arm/disarm/fire/config-change/
+                 mint-result events — see its doc comment and
+                 RUNBOOK.md's post-fire-verification section
   api.rs       — axum router: GET/PUT /api/config, GET /api/status,
-                 POST /api/arm|/api/abort|/api/trigger, WS /ws/events
+                 POST /api/arm|/api/abort|/api/trigger, WS /ws/events,
+                 GET /api/token (unauthenticated bootstrap route)
 
 ui/            — Vite + React + TS PWA, "Terminal Command Deck" design
                  (see ui/src/styles/tokens.css for the token system)
@@ -99,7 +109,12 @@ tests assert byte-identical output against independently-built expected
 calldata (real mainnet addresses/selectors, cross-checked outside the
 crate — see each test's comment), not just "doesn't panic." Jitter tests
 cover zero/positive/negative/over-negative boundaries and confirm it
-can't produce a negative (wrapped) gas value.
+can't produce a negative (wrapped) gas value. `config.rs` additionally
+covers `Config::validate()` — malformed RPC URLs, empty wallet list,
+negative gas knobs, and the timestamp-mode-only `trigger_timestamp_unix`
+checks (0 is fine, past is rejected, implausibly-far-future is rejected
+to catch a milliseconds-into-seconds mistake) — 19 tests total as of
+step 7f.
 
 ## Known gaps (fix before relying on this for a real mint)
 
@@ -132,9 +147,16 @@ can't produce a negative (wrapped) gas value.
    latency. Confirmed (not assumed) that this makes the `RpcHealth`
    unused-variant warning disappear — `cargo build`/`cargo check` produce
    zero warnings as of this fix.
-4. **No auth on the control API.** Binds to `127.0.0.1` only, on purpose.
+4. ~~No auth on the control API.~~ Fixed — see git history and the
+   "Security" section below. Local bearer-token auth on every route
+   (`GET /api/token` excepted, since it's how the UI bootstraps the
+   token) plus an explicit CORS origin allow-list, replacing the old
+   `allow_origin(Any)`. Still binds to `127.0.0.1` only, on purpose — the
+   token stops a malicious webpage in the same browser, not a network
+   attacker; the bind restriction is still the thing stopping the latter.
    If you ever need remote access, put it behind Tailscale/SSH tunnel —
-   do not change the bind address to `0.0.0.0` without adding auth first.
+   do not change the bind address to `0.0.0.0` on the strength of the
+   token alone.
 5. ~~No test coverage at all.~~ Partially fixed — see git history and
    "Commands" above. Calldata encoding and gas jitter math are covered
    (the two things this note originally pointed at as highest
@@ -161,6 +183,221 @@ can't produce a negative (wrapped) gas value.
    happens after `send_raw_transaction` has already dispatched the bytes,
    in the same post-dispatch wait `.watch()` was already doing — nothing
    added to the broadcast/dispatch step itself.
+8. ~~poll_state's periodic re-prepare advanced next_nonce on every cycle,
+   not just when a batch was actually broadcast.~~ Fixed — found live
+   against Sepolia (see step 5's dry-run notes below), not in review.
+   `prepare_fire` now only reads `next_nonce`; `main.rs`'s `advance_nonces`
+   helper bumps it exactly once, at the point a prepared batch is actually
+   committed to firing.
+9. ~~Watcher task failures (WS connection/subscribe errors) were
+   completely silent — the UI just showed ARMED forever with nothing
+   running.~~ Fixed — found live (see below). `main.rs`'s
+   `spawn_supervised_watcher` wraps every watcher spawn (timestamp mode
+   excepted — it makes no RPC connection) and logs + auto-disarms on
+   `Err`. This generalizes the safety net mempool_watch already had for
+   its own subscribe failure specifically (gap #2 above).
+10. **Prepare-failure log messages only showed a truncated error.** Fixed
+    alongside #8/#9 — `format!("prepare failed: {e}")` used anyhow's
+    default `Display`, which only prints the outermost `.context()` frame.
+    Switched to `{e:#}` (anyhow's alternate Display), which joins the full
+    context chain, so a real RPC/revert reason isn't hidden behind a
+    generic "estimating gas" or similar.
+11. **`poll_state` and `mempool_watch` trigger logic has not been
+    fire-tested against a live chain — only the underlying transport has
+    been confirmed working outside the bot.** The step 5 dry run verified
+    `eth_subscribe("newHeads")` and `eth_subscribe("newPendingTransactions",
+    true)` work against a live Sepolia RPC via a raw WS client, but never
+    got either watcher connected and running inside the bot itself (see
+    "Testnet dry run" section above for why — a sandbox-local TLS issue,
+    not a code defect). That means `run_state_poll_watcher`'s block-poll
+    loop and `run_mempool_watcher`'s (from, to) pending-tx filter have
+    never actually fired a real trigger under real timing and real chain
+    conditions, in this dry run or any prior one — everything known about
+    their correctness so far is code review and unit-level reasoning, not
+    a live result. Needs a live run from an environment without this
+    sandbox's WS/TLS limitation before either mode should be trusted for
+    a real drop.
+12. **`ruint` 1.16.0 (transitive, via `alloy-primitives` 0.8.26 — this
+    bot's nonce/gas/value math sits on top of it) has two open RustSec
+    advisories: RUSTSEC-2025-0137 (unsoundness in an internal division
+    function, only live in release builds since the bounds check is a
+    `debug_assert!`) and RUSTSEC-2026-0220 (incorrect overflow flags on
+    checked/saturating/wrapping shift ops, worst on non-limb-aligned
+    widths — U256, what this bot actually uses, is limb-aligned and not
+    the worst case, though the advisory isn't scoped to exclude it
+    either).** `cargo update -p ruint` confirms 1.16.0 is already the
+    newest version `alloy-primitives` 0.8.26 permits — the only real fix
+    is `alloy` 0.9.2 → 2.4.1 (current latest), a major-version jump.
+    Explicitly NOT done as part of step 7's CI fix: this repo's own
+    "Status" section above already warns alloy's surface shifts across
+    even minor versions, so a 0.9 → 2.x jump touching every RPC/signing
+    call site is real, separate work with its own compile/test/dry-run
+    cycle — not something to fold silently into getting CI green.
+    Currently suppressed in `.github/workflows/ci.yml`'s `cargo audit`
+    step via `ignore: RUSTSEC-2025-0137,RUSTSEC-2026-0220`, with the same
+    reasoning duplicated in that file's comment. This is flagged, not
+    fixed — treat the alloy upgrade as its own task before assuming this
+    gap is closed.
+
+## Security (step 7)
+
+Step 7 (7a-7g) closed the gap the rest of this file's feature work had
+been assuming was sound without anyone actually checking: this bot holds
+private keys and moves real money, and until step 7 nobody had audited
+its own key handling, hardened its control API, wired up CI, written a
+release process, or given an operator anything to do when something goes
+wrong. Summary below; see git history for the individual 7a-7g commits
+and `RUNBOOK.md` for the operational playbooks this section backs.
+
+**7a — key-handling self-audit (findings: clean).** Grepped `wallet.rs`,
+`executor.rs`, and `main.rs`'s `control_loop` for `PrivateKeySigner`/raw
+key strings reaching any logging call — none found. Alloy's signer types
+(`PrivateKeySigner`/`LocalSigner<C>`) don't derive `Debug`, so an
+accidental `{:?}` on one is a compile error, not a runtime leak — a
+structural safety net, not just discipline. `.gitignore` was verified
+directly (`git check-ignore`), not assumed, and covers `config.toml`,
+`.env`, `.sniper-token`, `.testnet-keys/`, and (as of 7g) `audit.log`.
+`PUT /api/config`'s full type definition and handler were read end to
+end: `Config`/`WalletCfg` only ever carry `private_key_env` (an env var
+*name*), never a key value — round-tripping the API cannot leak key
+material because the type has no field for it to leak through.
+
+**7b — control API hardening: CORS + local bearer-token auth.** Two
+independent fixes, both in `src/auth.rs`, `src/api.rs`, `state.rs`, and
+mirrored on the UI side (`ui/src/lib/api.ts`, `useEventSocket.ts`,
+`App.tsx`):
+- **CORS** went from `allow_origin(Any)` to an explicit allow-list
+  (`http://localhost:5173` dev, `http://127.0.0.1:4117` /
+  `http://localhost:4117` prod). No wildcard fallback.
+- **Every route requires a local bearer token** (`Authorization: Bearer
+  <token>` for HTTP; `?token=` query param specifically for the
+  `/ws/events` WebSocket upgrade, since browsers cannot set a custom
+  header on a WebSocket handshake) except `GET /api/token`, the
+  unauthenticated bootstrap route the UI calls once at startup
+  (`initAuth()`) to learn the token in the first place. The token itself:
+  32 random bytes hex-encoded, generated on first run, persisted to
+  `.sniper-token` (gitignored, `chmod 600` on Unix), read from disk on
+  every subsequent boot rather than regenerated.
+
+**What this model protects against:** binding to `127.0.0.1` already
+stops anything off-machine; the token additionally stops a malicious
+webpage open in the *same browser* — a bad ad, a compromised site, a
+rogue extension content-script — from silently `fetch()`-ing or opening a
+raw WebSocket to arm/fire/reconfigure the bot. This is a real, known
+attack class against unauthenticated local APIs (DNS rebinding,
+localhost-CSRF), not a hypothetical.
+
+**What it does NOT protect against, precisely:** anything that already
+has filesystem access to `.sniper-token` — native malware running as the
+same OS user, a compromised browser extension with broad host/file
+permissions, another process on a shared machine that can read your
+files. Reading the token file directly is exactly as good as stealing it
+over HTTP; this is a local-agent auth model (stops arbitrary web content
+from reaching the API), not a defense for a fully compromised machine.
+Full precision on this trade-off lives in `ui/README.md`'s security
+section — read that before assuming the token means more than it does.
+
+**7c-7g in brief** (each has its own detailed commit message and, where
+applicable, a doc comment at the point of implementation):
+- **7c**: `.github/workflows/ci.yml` — build/test/clippy/`cargo audit` on
+  the Rust side, typecheck/build/`npm audit` on the UI side, gitleaks
+  secret-scanning (full history, `fetch-depth: 0`) on every push. Fixed
+  two pre-existing gaps this surfaced (a clippy `too_many_arguments` trip
+  in `control_loop`, a missing `ui/src/vite-env.d.ts`) so the pipeline
+  isn't red from its first run. **Branch protection is not enabled** —
+  no branch-protection/ruleset API was available to check or set it from
+  this session, and it needs manual verification/enabling by someone
+  with repo-settings access; this workflow is not yet an enforced merge
+  gate.
+- **7d**: `.github/workflows/release.yml` — tag-triggered (`v*`), clean
+  checkout, `cargo build --release` + `npm run build`, packaged together
+  (binary + `ui/dist` + `config.example.toml` + `README.md` +
+  `RUNBOOK.md`) into one tarball attached to a GitHub Release. No
+  deployment automation beyond that.
+- **7e**: `RUNBOOK.md` — checklists (not prose) for suspected key
+  compromise, post-fire verification, drained wallets, and API token
+  compromise.
+- **7f**: `Config::validate()` in `config.rs`, called from both
+  `Config::load` (startup) and `api::put_config` (every UI save) —
+  malformed RPC URLs, empty wallet list, negative gas values, and (in
+  `trigger_mode = "timestamp"`) an implausible `trigger_timestamp_unix`
+  all get rejected with a specific reason instead of silently written.
+- **7g**: `audit.rs` — a `bus.rs` subscriber that persists arm/disarm/
+  fire/config-change/mint-result events to a gitignored, append-only
+  `audit.log` (JSON Lines), giving `RUNBOOK.md`'s "confirm what happened"
+  guidance something durable to check beyond `bus.rs`'s ephemeral
+  256-event buffer or a terminal that may no longer be open.
+
+## Testnet dry run (step 5) — what a live run against Sepolia found
+
+A full dry run was done against real Sepolia infra: SeaDrop 1.0's actual
+existing singleton (`0x00005EA0...4bf5` — confirmed deployed via direct
+`eth_getCode`, not just the README's deployments table), a purpose-deployed
+`ERC721SeaDrop` test token with a real (near-zero, not free) mint price, and
+a purpose-built minimal contract for exercising poll_state specifically. See
+git history around this note for the exact commits.
+
+**What was verified working, independently (not just trusting the bot's own
+report):**
+- `timestamp` mode: armed → prepared → fired → 3/3 wallets minted
+  successfully. Verified via direct `eth_getTransactionReceipt` calls
+  (status `0x1`) and `balanceOf`/`totalSupply` reads — not just the bot's
+  own event feed.
+- The deliberate-revert path: two wallets pushed to their
+  `maxTotalMintableByWallet` cap via manual self-mints, then fired again.
+  The bot correctly reported `success: false` with block number and gas
+  used for both, while the third (under-cap) wallet correctly reported
+  `success: true` — verified independently via `eth_getTransactionReceipt`
+  (status `0x0` for the two reverts, `0x1` for the success). This is the
+  live confirmation of the gap #7 fix above.
+- The UI (`npm run dev`), driven with a real headless browser against the
+  live running bot for the first time: wallet balances, nonces, and
+  armed/standby state rendered correctly and matched `/api/status`
+  byte-for-byte. (Two console errors observed were Google Fonts failing to
+  load over this environment's network — cosmetic, unrelated to the app.)
+
+**What could NOT be verified in this specific run, and why (environment
+limitation on the connection, NOT proof the watcher logic itself is
+sound — see below for why those are different claims):** `poll_state` and
+`mempool_watch` both use `ws_rpc_url` via alloy's WS transport, which is
+hard-compiled against `webpki-roots` (a fixed public CA bundle — see
+`alloy-transport-ws`'s Cargo.toml, `tokio-tungstenite` with the
+`rustls-tls-webpki-roots` feature). The sandbox this dry run ran in
+terminates TLS through a local proxy with its own CA, which `reqwest`
+(used for all HTTP RPC calls) was configured to trust but this hard-coded
+WS stack structurally cannot be pointed at. A real deployment on a normal
+network without TLS interception would not hit this specific connection
+failure. It's exactly what surfaced gap #9 above though: arming
+poll_state in this environment used to just hang forever with the UI
+still saying ARMED; now it fails loudly and disarms within ~150ms, with
+the real error in the log.
+
+**Be precise about what this does and doesn't prove.** The underlying
+wire protocols (`eth_subscribe("newHeads")` and
+`eth_subscribe("newPendingTransactions", true)`) were independently
+confirmed to work against the same Sepolia RPC via a raw Python WS client
+outside the bot — that's real evidence the *transport* is reachable and
+the RPC supports both subscription types. It is NOT evidence that
+`run_state_poll_watcher`'s block-poll loop or `run_mempool_watcher`'s
+(from, to) pending-tx filter behave correctly under real timing and real
+chain conditions — neither watcher has ever actually connected and fired
+against a live chain, in this dry run or any prior one. Every review of
+that logic so far (steps 1-4, and the "what could not be verified" note
+above) is code review and unit-level reasoning, not a live result. Don't
+read the transport check as having verified more than it did — see gap
+#11 below.
+
+**A UI display gap noticed, not fixed:** each `WalletStatus.nonce` shown by
+`/api/status` and the WS `snapshot` event is set once at process boot (from
+`wallet::load_wallets`'s real on-chain read) and never updated again —
+`balance_poll_loop`'s `WalletUpdate` event hardcodes `nonce: 0` and nothing
+else writes to `state.wallet_status`'s nonce field. This dry run didn't
+initially reveal the gap because each test round happened to restart the
+bot process (which re-reads the real nonce at boot); within one continuous
+session, the UI's nonce display would go stale after minting while the
+actual signing logic (which reads `ManagedWallet.next_nonce` in
+`control_loop`, a different value) stays correct. Cosmetic, not a
+correctness bug — flagged for a future session rather than fixed here.
 
 ## Explicitly out of scope
 

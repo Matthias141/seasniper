@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+# Secret scanning needs full history to catch anything committed and later
+# "removed" but still present in an earlier commit, not just the working
+# tree — see the secrets job below.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (build, test, clippy, audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # rustsec/audit-check tries to publish its findings as a check run,
+      # which needs this beyond the default (read-only) GITHUB_TOKEN scope
+      # this repo has — confirmed live: without it the step still ran the
+      # actual audit correctly, then failed afterward on "Resource not
+      # accessible by integration" trying to create the check run.
+      checks: write
+    defaults:
+      run:
+        working-directory: mint-sniper
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mint-sniper
+
+      - name: cargo build
+        run: cargo build --all-targets
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # `uses:` steps do NOT inherit this job's `defaults.run.working-
+          # directory: mint-sniper` — that only applies to `run:` steps.
+          # Confirmed live (see the failed CI run this comment replaces):
+          # the action ran from the checkout root and failed with
+          # "Couldn't load ./Cargo.lock" since the real file is at
+          # mint-sniper/Cargo.lock. rustsec/audit-check's own `action.yml`
+          # (checked directly, not assumed) exposes `working-directory`
+          # for exactly this — "The directory of the Cargo.toml /
+          # Cargo.lock files to scan," defaulting to `.`.
+          working-directory: mint-sniper
+          # EXPLICIT ACCEPTED-RISK EXCEPTION — flagged to a human, not
+          # silently swallowed (see the npm audit step below for the same
+          # policy applied to the UI side). Confirmed live on this exact
+          # Cargo.lock, both against `ruint` 1.16.0, pulled in transitively
+          # via alloy-primitives 0.8.26 (`cargo tree -i ruint`), which this
+          # bot's arithmetic (nonce/gas/value math via alloy's U256) sits on
+          # top of:
+          #   - RUSTSEC-2025-0137: unsoundness in ruint::algorithms::div::
+          #     reciprocal_mg10 (a debug_assert-only bounds check, compiled
+          #     out in release builds). Fixed in ruint >=1.17.1.
+          #   - RUSTSEC-2026-0220: incorrect overflow flags on checked/
+          #     overflowing/saturating/wrapping shl/shr, worst on non-limb-
+          #     aligned widths (e.g. U160) — U256, what this bot actually
+          #     uses for value/gas math, is limb-aligned (4×64-bit) and not
+          #     the case the advisory calls out as worst-affected, though
+          #     the advisory does not scope itself to only non-aligned
+          #     widths. Fixed in ruint >=1.20.0.
+          # `cargo update -p ruint --dry-run` confirms 1.16.0 is already
+          # the newest version alloy-primitives 0.8.26's own Cargo.toml
+          # permits — the only fix is bumping alloy 0.9.2 -> 2.4.1 (current
+          # latest), a major-version jump. This repo's own CLAUDE.md
+          # ("Status" section) explicitly flags alloy's API surface as
+          # shifting across even *minor* versions and warns against
+          # assuming compatibility — a 0.9 -> 2.x jump touching every RPC/
+          # signing call site is a real, separate, non-trivial piece of
+          # work with its own compile/test/dry-run cycle, not something to
+          # fold silently into a CI-plumbing fix. Ignored here by advisory
+          # ID with this reasoning on record; revisit as its own dedicated
+          # task, not deferred indefinitely.
+          ignore: RUSTSEC-2025-0137,RUSTSEC-2026-0220
+
+  ui:
+    name: UI (typecheck, build, audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mint-sniper/ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mint-sniper/ui/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: npm run typecheck
+        run: npm run typecheck
+
+      - name: npm run build
+        run: npm run build
+
+      - name: npm audit
+        # --omit=dev: audits only what ships in ui/dist. Explicit, checked
+        # decision, not a blanket weakening — as of this workflow's authoring
+        # there is exactly one advisory in the full (dev+prod) tree: esbuild
+        # <=0.24.2 / GHSA-67mh-4wv8-2f99, "esbuild enables any website to
+        # send any requests to the development server and read the
+        # response." It's a `vite`/`vite-plugin-pwa` transitive devDependency,
+        # only reachable by something that can already reach your machine's
+        # `npm run dev` process — it ships in nothing this job builds. The
+        # only available fix is vite 8 (breaking, unverified against this
+        # project). Revisit --omit=dev (or bump to vite 8 and drop it) next
+        # time dependencies are touched. Fails on any moderate-or-higher
+        # advisory in production dependencies — those DO ship, so there's no
+        # equivalent excuse to soften that half of the check.
+        run: npm audit --omit=dev --audit-level=moderate
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, not just the pushed diff — a secret committed and
+          # then "removed" in a later commit is still sitting in history and
+          # still just as compromised. This is the single highest-value
+          # check in this whole workflow given this project's own CLAUDE.md
+          # security rules exist because exactly that happened once already
+          # in a sibling project (see AbiaEats' CLAUDE.md) — don't skip this
+          # even though 7a already did a one-time manual pass.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

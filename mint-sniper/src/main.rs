@@ -7,6 +7,8 @@
 // exact same mint-gating logic first.
 
 mod api;
+mod audit;
+mod auth;
 mod bus;
 mod config;
 mod executor;
@@ -28,6 +30,8 @@ use tokio::sync::{mpsc, watch, RwLock};
 use tracing::info;
 
 const CONFIG_PATH: &str = "config.toml";
+const TOKEN_PATH: &str = ".sniper-token";
+const AUDIT_LOG_PATH: &str = "audit.log";
 const API_BIND_ADDR: &str = "127.0.0.1:4117";
 
 #[tokio::main]
@@ -36,6 +40,12 @@ async fn main() -> Result<()> {
 
     let mut cfg = config::Config::load(CONFIG_PATH).context("loading config.toml")?;
     let event_bus = bus::new_bus();
+    // Never awaited — runs for the process lifetime, persisting
+    // arm/disarm/fire/config-change/mint-result events. See audit.rs's
+    // doc comment for why this is a bus subscriber rather than scattered
+    // call sites, and why a separate file rather than reusing tracing's
+    // stdout output.
+    tokio::spawn(audit::run_audit_writer(event_bus.clone(), AUDIT_LOG_PATH.to_string()));
 
     // admin_watch_target is only used by mempool_watch (see
     // watcher::run_mempool_watcher's doc comment for why it's not always
@@ -160,6 +170,8 @@ async fn main() -> Result<()> {
 
     let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(8);
 
+    let api_token = auth::load_or_create_token(TOKEN_PATH).context("loading/creating API token")?;
+
     let app_state: SharedState = Arc::new(AppState {
         config: RwLock::new(cfg.clone()),
         wallet_status: RwLock::new(initial_status),
@@ -167,6 +179,7 @@ async fn main() -> Result<()> {
         bus: event_bus.clone(),
         control_tx: control_tx.clone(),
         config_path: CONFIG_PATH.to_string(),
+        api_token,
     });
 
     // Background: refresh wallet ETH balances every 15s and push updates
@@ -268,6 +281,43 @@ async fn rpc_health_poll_loop(state: SharedState, http_rpc_urls: Vec<String>) {
     }
 }
 
+/// Spawns a watcher future, and if it ever completes with an `Err`, surfaces
+/// that loudly (bus log + auto-disarm) instead of leaving the control panel
+/// showing ARMED while the watcher has silently died.
+///
+/// Found live during the step 5 dry run: `run_state_poll_watcher`'s WS
+/// connection failed immediately, but since nothing awaited its
+/// `JoinHandle`, the failure was completely invisible — the UI just showed
+/// ARMED indefinitely with no watcher actually running. mempool_watch had
+/// its own hand-rolled version of this safety net (added in step 4a,
+/// motivated by "many public RPCs don't support full mempool
+/// subscriptions"); this generalizes it to every watcher, since a WS
+/// connection or RPC failure can kill any of them at any time, not just
+/// mempool_watch's specific subscribe step — timestamp mode is the only
+/// one that doesn't need this, since it makes no RPC connection at all.
+///
+/// Wrapping the future directly (not spawning a second task to watch a
+/// first) means `.abort()` on the returned handle still works exactly as
+/// before: aborting cancels whatever this task is currently awaiting,
+/// including the inner watcher future, at any depth.
+fn spawn_supervised_watcher<F>(
+    watcher_fut: F,
+    event_bus: bus::EventBus,
+    control_tx: mpsc::Sender<ControlMsg>,
+) -> tokio::task::JoinHandle<Result<()>>
+where
+    F: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let result = watcher_fut.await;
+        if let Err(e) = &result {
+            bus::log(&event_bus, "error", format!("watcher exited with an error: {e:#} — disarming"));
+            let _ = control_tx.send(ControlMsg::Disarm).await;
+        }
+        result
+    })
+}
+
 /// How long before a known `timestamp`-mode trigger to run the prepare
 /// (sign) phase. Long enough that gas price / gas estimate are still
 /// fresh at fire time, short enough that "prepare" and "trigger" stay
@@ -295,6 +345,10 @@ const POLL_STATE_REPREPARE_INTERVAL_SECS: u64 = 30;
 /// for the same single-writer reason as firing itself. `Prepare` is a
 /// `ControlMsg` for that reason too — it's never sent from api.rs, only
 /// self-sent the same way auto-fire already self-sends `FireNow`.
+// Called exactly once, from main(), with startup-computed values each
+// used throughout the function body — a wrapper struct here would be
+// indirection without real clarity benefit for a single call site.
+#[allow(clippy::too_many_arguments)]
 async fn control_loop(
     state: SharedState,
     mut control_rx: mpsc::Receiver<ControlMsg>,
@@ -349,17 +403,22 @@ async fn control_loop(
                 let handle = match cfg.trigger_mode.as_str() {
                     "timestamp" => {
                         let target = cfg.trigger_timestamp_unix;
+                        // timestamp mode makes no RPC connection at all — no
+                        // supervision needed, it can't fail this way.
                         tokio::spawn(watcher::run_timestamp_watcher(target, trigger_tx))
                     }
                     "mempool_watch" => match cfg.mint_enable_admin.trim().parse::<Address>() {
-                        Ok(admin) => tokio::spawn(watcher::run_mempool_watcher(
-                            cfg.ws_rpc_url.clone(),
-                            admin,
-                            admin_watch_target,
-                            trigger_tx,
-                            bus_clone,
+                        Ok(admin) => spawn_supervised_watcher(
+                            watcher::run_mempool_watcher(
+                                cfg.ws_rpc_url.clone(),
+                                admin,
+                                admin_watch_target,
+                                trigger_tx,
+                                bus_clone,
+                            ),
+                            state.bus.clone(),
                             state.control_tx.clone(),
-                        )),
+                        ),
                         Err(e) => {
                             // Fail loudly and fall back rather than silently
                             // watching nothing — this is exactly the trap
@@ -375,22 +434,30 @@ async fn control_loop(
                                      to be a valid address ({e}) — falling back to poll_state"
                                 ),
                             );
-                            tokio::spawn(watcher::run_state_poll_watcher(
-                                cfg.ws_rpc_url.clone(),
-                                contract,
-                                mint_state_selector.clone(),
-                                trigger_tx,
-                                bus_clone,
-                            ))
+                            spawn_supervised_watcher(
+                                watcher::run_state_poll_watcher(
+                                    cfg.ws_rpc_url.clone(),
+                                    contract,
+                                    mint_state_selector.clone(),
+                                    trigger_tx,
+                                    bus_clone,
+                                ),
+                                state.bus.clone(),
+                                state.control_tx.clone(),
+                            )
                         }
                     },
-                    "poll_state" => tokio::spawn(watcher::run_state_poll_watcher(
-                        cfg.ws_rpc_url.clone(),
-                        contract,
-                        mint_state_selector.clone(),
-                        trigger_tx,
-                        bus_clone,
-                    )),
+                    "poll_state" => spawn_supervised_watcher(
+                        watcher::run_state_poll_watcher(
+                            cfg.ws_rpc_url.clone(),
+                            contract,
+                            mint_state_selector.clone(),
+                            trigger_tx,
+                            bus_clone,
+                        ),
+                        state.bus.clone(),
+                        state.control_tx.clone(),
+                    ),
                     other => {
                         // Unrecognized trigger_mode string — same fail-
                         // loud-and-fall-back principle as the mempool_watch
@@ -401,13 +468,17 @@ async fn control_loop(
                             "warn",
                             format!("unrecognized trigger_mode {other:?} — falling back to poll_state"),
                         );
-                        tokio::spawn(watcher::run_state_poll_watcher(
-                            cfg.ws_rpc_url.clone(),
-                            contract,
-                            mint_state_selector.clone(),
-                            trigger_tx,
-                            bus_clone,
-                        ))
+                        spawn_supervised_watcher(
+                            watcher::run_state_poll_watcher(
+                                cfg.ws_rpc_url.clone(),
+                                contract,
+                                mint_state_selector.clone(),
+                                trigger_tx,
+                                bus_clone,
+                            ),
+                            state.bus.clone(),
+                            state.control_tx.clone(),
+                        )
                     }
                 };
                 watcher_handle = Some(handle);
@@ -484,7 +555,7 @@ async fn control_loop(
                 let cfg = state.config.read().await.clone();
                 match executor::prepare_fire(
                     &cfg,
-                    &mut wallets,
+                    &wallets,
                     contract,
                     &mint_calldata,
                     mint_value,
@@ -505,7 +576,15 @@ async fn control_loop(
                         });
                     }
                     Err(e) => {
-                        bus::log(&state.bus, "error", format!("prepare failed: {e}"));
+                        // {:#} (anyhow's alternate Display), not {} — {}
+                        // only prints the outermost .context() frame
+                        // ("estimating gas"), hiding the actual RPC/revert
+                        // reason underneath it. Confirmed live during the
+                        // step 5 dry run: a genuine "execution reverted:
+                        // not active" was reduced to an opaque "prepare
+                        // failed: estimating gas" with no way to tell from
+                        // the event feed alone what was actually wrong.
+                        bus::log(&state.bus, "error", format!("prepare failed: {e:#}"));
                     }
                 }
             }
@@ -532,6 +611,10 @@ async fn control_loop(
                 bus::log(&state.bus, "warn", "FIRING all wallets");
 
                 let fire_result = if let Some(pf) = prepared_fire.take() {
+                    // Committing to broadcast this batch now — this is the
+                    // one place next_nonce advances (see prepare_fire's doc
+                    // comment for why it doesn't advance on its own).
+                    advance_nonces(&mut wallets, &pf.wallets);
                     executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus).await
                 } else {
                     // Manual fire (UI "Fire Now") without a prior arm, or a
@@ -552,7 +635,7 @@ async fn control_loop(
                     };
                     match executor::prepare_fire(
                         &cfg,
-                        &mut wallets,
+                        &wallets,
                         contract,
                         &mint_calldata,
                         mint_value,
@@ -561,13 +644,18 @@ async fn control_loop(
                     )
                     .await
                     {
-                        Ok(w) => executor::fire_prepared(&cfg, &w, &providers, &state.bus).await,
+                        Ok(w) => {
+                            advance_nonces(&mut wallets, &w);
+                            executor::fire_prepared(&cfg, &w, &providers, &state.bus).await
+                        }
                         Err(e) => Err(e),
                     }
                 };
 
                 if let Err(e) = fire_result {
-                    bus::log(&state.bus, "error", format!("fire sequence error: {e}"));
+                    // {:#} for the same reason as the Prepare handler above
+                    // — the full context chain, not just the outermost frame.
+                    bus::log(&state.bus, "error", format!("fire sequence error: {e:#}"));
                 }
 
                 // Disarm after firing — a completed mint attempt shouldn't
@@ -586,6 +674,20 @@ async fn control_loop(
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
             }
+        }
+    }
+}
+
+/// Advances `next_nonce` for exactly the wallets present in `prepared` —
+/// called once, right at the point control_loop commits to broadcasting a
+/// prepared batch. `prepare_fire` itself never advances the nonce (see its
+/// doc comment): it can be called many times before anything is fired,
+/// and every one of those calls has to sign the same still-unused nonce,
+/// not a fresh one each time.
+fn advance_nonces(wallets: &mut [wallet::ManagedWallet], prepared: &[executor::PreparedWallet]) {
+    for w in wallets.iter_mut() {
+        if prepared.iter().any(|pw| pw.address == w.address) {
+            w.next_nonce += 1;
         }
     }
 }
