@@ -37,6 +37,11 @@ pub struct AppState {
     pub bus: EventBus,
     pub control_tx: mpsc::Sender<ControlMsg>,
     pub config_path: String,
+    /// Local bearer token — see auth.rs. Every route except GET /api/token
+    /// itself requires this, as `Authorization: Bearer <token>` or a
+    /// `?token=` query param (the WS upgrade route needs the latter;
+    /// browsers can't set custom headers on a WebSocket handshake).
+    pub api_token: String,
 }
 
 pub type SharedState = Arc<AppState>;

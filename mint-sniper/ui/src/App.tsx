@@ -6,12 +6,39 @@ import { EventFeed, type FeedLine } from './components/EventFeed';
 import { ConfigPanel } from './components/ConfigPanel';
 import { TriggerConsole } from './components/TriggerConsole';
 import { useEventSocket } from './lib/useEventSocket';
-import { api } from './lib/api';
+import { api, initAuth } from './lib/api';
 import type { Config, ServerEvent, WalletStatus } from './types';
 
 let lineId = 0;
 
+// Gates the whole app behind GET /api/token resolving first — the WS hook
+// and every api.ts call need the token already in memory before they fire,
+// not racing it. A failed fetch here means the backend isn't reachable at
+// all, which is worth a distinct message from "config load failed".
 export default function App() {
+  const [authReady, setAuthReady] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  useEffect(() => {
+    initAuth()
+      .then(() => setAuthReady(true))
+      .catch((e) => setAuthError(e.message));
+  }, []);
+
+  if (authError) {
+    return (
+      <div className={styles.shell}>
+        <div className={styles.banner}>couldn't reach the bot: {authError}</div>
+      </div>
+    );
+  }
+
+  if (!authReady) return null;
+
+  return <Control />;
+}
+
+function Control() {
   const [config, setConfig] = useState<Config | null>(null);
   const [wallets, setWallets] = useState<WalletStatus[]>([]);
   const [armed, setArmed] = useState(false);

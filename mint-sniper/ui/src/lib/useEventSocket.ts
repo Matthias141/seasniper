@@ -1,7 +1,17 @@
 import { useEffect, useRef, useState } from 'react';
 import type { ServerEvent } from '../types';
+import { getAuthToken } from './api';
 
-const WS_URL = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/events`;
+function wsUrl(): string {
+  const base = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws/events`;
+  // Browsers can't set an Authorization header on a WebSocket handshake —
+  // a ?token= query param is what api.rs's auth middleware checks for this
+  // route specifically (see auth.rs's doc comment for why not a
+  // subprotocol instead). initAuth() must have resolved before this hook
+  // mounts, or the connection is unauthenticated and the server rejects it.
+  const token = getAuthToken();
+  return token ? `${base}?token=${encodeURIComponent(token)}` : base;
+}
 
 /**
  * Reconnects with backoff on drop. A control panel for a time-sensitive
@@ -22,7 +32,7 @@ export function useEventSocket(onEvent: (e: ServerEvent) => void) {
 
     function connect() {
       if (closed) return;
-      socket = new WebSocket(WS_URL);
+      socket = new WebSocket(wsUrl());
 
       socket.onopen = () => {
         setConnected(true);
