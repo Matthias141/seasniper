@@ -12,6 +12,7 @@ mod auth;
 mod bus;
 mod config;
 mod copymint;
+mod db;
 mod executor;
 mod opensea;
 mod seadrop;
@@ -36,6 +37,7 @@ const CONFIG_PATH: &str = "config.toml";
 const TOKEN_PATH: &str = ".sniper-token";
 const AUDIT_LOG_PATH: &str = "audit.log";
 const API_BIND_ADDR: &str = "127.0.0.1:4117";
+const IDENTITY_DB_PATH: &str = "identity.db";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -175,6 +177,13 @@ async fn main() -> Result<()> {
 
     let api_token = auth::load_or_create_token(TOKEN_PATH).context("loading/creating API token")?;
 
+    // Identity DB (step 10) — opened and migrated before the router is
+    // built, same "fail loudly at startup rather than lazily on first
+    // use" principle as config::Config::load above.
+    let identity_db = db::open(IDENTITY_DB_PATH)
+        .await
+        .context("opening identity DB")?;
+
     let app_state: SharedState = Arc::new(AppState {
         config: RwLock::new(cfg.clone()),
         wallet_status: RwLock::new(initial_status),
@@ -184,6 +193,7 @@ async fn main() -> Result<()> {
         config_path: CONFIG_PATH.to_string(),
         api_token,
         http_client: reqwest::Client::new(),
+        identity_db,
     });
 
     // Background: refresh wallet ETH balances every 15s and push updates

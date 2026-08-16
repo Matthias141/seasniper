@@ -88,6 +88,12 @@ pub struct AppState {
     /// once in main() and reused (connection pooling), same reasoning as
     /// executor.rs's warmed RPC providers.
     pub http_client: reqwest::Client,
+    /// Identity DB (step 10) — users/sessions/totp_secrets/webauthn_credentials.
+    /// See db.rs's doc comment and CLAUDE.md's "Identity (step 10)" section.
+    /// Not yet read or written anywhere as of 10b; wired into AppState now
+    /// so the connection/migration path is exercised by every startup and
+    /// test run from this point on, not just whenever 10c first touches it.
+    pub identity_db: sqlx::SqlitePool,
 }
 
 pub type SharedState = Arc<AppState>;
