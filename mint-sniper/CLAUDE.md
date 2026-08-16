@@ -46,13 +46,23 @@ src/
                  doc comment for why allowlist/signed/token-gated stages
                  aren't (and can't trivially be) covered.
   bus.rs       — ServerEvent enum + broadcast channel, single source of
-                 truth for everything the UI displays in real time
+                 truth for everything the UI displays in real time (and,
+                 via audit.rs's subscription, what gets persisted)
   state.rs     — AppState (shared config/wallet-status/armed flag/bus/
-                 control channel), ControlMsg enum (Arm/Disarm/FireNow/
-                 Prepare — Prepare is internal-only, never sent from
-                 api.rs, see control_loop's doc comment in main.rs)
+                 control channel/api_token), ControlMsg enum (Arm/Disarm/
+                 FireNow/Prepare — Prepare is internal-only, never sent
+                 from api.rs, see control_loop's doc comment in main.rs)
+  auth.rs      — local bearer-token auth: generates/persists the token to
+                 .sniper-token on first run, axum middleware that checks
+                 it on every route except GET /api/token (see "Security"
+                 section below)
+  audit.rs     — persistent append-only audit.log (JSON Lines), a bus.rs
+                 subscriber that records arm/disarm/fire/config-change/
+                 mint-result events — see its doc comment and
+                 RUNBOOK.md's post-fire-verification section
   api.rs       — axum router: GET/PUT /api/config, GET /api/status,
-                 POST /api/arm|/api/abort|/api/trigger, WS /ws/events
+                 POST /api/arm|/api/abort|/api/trigger, WS /ws/events,
+                 GET /api/token (unauthenticated bootstrap route)
 
 ui/            — Vite + React + TS PWA, "Terminal Command Deck" design
                  (see ui/src/styles/tokens.css for the token system)
@@ -99,7 +109,12 @@ tests assert byte-identical output against independently-built expected
 calldata (real mainnet addresses/selectors, cross-checked outside the
 crate — see each test's comment), not just "doesn't panic." Jitter tests
 cover zero/positive/negative/over-negative boundaries and confirm it
-can't produce a negative (wrapped) gas value.
+can't produce a negative (wrapped) gas value. `config.rs` additionally
+covers `Config::validate()` — malformed RPC URLs, empty wallet list,
+negative gas knobs, and the timestamp-mode-only `trigger_timestamp_unix`
+checks (0 is fine, past is rejected, implausibly-far-future is rejected
+to catch a milliseconds-into-seconds mistake) — 19 tests total as of
+step 7f.
 
 ## Known gaps (fix before relying on this for a real mint)
 
@@ -132,9 +147,16 @@ can't produce a negative (wrapped) gas value.
    latency. Confirmed (not assumed) that this makes the `RpcHealth`
    unused-variant warning disappear — `cargo build`/`cargo check` produce
    zero warnings as of this fix.
-4. **No auth on the control API.** Binds to `127.0.0.1` only, on purpose.
+4. ~~No auth on the control API.~~ Fixed — see git history and the
+   "Security" section below. Local bearer-token auth on every route
+   (`GET /api/token` excepted, since it's how the UI bootstraps the
+   token) plus an explicit CORS origin allow-list, replacing the old
+   `allow_origin(Any)`. Still binds to `127.0.0.1` only, on purpose — the
+   token stops a malicious webpage in the same browser, not a network
+   attacker; the bind restriction is still the thing stopping the latter.
    If you ever need remote access, put it behind Tailscale/SSH tunnel —
-   do not change the bind address to `0.0.0.0` without adding auth first.
+   do not change the bind address to `0.0.0.0` on the strength of the
+   token alone.
 5. ~~No test coverage at all.~~ Partially fixed — see git history and
    "Commands" above. Calldata encoding and gas jitter math are covered
    (the two things this note originally pointed at as highest
@@ -195,6 +217,95 @@ can't produce a negative (wrapped) gas value.
     a live result. Needs a live run from an environment without this
     sandbox's WS/TLS limitation before either mode should be trusted for
     a real drop.
+
+## Security (step 7)
+
+Step 7 (7a-7g) closed the gap the rest of this file's feature work had
+been assuming was sound without anyone actually checking: this bot holds
+private keys and moves real money, and until step 7 nobody had audited
+its own key handling, hardened its control API, wired up CI, written a
+release process, or given an operator anything to do when something goes
+wrong. Summary below; see git history for the individual 7a-7g commits
+and `RUNBOOK.md` for the operational playbooks this section backs.
+
+**7a — key-handling self-audit (findings: clean).** Grepped `wallet.rs`,
+`executor.rs`, and `main.rs`'s `control_loop` for `PrivateKeySigner`/raw
+key strings reaching any logging call — none found. Alloy's signer types
+(`PrivateKeySigner`/`LocalSigner<C>`) don't derive `Debug`, so an
+accidental `{:?}` on one is a compile error, not a runtime leak — a
+structural safety net, not just discipline. `.gitignore` was verified
+directly (`git check-ignore`), not assumed, and covers `config.toml`,
+`.env`, `.sniper-token`, `.testnet-keys/`, and (as of 7g) `audit.log`.
+`PUT /api/config`'s full type definition and handler were read end to
+end: `Config`/`WalletCfg` only ever carry `private_key_env` (an env var
+*name*), never a key value — round-tripping the API cannot leak key
+material because the type has no field for it to leak through.
+
+**7b — control API hardening: CORS + local bearer-token auth.** Two
+independent fixes, both in `src/auth.rs`, `src/api.rs`, `state.rs`, and
+mirrored on the UI side (`ui/src/lib/api.ts`, `useEventSocket.ts`,
+`App.tsx`):
+- **CORS** went from `allow_origin(Any)` to an explicit allow-list
+  (`http://localhost:5173` dev, `http://127.0.0.1:4117` /
+  `http://localhost:4117` prod). No wildcard fallback.
+- **Every route requires a local bearer token** (`Authorization: Bearer
+  <token>` for HTTP; `?token=` query param specifically for the
+  `/ws/events` WebSocket upgrade, since browsers cannot set a custom
+  header on a WebSocket handshake) except `GET /api/token`, the
+  unauthenticated bootstrap route the UI calls once at startup
+  (`initAuth()`) to learn the token in the first place. The token itself:
+  32 random bytes hex-encoded, generated on first run, persisted to
+  `.sniper-token` (gitignored, `chmod 600` on Unix), read from disk on
+  every subsequent boot rather than regenerated.
+
+**What this model protects against:** binding to `127.0.0.1` already
+stops anything off-machine; the token additionally stops a malicious
+webpage open in the *same browser* — a bad ad, a compromised site, a
+rogue extension content-script — from silently `fetch()`-ing or opening a
+raw WebSocket to arm/fire/reconfigure the bot. This is a real, known
+attack class against unauthenticated local APIs (DNS rebinding,
+localhost-CSRF), not a hypothetical.
+
+**What it does NOT protect against, precisely:** anything that already
+has filesystem access to `.sniper-token` — native malware running as the
+same OS user, a compromised browser extension with broad host/file
+permissions, another process on a shared machine that can read your
+files. Reading the token file directly is exactly as good as stealing it
+over HTTP; this is a local-agent auth model (stops arbitrary web content
+from reaching the API), not a defense for a fully compromised machine.
+Full precision on this trade-off lives in `ui/README.md`'s security
+section — read that before assuming the token means more than it does.
+
+**7c-7g in brief** (each has its own detailed commit message and, where
+applicable, a doc comment at the point of implementation):
+- **7c**: `.github/workflows/ci.yml` — build/test/clippy/`cargo audit` on
+  the Rust side, typecheck/build/`npm audit` on the UI side, gitleaks
+  secret-scanning (full history, `fetch-depth: 0`) on every push. Fixed
+  two pre-existing gaps this surfaced (a clippy `too_many_arguments` trip
+  in `control_loop`, a missing `ui/src/vite-env.d.ts`) so the pipeline
+  isn't red from its first run. **Branch protection is not enabled** —
+  no branch-protection/ruleset API was available to check or set it from
+  this session, and it needs manual verification/enabling by someone
+  with repo-settings access; this workflow is not yet an enforced merge
+  gate.
+- **7d**: `.github/workflows/release.yml` — tag-triggered (`v*`), clean
+  checkout, `cargo build --release` + `npm run build`, packaged together
+  (binary + `ui/dist` + `config.example.toml` + `README.md` +
+  `RUNBOOK.md`) into one tarball attached to a GitHub Release. No
+  deployment automation beyond that.
+- **7e**: `RUNBOOK.md` — checklists (not prose) for suspected key
+  compromise, post-fire verification, drained wallets, and API token
+  compromise.
+- **7f**: `Config::validate()` in `config.rs`, called from both
+  `Config::load` (startup) and `api::put_config` (every UI save) —
+  malformed RPC URLs, empty wallet list, negative gas values, and (in
+  `trigger_mode = "timestamp"`) an implausible `trigger_timestamp_unix`
+  all get rejected with a specific reason instead of silently written.
+- **7g**: `audit.rs` — a `bus.rs` subscriber that persists arm/disarm/
+  fire/config-change/mint-result events to a gitignored, append-only
+  `audit.log` (JSON Lines), giving `RUNBOOK.md`'s "confirm what happened"
+  guidance something durable to check beyond `bus.rs`'s ephemeral
+  256-event buffer or a terminal that may no longer be open.
 
 ## Testnet dry run (step 5) — what a live run against Sepolia found
 
