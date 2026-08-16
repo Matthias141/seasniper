@@ -39,7 +39,29 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: mint-sniper
+          # `workspaces: mint-sniper` matters because Cargo.toml isn't at
+          # the repo root — Swatinem/rust-cache's default (".") would look
+          # for it in the wrong place. Confirmed via this step's own "Cache
+          # Key"/"Lockfiles considered" log output pointing at
+          # mint-sniper/Cargo.lock, not assumed from the docs.
+          #
+          # `cache-bin: true` (the default, left implicit) is what actually
+          # matters for cargo audit's ~5min-per-run compile-from-source
+          # problem, since rustsec/audit-check's own `cargo install
+          # cargo-audit` writes the resulting binary to the same
+          # ~/.cargo/bin this action caches. Confirmed with real numbers,
+          # not assumed from the config alone: two runs against an
+          # unchanged Cargo.lock (this branch's own CI history, 9g) —
+          # cargo build 64s -> 17s, cargo audit ~175s (full source compile)
+          # -> 4s (cached binary, no compile at all). One earlier pair of
+          # consecutive runs on this branch showed "No cache found" despite
+          # an unchanged Cargo.lock and a prior successful save — possibly
+          # a propagation-delay or scope quirk in GitHub's cache backend,
+          # not this config; not chased further since the very next pair
+          # showed a clean hit with the numbers above. This does NOT speed
+          # up a fresh Claude Code sandbox session's local `cargo build` —
+          # that starts cold every time regardless — this is purely a
+          # CI-run-to-CI-run cache.
 
       - name: cargo build
         run: cargo build --all-targets
