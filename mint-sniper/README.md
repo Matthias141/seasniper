@@ -17,16 +17,20 @@ export SNIPER_PK_3=0x...
 
 ## Before you point this at a real mint
 
-1. **Compile and fix API drift.** This was written without a compiler in the
-   loop (sandbox had no Rust toolchain). Alloy's API shifts across minor
-   versions — expect a handful of signature mismatches on first `cargo build`.
-2. **Dry-run on a testnet clone of the target contract** if you can get the
-   bytecode/source (most ERC721A/manifold/thirdweb mints are open source or
-   verified on Etherscan) — deploy identical mint-gating logic to Sepolia,
-   fire the bot at it, confirm nonces/calldata/gas all land correctly.
-   For seadrop mode, SeaDrop is also deployed on Goerli/Sepolia — verify
-   the address on that chain's explorer before testing there, it isn't
-   hardcoded to the mainnet address in `config.example.toml`.
+1. ~~Compile and fix API drift.~~ Done — see `CLAUDE.md`'s known-gaps
+   list. `cargo build`/`cargo check` are clean with zero warnings.
+2. ~~Dry-run on a testnet clone of the target contract.~~ Done against
+   Sepolia — see `CLAUDE.md`'s "Testnet dry run (step 5)" section for
+   what was verified (timestamp mode firing real mints, the
+   deliberate-revert path reporting correctly, the UI against a live
+   bot) and what couldn't be exercised in that specific sandboxed run
+   (poll_state/mempool_watch's WS-based watchers, blocked by that
+   environment's TLS-interception proxy, not by anything in this repo —
+   their subscription protocols were independently confirmed working
+   against the same RPC outside the bot). SeaDrop 1.0 is confirmed live
+   on Sepolia at the same singleton address as mainnet (verified via
+   `eth_getCode`, not just the README table) — no need to deploy the
+   singleton yourself, only a test `ERC721SeaDrop` token pointed at it.
 3. **Confirm the mint isn't allowlist-gated.** If `mint()` requires a merkle
    proof argument (custom mode) or the SeaDrop drop is allowlist/signed/
    token-gated rather than public (seadrop mode — check `getPublicDrop`

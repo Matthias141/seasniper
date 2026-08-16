@@ -268,6 +268,43 @@ async fn rpc_health_poll_loop(state: SharedState, http_rpc_urls: Vec<String>) {
     }
 }
 
+/// Spawns a watcher future, and if it ever completes with an `Err`, surfaces
+/// that loudly (bus log + auto-disarm) instead of leaving the control panel
+/// showing ARMED while the watcher has silently died.
+///
+/// Found live during the step 5 dry run: `run_state_poll_watcher`'s WS
+/// connection failed immediately, but since nothing awaited its
+/// `JoinHandle`, the failure was completely invisible — the UI just showed
+/// ARMED indefinitely with no watcher actually running. mempool_watch had
+/// its own hand-rolled version of this safety net (added in step 4a,
+/// motivated by "many public RPCs don't support full mempool
+/// subscriptions"); this generalizes it to every watcher, since a WS
+/// connection or RPC failure can kill any of them at any time, not just
+/// mempool_watch's specific subscribe step — timestamp mode is the only
+/// one that doesn't need this, since it makes no RPC connection at all.
+///
+/// Wrapping the future directly (not spawning a second task to watch a
+/// first) means `.abort()` on the returned handle still works exactly as
+/// before: aborting cancels whatever this task is currently awaiting,
+/// including the inner watcher future, at any depth.
+fn spawn_supervised_watcher<F>(
+    watcher_fut: F,
+    event_bus: bus::EventBus,
+    control_tx: mpsc::Sender<ControlMsg>,
+) -> tokio::task::JoinHandle<Result<()>>
+where
+    F: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let result = watcher_fut.await;
+        if let Err(e) = &result {
+            bus::log(&event_bus, "error", format!("watcher exited with an error: {e:#} — disarming"));
+            let _ = control_tx.send(ControlMsg::Disarm).await;
+        }
+        result
+    })
+}
+
 /// How long before a known `timestamp`-mode trigger to run the prepare
 /// (sign) phase. Long enough that gas price / gas estimate are still
 /// fresh at fire time, short enough that "prepare" and "trigger" stay
@@ -349,17 +386,22 @@ async fn control_loop(
                 let handle = match cfg.trigger_mode.as_str() {
                     "timestamp" => {
                         let target = cfg.trigger_timestamp_unix;
+                        // timestamp mode makes no RPC connection at all — no
+                        // supervision needed, it can't fail this way.
                         tokio::spawn(watcher::run_timestamp_watcher(target, trigger_tx))
                     }
                     "mempool_watch" => match cfg.mint_enable_admin.trim().parse::<Address>() {
-                        Ok(admin) => tokio::spawn(watcher::run_mempool_watcher(
-                            cfg.ws_rpc_url.clone(),
-                            admin,
-                            admin_watch_target,
-                            trigger_tx,
-                            bus_clone,
+                        Ok(admin) => spawn_supervised_watcher(
+                            watcher::run_mempool_watcher(
+                                cfg.ws_rpc_url.clone(),
+                                admin,
+                                admin_watch_target,
+                                trigger_tx,
+                                bus_clone,
+                            ),
+                            state.bus.clone(),
                             state.control_tx.clone(),
-                        )),
+                        ),
                         Err(e) => {
                             // Fail loudly and fall back rather than silently
                             // watching nothing — this is exactly the trap
@@ -375,22 +417,30 @@ async fn control_loop(
                                      to be a valid address ({e}) — falling back to poll_state"
                                 ),
                             );
-                            tokio::spawn(watcher::run_state_poll_watcher(
-                                cfg.ws_rpc_url.clone(),
-                                contract,
-                                mint_state_selector.clone(),
-                                trigger_tx,
-                                bus_clone,
-                            ))
+                            spawn_supervised_watcher(
+                                watcher::run_state_poll_watcher(
+                                    cfg.ws_rpc_url.clone(),
+                                    contract,
+                                    mint_state_selector.clone(),
+                                    trigger_tx,
+                                    bus_clone,
+                                ),
+                                state.bus.clone(),
+                                state.control_tx.clone(),
+                            )
                         }
                     },
-                    "poll_state" => tokio::spawn(watcher::run_state_poll_watcher(
-                        cfg.ws_rpc_url.clone(),
-                        contract,
-                        mint_state_selector.clone(),
-                        trigger_tx,
-                        bus_clone,
-                    )),
+                    "poll_state" => spawn_supervised_watcher(
+                        watcher::run_state_poll_watcher(
+                            cfg.ws_rpc_url.clone(),
+                            contract,
+                            mint_state_selector.clone(),
+                            trigger_tx,
+                            bus_clone,
+                        ),
+                        state.bus.clone(),
+                        state.control_tx.clone(),
+                    ),
                     other => {
                         // Unrecognized trigger_mode string — same fail-
                         // loud-and-fall-back principle as the mempool_watch
@@ -401,13 +451,17 @@ async fn control_loop(
                             "warn",
                             format!("unrecognized trigger_mode {other:?} — falling back to poll_state"),
                         );
-                        tokio::spawn(watcher::run_state_poll_watcher(
-                            cfg.ws_rpc_url.clone(),
-                            contract,
-                            mint_state_selector.clone(),
-                            trigger_tx,
-                            bus_clone,
-                        ))
+                        spawn_supervised_watcher(
+                            watcher::run_state_poll_watcher(
+                                cfg.ws_rpc_url.clone(),
+                                contract,
+                                mint_state_selector.clone(),
+                                trigger_tx,
+                                bus_clone,
+                            ),
+                            state.bus.clone(),
+                            state.control_tx.clone(),
+                        )
                     }
                 };
                 watcher_handle = Some(handle);

@@ -161,6 +161,84 @@ can't produce a negative (wrapped) gas value.
    happens after `send_raw_transaction` has already dispatched the bytes,
    in the same post-dispatch wait `.watch()` was already doing — nothing
    added to the broadcast/dispatch step itself.
+8. ~~poll_state's periodic re-prepare advanced next_nonce on every cycle,
+   not just when a batch was actually broadcast.~~ Fixed — found live
+   against Sepolia (see step 5's dry-run notes below), not in review.
+   `prepare_fire` now only reads `next_nonce`; `main.rs`'s `advance_nonces`
+   helper bumps it exactly once, at the point a prepared batch is actually
+   committed to firing.
+9. ~~Watcher task failures (WS connection/subscribe errors) were
+   completely silent — the UI just showed ARMED forever with nothing
+   running.~~ Fixed — found live (see below). `main.rs`'s
+   `spawn_supervised_watcher` wraps every watcher spawn (timestamp mode
+   excepted — it makes no RPC connection) and logs + auto-disarms on
+   `Err`. This generalizes the safety net mempool_watch already had for
+   its own subscribe failure specifically (gap #2 above).
+10. **Prepare-failure log messages only showed a truncated error.** Fixed
+    alongside #8/#9 — `format!("prepare failed: {e}")` used anyhow's
+    default `Display`, which only prints the outermost `.context()` frame.
+    Switched to `{e:#}` (anyhow's alternate Display), which joins the full
+    context chain, so a real RPC/revert reason isn't hidden behind a
+    generic "estimating gas" or similar.
+
+## Testnet dry run (step 5) — what a live run against Sepolia found
+
+A full dry run was done against real Sepolia infra: SeaDrop 1.0's actual
+existing singleton (`0x00005EA0...4bf5` — confirmed deployed via direct
+`eth_getCode`, not just the README's deployments table), a purpose-deployed
+`ERC721SeaDrop` test token with a real (near-zero, not free) mint price, and
+a purpose-built minimal contract for exercising poll_state specifically. See
+git history around this note for the exact commits.
+
+**What was verified working, independently (not just trusting the bot's own
+report):**
+- `timestamp` mode: armed → prepared → fired → 3/3 wallets minted
+  successfully. Verified via direct `eth_getTransactionReceipt` calls
+  (status `0x1`) and `balanceOf`/`totalSupply` reads — not just the bot's
+  own event feed.
+- The deliberate-revert path: two wallets pushed to their
+  `maxTotalMintableByWallet` cap via manual self-mints, then fired again.
+  The bot correctly reported `success: false` with block number and gas
+  used for both, while the third (under-cap) wallet correctly reported
+  `success: true` — verified independently via `eth_getTransactionReceipt`
+  (status `0x0` for the two reverts, `0x1` for the success). This is the
+  live confirmation of the gap #7 fix above.
+- The UI (`npm run dev`), driven with a real headless browser against the
+  live running bot for the first time: wallet balances, nonces, and
+  armed/standby state rendered correctly and matched `/api/status`
+  byte-for-byte. (Two console errors observed were Google Fonts failing to
+  load over this environment's network — cosmetic, unrelated to the app.)
+
+**What could NOT be verified in this specific run, and why (environment
+limitation, not a code defect):** `poll_state` and `mempool_watch` both use
+`ws_rpc_url` via alloy's WS transport, which is hard-compiled against
+`webpki-roots` (a fixed public CA bundle — see `alloy-transport-ws`'s
+Cargo.toml, `tokio-tungstenite` with the `rustls-tls-webpki-roots` feature).
+The sandbox this dry run ran in terminates TLS through a local proxy with
+its own CA, which `reqwest` (used for all HTTP RPC calls) was configured to
+trust but this hard-coded WS stack structurally cannot be pointed at. Their
+underlying wire protocols (`eth_subscribe("newHeads")` and
+`eth_subscribe("newPendingTransactions", true)`) were independently
+confirmed to work against the same Sepolia RPC via a raw Python WS client
+outside the bot, so this is specifically about this Rust dependency's fixed
+TLS trust store in this sandboxed network, not a reachability problem with
+the RPC or a logic problem in `watcher.rs`. A real deployment on a normal
+network without TLS interception would not hit this. It's exactly what
+surfaced gap #9 above though: arming poll_state in this environment used to
+just hang forever with the UI still saying ARMED; now it fails loudly and
+disarms within ~150ms, with the real error in the log.
+
+**A UI display gap noticed, not fixed:** each `WalletStatus.nonce` shown by
+`/api/status` and the WS `snapshot` event is set once at process boot (from
+`wallet::load_wallets`'s real on-chain read) and never updated again —
+`balance_poll_loop`'s `WalletUpdate` event hardcodes `nonce: 0` and nothing
+else writes to `state.wallet_status`'s nonce field. This dry run didn't
+initially reveal the gap because each test round happened to restart the
+bot process (which re-reads the real nonce at boot); within one continuous
+session, the UI's nonce display would go stale after minting while the
+actual signing logic (which reads `ManagedWallet.next_nonce` in
+`control_loop`, a different value) stays correct. Cosmetic, not a
+correctness bug — flagged for a future session rather than fixed here.
 
 ## Explicitly out of scope
 
