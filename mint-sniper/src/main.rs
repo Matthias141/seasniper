@@ -368,6 +368,12 @@ async fn control_loop(
     mint_state_selector: Vec<u8>,
     mut wallets: Vec<wallet::ManagedWallet>,
 ) {
+    // Startup-computed but not fixed thereafter (step 8a) — SeaDrop's
+    // updatePublicDrop can change mintPrice at any time, including
+    // flipping a drop from free to paid, between arm and fire. Re-checked
+    // on every Prepare that isn't timestamp mode's single lead-time call —
+    // see the ControlMsg::Prepare handler below.
+    let mut mint_value = mint_value;
     // Both watcher fns (run_timestamp_watcher, run_state_poll_watcher) return
     // anyhow::Result<()>, not (); the handle type has to match whichever the
     // `match` below spawns, and it's the same for either arm.
@@ -562,6 +568,56 @@ async fn control_loop(
                     continue;
                 }
                 let cfg = state.config.read().await.clone();
+
+                // 8a: re-fetch mintPrice at the same cadence gas already
+                // gets refreshed. Skipped for timestamp mode's single
+                // prepare-at-T-minus-PREPARE_LEAD_SECS call — that window
+                // is short enough that staleness isn't a real concern,
+                // same reasoning 3b already applies there to gas. Every
+                // other mode's arm-to-trigger window is unbounded, so a
+                // price that changed since arming (or since the last
+                // periodic re-prepare) would otherwise go unnoticed until
+                // the contract reverts on a msg.value mismatch at fire
+                // time — step 3c's fix means that reverts report
+                // success: false rather than a false positive, but it's
+                // still a missed mint this re-check prevents. Only
+                // meaningful in seadrop mode — custom mode has no
+                // getPublicDrop equivalent to re-check against.
+                if cfg.mint_mode == "seadrop" && cfg.trigger_mode != "timestamp" {
+                    match seadrop::fetch_public_drop(&cfg.http_rpc_urls[0], contract, admin_watch_target).await {
+                        Ok(drop) => {
+                            let new_value = drop.mint_price_wei * U256::from(cfg.quantity_per_wallet);
+                            if new_value != mint_value {
+                                let old_eth = format_units(mint_value, "ether").unwrap_or_else(|_| mint_value.to_string());
+                                let new_eth = format_units(new_value, "ether").unwrap_or_else(|_| new_value.to_string());
+                                if is_alarming_price_increase(mint_value, new_value) {
+                                    bus::log(
+                                        &state.bus,
+                                        "warn",
+                                        format!(
+                                            "mint price changed {old_eth} -> {new_eth} ETH since last check — re-signing with the new value"
+                                        ),
+                                    );
+                                } else {
+                                    bus::log(
+                                        &state.bus,
+                                        "info",
+                                        format!("mint price changed {old_eth} -> {new_eth} ETH since last check"),
+                                    );
+                                }
+                                mint_value = new_value;
+                            }
+                        }
+                        Err(e) => {
+                            bus::log(
+                                &state.bus,
+                                "warn",
+                                format!("mint price re-check failed ({e:#}) — using last known value"),
+                            );
+                        }
+                    }
+                }
+
                 match executor::prepare_fire(
                     &cfg,
                     &wallets,
@@ -742,6 +798,20 @@ fn advance_nonces(wallets: &mut [wallet::ManagedWallet], prepared: &[executor::P
     }
 }
 
+/// step 8a: whether a mintPrice change since the last check is alarming
+/// enough to log at `warn` (vs a quieter `info`) in the
+/// `ControlMsg::Prepare` handler. Threshold is >2x the old value — loud
+/// enough to catch a real, meaningful price change without firing on
+/// gas-price-style noise (there isn't any here; mintPrice only moves when
+/// a project deliberately calls `updatePublicDrop`, so any change at all
+/// is real, but not every real change is alarming). Free -> paid is
+/// already covered by this same rule, not a special case: `old_value * 2
+/// == 0` when `old_value == 0`, so any nonzero `new_value` already
+/// exceeds it.
+fn is_alarming_price_increase(old_value: U256, new_value: U256) -> bool {
+    new_value > old_value.saturating_mul(U256::from(2))
+}
+
 fn encode_mint_calldata(signature: &str, args: &[String]) -> Result<Vec<u8>> {
     let func = Function::parse(signature).context("parsing mint fn signature")?;
     let values: Vec<DynSolValue> = func
@@ -768,6 +838,42 @@ fn encode_selector_only(signature: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_to_paid_is_alarming() {
+        // The specific case 8a's task description calls out by name —
+        // covered by the general >2x rule, not a special case: 0 * 2 == 0.
+        assert!(is_alarming_price_increase(U256::ZERO, U256::from(1u64)));
+    }
+
+    #[test]
+    fn just_over_2x_is_alarming() {
+        assert!(is_alarming_price_increase(U256::from(100u64), U256::from(201u64)));
+    }
+
+    #[test]
+    fn exactly_2x_is_not_alarming() {
+        // Boundary: strictly greater than 2x, not >=, so a project simply
+        // doubling their price isn't flagged as loudly as a >2x jump.
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::from(200u64)));
+    }
+
+    #[test]
+    fn small_increase_is_not_alarming() {
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::from(150u64)));
+    }
+
+    #[test]
+    fn decrease_is_never_alarming() {
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::from(1u64)));
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::ZERO));
+    }
+
+    #[test]
+    fn no_change_is_not_alarming() {
+        assert!(!is_alarming_price_increase(U256::ZERO, U256::ZERO));
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::from(100u64)));
+    }
 
     #[test]
     fn encode_mint_calldata_matches_known_good_calldata() {
