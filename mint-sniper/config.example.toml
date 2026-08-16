@@ -16,7 +16,7 @@ http_rpc_urls = [
 # example commented out at the bottom of this file).
 mint_mode = "custom"
 
-contract_address = "0x0000000000000000000000000000000000dEaD"
+contract_address = "0x000000000000000000000000000000000000dEaD"
 
 # ABI fragment for the mint call you'll actually send. Adjust selector + args
 # per-project — this is the single most common reason a sniper silently fails.

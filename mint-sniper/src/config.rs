@@ -207,7 +207,7 @@ mod tests {
             ws_rpc_url: "wss://eth-mainnet.g.alchemy.com/v2/KEY".to_string(),
             http_rpc_urls: vec!["https://eth-mainnet.g.alchemy.com/v2/KEY".to_string()],
             mint_mode: default_mint_mode(),
-            contract_address: "0x0000000000000000000000000000000000dEaD".to_string(),
+            contract_address: "0x000000000000000000000000000000000000dEaD".to_string(),
             mint_fn_signature: "mint(uint256)".to_string(),
             mint_fn_args_template: vec!["1".to_string()],
             mint_state_fn_signature: "mintActive()".to_string(),
@@ -323,7 +323,7 @@ mod tests {
         let toml_str = r#"
             ws_rpc_url = "wss://example.invalid"
             http_rpc_urls = ["https://example.invalid"]
-            contract_address = "0x0000000000000000000000000000000000dEaD"
+            contract_address = "0x000000000000000000000000000000000000dEaD"
             mint_fn_signature = "mint(uint256)"
             mint_fn_args_template = ["1"]
             mint_state_fn_signature = "mintActive()"
