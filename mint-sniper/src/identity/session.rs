@@ -10,6 +10,17 @@ use anyhow::{Context, Result};
 use rand::RngCore;
 use sqlx::SqlitePool;
 
+// `device_label`, `created_at`, `last_seen_at`, `revoked_at` are populated by
+// every `SELECT * FROM sessions` via `sqlx::FromRow` but have no reader yet —
+// no "list my sessions" / device-management UI exists as of step 10h. Kept on
+// the struct (not deleted) because the row shape is the real, committed DB
+// schema (see migrations/0002_session_login_stages.sql) and dropping the
+// fields here would just silently desync the struct from that schema. Under
+// CI's actual `cargo clippy --all-targets -- -D warnings` (not the weaker
+// plain `cargo clippy` used locally through 10b-10h) this dead_code lint is a
+// hard compile error, not a soft warning — confirmed live, see CI incident
+// writeup in this repo's CLAUDE.md.
+#[allow(dead_code)]
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Session {
     pub id: String,
