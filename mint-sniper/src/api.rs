@@ -30,7 +30,7 @@ use tower_http::cors::CorsLayer;
 /// carries only the opaque session id (see identity/session.rs);
 /// FLOW_COOKIE is short-lived, scoped to /auth/google, and never
 /// outlives a single login attempt.
-const SESSION_COOKIE: &str = "sniper_session";
+pub(crate) const SESSION_COOKIE: &str = "sniper_session";
 const FLOW_COOKIE: &str = "sniper_oidc_flow";
 
 /// Note: PUT /api/config accepts `wallets: [{ private_key_env: "SNIPER_PK_1" }]`
@@ -41,15 +41,16 @@ const FLOW_COOKIE: &str = "sniper_oidc_flow";
 /// a browser tab, which is a materially worse security posture than a
 /// TOML file on disk.
 ///
-/// Auth: every route below requires the local bearer token (see auth.rs)
-/// except GET /api/token, which is how the UI bootstraps it in the first
-/// place, and the new /auth/google/* + /auth/logout routes (step 10c),
-/// which are how a *session* gets established/torn down in the first
-/// place and so can't themselves require one. The bearer token and
-/// session-cookie auth currently coexist without either gating the
-/// other — TODO(step 10g): make an explicit decision about whether the
-/// static token is retired in favor of sessions or kept as a narrower
-/// fallback; don't assume this dual-mechanism state is the final design.
+/// Auth: every route below requires `auth::require_token_or_session`
+/// (step 10g) — see auth.rs's module doc comment for the full decision,
+/// summary here: exactly ONE of bearer-token or session auth is active
+/// per boot, decided once by whether identity (step 10) is configured,
+/// never both for the same request. GET /api/token (how the UI
+/// bootstraps the token when identity isn't configured) and the
+/// /auth/google/* + /auth/logout + /auth/session + /auth/totp/* +
+/// /auth/webauthn/* routes (step 10c-10e — how a session gets
+/// established/torn down/progressed in the first place, so they can't
+/// themselves require one) are the only routes outside this gate.
 /// CORS is an explicit allow-list, not `Any` — an arm/fire-capable
 /// API bound to 127.0.0.1 is still reachable from any webpage open in the
 /// same browser if CORS says any origin may call it; DNS-rebinding and
@@ -69,18 +70,17 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/target/set", post(post_target_set))
         .route("/api/target/search", post(post_target_search))
         .route("/ws/events", get(ws_handler))
-        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_token));
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_token_or_session));
 
     let public = Router::new()
         .route("/api/token", get(get_token))
-        // Identity routes (step 10c) are deliberately outside the bearer-
-        // token-protected `protected` router above: they're how a session
-        // is established in the first place, so nothing gates them yet
-        // except Google's own OAuth flow itself. Every route a session
-        // actually needs to DO anything (arm/fire/config/etc.) stays
-        // behind auth::require_token for now — see the TODO(step 10g) at
-        // the top of this file's doc comment once 10g decides how the
-        // bearer token and session auth coexist.
+        // Identity routes (step 10c-10e) are deliberately outside
+        // `protected` above: they're how a session gets established/
+        // progressed/torn down in the first place, so nothing but
+        // Google's own OAuth flow (and, per-route, their own internal
+        // require_session/require_step_up checks) gates them. Every
+        // route that actually DOES something (arm/fire/config/etc.)
+        // sits behind require_token_or_session instead (step 10g).
         .route("/auth/google/login", get(get_auth_google_login))
         .route("/auth/google/callback", get(get_auth_google_callback))
         .route("/auth/logout", post(post_auth_logout))
