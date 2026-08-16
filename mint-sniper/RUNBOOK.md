@@ -199,3 +199,75 @@ threat model.
 7. **If the leak vector was a browser/extension**, the token rotation in
    steps 2-4 is the fix — reinstall or remove the compromised extension
    before trusting that browser with the new token.
+
+---
+
+## 5. Lost a WebAuthn device (step 10e)
+
+Trigger: a laptop or phone holding one of your two registered passkeys
+is lost, stolen, wiped, or its authenticator storage is reset.
+
+**The normal case — you still have your OTHER registered device.** This
+is fully self-service through the UI, no DB access needed:
+
+1. Sign in on the surviving device (Google → TOTP → WebAuthn assertion
+   from that device).
+2. Open the device list (`GET /auth/webauthn/devices`) and identify the
+   lost device's row.
+3. Revoke it (`POST /auth/webauthn/devices/<id>/revoke`). This deletes
+   the credential row outright — there is no "undo," the same as any
+   other credential revocation.
+4. If you want a replacement device registered, do that now — revoking
+   first frees a slot under the 2-device cap (`start_registration`
+   rejects a 3rd registration attempt with a clear error rather than
+   silently overwriting or silently allowing it; see `identity/
+   webauthn.rs`'s `ADMIN_CREDENTIAL_CAP`).
+
+**The hard case — you lost BOTH registered devices at once (or the 2nd
+was already lost and never revoked).** There is currently no self-service
+path for this: per step 10f's model, even VIEWING wallet status requires
+a session that has completed Google + TOTP + a WebAuthn assertion from a
+still-registered device — with zero valid devices left, no session can
+ever reach that state, and there is no "email yourself a recovery link"
+flow (no SMTP is configured anywhere in this project, and step 10 is
+explicitly scoped to one operator, not a multi-user system with an admin
+who could intervene on your behalf).
+
+The actual recovery path is direct access to the machine running the
+bot — which you have, since this is a self-hosted single-operator tool,
+not a SaaS you're locked out of. You are clearing your OWN device
+registrations because you still control the server; this is not an
+identity-verification problem the way a "forgot my Google password" flow
+is.
+
+1. **Stop the bot** (`Ctrl-C` the `cargo run` process). `identity.db` is
+   SQLite in WAL mode; editing it while the process holds it open risks
+   a corrupt read on the next boot.
+2. **Open `identity.db` with any SQLite client** (`sqlite3 identity.db`
+   if you have the CLI installed; this project's own binary vendors
+   SQLite internally via `sqlite-bundled` but does not expose a query
+   shell of its own, so bring your own — DB Browser for SQLite works too
+   if you'd rather not use a terminal).
+3. **Clear your WebAuthn credentials** so the 2-device cap no longer
+   blocks re-registration:
+   ```sql
+   DELETE FROM webauthn_credentials WHERE user_id = (SELECT id FROM users WHERE email = 'you@example.com');
+   ```
+4. **If you ALSO lost access to your TOTP app** (not just the WebAuthn
+   devices — these are separate factors and losing one doesn't imply
+   losing the other), clear that too so 10d's setup flow can be re-run
+   from scratch instead of rejecting a "wrong" code forever:
+   ```sql
+   DELETE FROM totp_secrets WHERE user_id = (SELECT id FROM users WHERE email = 'you@example.com');
+   ```
+5. **Restart the bot**, sign in with Google (still works — that identity
+   was never touched), then redo whichever of 10d (TOTP) / 10e (WebAuthn)
+   setup you cleared above.
+6. **Treat this as a real incident, not routine maintenance.** Anyone
+   who could run steps 1-4 above already had the level of access needed
+   to fully compromise this bot regardless of step 10's identity layer
+   (they're on the machine holding the wallet private keys) — but if
+   this recovery was needed because a device was STOLEN rather than
+   merely lost/wiped by you, also work through Section 1 (suspected
+   private key compromise) and Section 4 (API token compromised) above,
+   since a stolen laptop/phone may carry more than just a passkey.

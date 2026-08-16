@@ -6,3 +6,4 @@ pub mod crypto;
 pub mod oidc;
 pub mod session;
 pub mod totp;
+pub mod webauthn;

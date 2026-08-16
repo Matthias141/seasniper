@@ -106,6 +106,11 @@ pub struct AppState {
     /// unset in config.toml) — every /auth/google/* route must check this
     /// and return a clear "not configured" error rather than panic.
     pub google_oidc: Option<Arc<crate::identity::oidc::GoogleOidc>>,
+    /// `None` under the exact same condition as `google_oidc` (WebAuthn's
+    /// rp_id/rp_origin are derived FROM the Google redirect URL — see
+    /// identity/webauthn.rs's doc comment) — every /auth/webauthn/* route
+    /// must check this and return a clear "not configured" error.
+    pub webauthn: Option<Arc<crate::identity::webauthn::WebauthnState>>,
 }
 
 // NOTE: deliberately no `impl FromRef<SharedState> for cookie::Key` here.

@@ -214,6 +214,19 @@ async fn main() -> Result<()> {
         None
     };
 
+    // WebAuthn (step 10e) piggybacks on the same google_oauth_redirect_url
+    // for its rp_id/rp_origin — see identity/webauthn.rs's doc comment —
+    // so it's gated on the exact same config presence as Google Sign-In,
+    // not a separate flag.
+    let webauthn_state = if !cfg.google_oauth_client_id.is_empty() {
+        let ws = identity::webauthn::WebauthnState::new(&cfg.google_oauth_redirect_url, "mint-sniper")
+            .context("initializing WebAuthn")?;
+        info!("WebAuthn configured (rp_id derived from google_oauth_redirect_url)");
+        Some(Arc::new(ws))
+    } else {
+        None
+    };
+
     let app_state: SharedState = Arc::new(AppState {
         config: RwLock::new(cfg.clone()),
         wallet_status: RwLock::new(initial_status),
@@ -227,6 +240,7 @@ async fn main() -> Result<()> {
         identity_cookie_key: identity_keys.cookie_key,
         identity_totp_cipher: identity_keys.totp_cipher,
         google_oidc,
+        webauthn: webauthn_state,
     });
 
     // Background: refresh wallet ETH balances every 15s and push updates

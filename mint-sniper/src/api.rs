@@ -3,6 +3,7 @@ use crate::bus;
 use crate::config::Config;
 use crate::copymint;
 use crate::identity::{session, totp};
+use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
 use crate::opensea;
 use crate::state::{ControlMsg, SharedState};
 use crate::target;
@@ -10,7 +11,7 @@ use alloy::primitives::Address;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, State,
+        Path, Query, State,
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     middleware,
@@ -86,7 +87,13 @@ pub fn router(state: SharedState) -> Router {
         .route("/auth/session", get(get_auth_session))
         .route("/auth/totp/setup/start", post(post_totp_setup_start))
         .route("/auth/totp/setup/verify", post(post_totp_setup_verify))
-        .route("/auth/totp/verify", post(post_totp_verify));
+        .route("/auth/totp/verify", post(post_totp_verify))
+        .route("/auth/webauthn/register/start", post(post_webauthn_register_start))
+        .route("/auth/webauthn/register/finish", post(post_webauthn_register_finish))
+        .route("/auth/webauthn/authenticate/start", post(post_webauthn_authenticate_start))
+        .route("/auth/webauthn/authenticate/finish", post(post_webauthn_authenticate_finish))
+        .route("/auth/webauthn/devices", get(get_webauthn_devices))
+        .route("/auth/webauthn/devices/:id/revoke", post(post_webauthn_device_revoke));
 
     let dev_origin = HeaderValue::from_static("http://localhost:5173");
     let prod_origin_a = HeaderValue::from_static("http://127.0.0.1:4117");
@@ -560,10 +567,18 @@ async fn require_session(state: &SharedState, headers: &HeaderMap) -> Result<ses
     let cookie = jar
         .get(SESSION_COOKIE)
         .ok_or((StatusCode::UNAUTHORIZED, "not signed in".to_string()))?;
-    session::get_active(&state.identity_db, cookie.value())
+    let session = session::get_active(&state.identity_db, cookie.value())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?
-        .ok_or((StatusCode::UNAUTHORIZED, "not signed in".to_string()))
+        .ok_or((StatusCode::UNAUTHORIZED, "not signed in".to_string()))?;
+    // Best-effort freshness bump — failing to record this shouldn't fail
+    // the request itself, so errors are swallowed (there's nothing more
+    // useful to do with a DB write failure on a non-critical timestamp
+    // than to note it and move on).
+    if let Err(e) = session::touch(&state.identity_db, &session.id).await {
+        bus::log(&state.bus, "warn", format!("touching session last_seen_at failed: {e:#}"));
+    }
+    Ok(session)
 }
 
 /// Generates a fresh TOTP secret for the signed-in user and returns a QR
@@ -648,6 +663,128 @@ async fn post_totp_verify(
             StatusCode::OK.into_response()
         }
         Ok(false) => (StatusCode::UNAUTHORIZED, "incorrect or already-used code").into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+// --- WebAuthn (step 10e) ---
+
+async fn post_webauthn_register_start(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let session = match require_session(&state, &headers).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let Some(webauthn) = &state.webauthn else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WebAuthn is not configured").into_response();
+    };
+    let email = match session::get_user_email(&state.identity_db, &session.user_id).await {
+        Ok(e) => e,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    };
+    match webauthn.start_registration(&state.identity_db, &session.id, &session.user_id, &email).await {
+        Ok(ccr) => Json(ccr).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct WebauthnRegisterFinishRequest {
+    device_label: String,
+    credential: RegisterPublicKeyCredential,
+}
+
+async fn post_webauthn_register_finish(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<WebauthnRegisterFinishRequest>,
+) -> impl IntoResponse {
+    let session = match require_session(&state, &headers).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let Some(webauthn) = &state.webauthn else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WebAuthn is not configured").into_response();
+    };
+    let label = req.device_label.trim();
+    if label.is_empty() {
+        return (StatusCode::BAD_REQUEST, "device_label must not be empty").into_response();
+    }
+    match webauthn
+        .finish_registration(&state.identity_db, &session.id, &session.user_id, label, &req.credential)
+        .await
+    {
+        Ok(()) => {
+            bus::log(&state.bus, "info", format!("WebAuthn device registered: {label}"));
+            StatusCode::OK.into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+async fn post_webauthn_authenticate_start(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let session = match require_session(&state, &headers).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let Some(webauthn) = &state.webauthn else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WebAuthn is not configured").into_response();
+    };
+    match webauthn.start_authentication(&state.identity_db, &session.id, &session.user_id).await {
+        Ok(rcr) => Json(rcr).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+async fn post_webauthn_authenticate_finish(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(cred): Json<PublicKeyCredential>,
+) -> impl IntoResponse {
+    let session = match require_session(&state, &headers).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    let Some(webauthn) = &state.webauthn else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "WebAuthn is not configured").into_response();
+    };
+    match webauthn.finish_authentication(&state.identity_db, &session.id, &cred).await {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(e) => (StatusCode::UNAUTHORIZED, format!("{e:#}")).into_response(),
+    }
+}
+
+async fn get_webauthn_devices(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let session = match require_session(&state, &headers).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    match crate::identity::webauthn::list_devices(&state.identity_db, &session.user_id).await {
+        Ok(devices) => Json(devices).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    }
+}
+
+/// Revokes a device — the "revoke" half of 10e's "view and revoke"
+/// requirement, and the answer to "what if I lose a device": the OTHER
+/// registered device signs in, revokes the lost one, and (if desired)
+/// registers a replacement, all without ever hitting the 2-device cap
+/// (revoke first frees a slot). See RUNBOOK.md's "Lost both WebAuthn
+/// devices" entry for the harder case this route can't self-service.
+async fn post_webauthn_device_revoke(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Path(device_id): Path<String>,
+) -> impl IntoResponse {
+    let session = match require_session(&state, &headers).await {
+        Ok(s) => s,
+        Err((code, msg)) => return (code, msg).into_response(),
+    };
+    match crate::identity::webauthn::revoke_device(&state.identity_db, &session.user_id, &device_id).await {
+        Ok(true) => {
+            bus::log(&state.bus, "warn", format!("WebAuthn device revoked (id {device_id})"));
+            StatusCode::OK.into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, "no such device for this account").into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
 }
