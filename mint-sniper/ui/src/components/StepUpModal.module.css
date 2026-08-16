@@ -1,0 +1,101 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background: rgba(0, 0, 0, 0.72);
+  backdrop-filter: blur(2px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3);
+}
+
+.modal {
+  width: 100%;
+  max-width: 360px;
+  background: var(--color-surface-1);
+  border: 1px solid var(--color-danger);
+  box-shadow: 0 0 32px var(--color-danger-glow);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  letter-spacing: 0.16em;
+  color: var(--color-danger);
+}
+
+.body {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--color-text-secondary);
+  line-height: 1.5;
+}
+
+.input {
+  background: var(--color-surface-0);
+  border: var(--border-hairline);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xl);
+  letter-spacing: 0.3em;
+  text-align: center;
+  padding: var(--space-2);
+}
+.input:focus {
+  outline: none;
+  border-color: var(--color-danger);
+  box-shadow: 0 0 0 1px var(--color-danger-glow);
+}
+
+.error {
+  margin: 0;
+  font-size: var(--text-xs);
+  color: var(--color-danger);
+}
+
+.actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+.cancelBtn {
+  flex: 1;
+  background: var(--color-surface-2);
+  border: var(--border-hairline);
+  color: var(--color-text-secondary);
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  letter-spacing: 0.08em;
+}
+.cancelBtn:hover {
+  color: var(--color-text-primary);
+}
+
+.confirmBtn {
+  flex: 2;
+  background: var(--color-danger);
+  border: none;
+  color: var(--color-surface-0);
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.confirmBtn:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+.confirmBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

@@ -7,16 +7,25 @@ import { ConfigPanel } from './components/ConfigPanel';
 import { TriggerConsole } from './components/TriggerConsole';
 import { CopyOpportunities, type CopyOpportunity } from './components/CopyOpportunities';
 import { TargetResolver } from './components/TargetResolver';
+import { LoginScreen } from './components/LoginScreen';
+import { IdentitySetup } from './components/IdentitySetup';
+import { StepUpModal } from './components/StepUpModal';
 import { useEventSocket } from './lib/useEventSocket';
 import { api, initAuth } from './lib/api';
-import type { Config, ServerEvent, WalletStatus } from './types';
+import type { AuthSession, Config, ServerEvent, WalletStatus } from './types';
 
 let lineId = 0;
 
 // Gates the whole app behind GET /api/token resolving first — the WS hook
 // and every api.ts call need the token already in memory before they fire,
 // not racing it. A failed fetch here means the backend isn't reachable at
-// all, which is worth a distinct message from "config load failed".
+// all, which is worth a distinct message from "config load failed". Once
+// that's ready, AuthGate (step 10h) decides what to actually show:
+// unchanged Control if identity isn't configured for this instance
+// (bearer-token-only, exactly pre-step-10 behavior), otherwise a real
+// login/setup wall in front of it. StepUpModal mounts once here, at the
+// true app root — see its own doc comment for why it can't live inside
+// Control alongside the panels that trigger it.
 export default function App() {
   const [authReady, setAuthReady] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
@@ -37,10 +46,49 @@ export default function App() {
 
   if (!authReady) return null;
 
-  return <Control />;
+  return (
+    <>
+      <AuthGate />
+      <StepUpModal />
+    </>
+  );
 }
 
-function Control() {
+function AuthGate() {
+  const [session, setSession] = useState<AuthSession | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const refetch = useCallback(() => {
+    api
+      .getAuthSession()
+      .then(setSession)
+      .catch((e) => setLoadError(e instanceof Error ? e.message : 'failed to check sign-in state'));
+  }, []);
+
+  useEffect(refetch, [refetch]);
+
+  if (loadError) {
+    return (
+      <div className={styles.shell}>
+        <div className={styles.banner}>couldn't check sign-in state: {loadError}</div>
+      </div>
+    );
+  }
+  if (!session) return null;
+
+  // Identity not configured for this instance at all — exactly pre-step-10
+  // behavior, the bearer token alone gates the API (see auth.rs's
+  // require_token_or_session). Don't show a login wall for a mode that
+  // has no login to perform.
+  if (!session.identity_configured) return <Control />;
+
+  if (!session.signed_in) return <LoginScreen />;
+  if (!session.admin_tier) return <IdentitySetup session={session} onProgressed={refetch} />;
+
+  return <Control onSignOut={() => api.logout().then(refetch)} />;
+}
+
+function Control({ onSignOut }: { onSignOut?: () => void }) {
   const [config, setConfig] = useState<Config | null>(null);
   const [wallets, setWallets] = useState<WalletStatus[]>([]);
   const [armed, setArmed] = useState(false);
@@ -139,7 +187,7 @@ function Control() {
 
   return (
     <div className={styles.shell}>
-      <StatusBar armed={armed} connected={connected} activeTarget={config?.nft_contract || undefined} />
+      <StatusBar armed={armed} connected={connected} activeTarget={config?.nft_contract || undefined} onSignOut={onSignOut} />
 
       {loadError && <div className={styles.banner}>config load failed: {loadError}</div>}
 

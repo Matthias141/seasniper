@@ -568,19 +568,47 @@ async fn post_auth_logout(State(state): State<SharedState>, headers: HeaderMap) 
 /// revoked/nonexistent session — same "don't distinguish absent from
 /// revoked" reasoning as identity/session.rs's get_active.
 async fn get_auth_session(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    let identity_configured = state.google_oidc.is_some();
     let jar = PrivateCookieJar::from_headers(&headers, state.identity_cookie_key.clone());
     let Some(cookie) = jar.get(SESSION_COOKIE) else {
-        return Json(serde_json::json!({ "signed_in": false }));
+        return Json(serde_json::json!({ "signed_in": false, "identity_configured": identity_configured })).into_response();
     };
-    match session::get_active(&state.identity_db, cookie.value()).await {
-        Ok(Some(s)) => Json(serde_json::json!({
-            "signed_in": true,
-            "admin_tier": s.admin_tier,
-            "totp_verified": s.totp_verified_at.is_some(),
-            "webauthn_verified": s.webauthn_verified_at.is_some(),
-        })),
-        _ => Json(serde_json::json!({ "signed_in": false })),
-    }
+    let Ok(Some(s)) = session::get_active(&state.identity_db, cookie.value()).await else {
+        return Json(serde_json::json!({ "signed_in": false, "identity_configured": identity_configured })).into_response();
+    };
+
+    // Distinct from `totp_verified`/`webauthn_verified` (THIS session's
+    // login-stage progress): whether the ACCOUNT has an enrolled,
+    // enabled factor at all, regardless of session. The UI needs this to
+    // decide "show a QR code to set up TOTP for the first time" vs
+    // "just ask for the code from your already-set-up app" — reusing
+    // /auth/totp/setup/start for an already-enrolled account would
+    // silently regenerate (and invalidate) the operator's existing
+    // authenticator entry every time they merely log back in.
+    let totp_enrolled = totp_is_enrolled(&state.identity_db, &s.user_id).await.unwrap_or(false);
+    let webauthn_enrolled = crate::identity::webauthn::list_devices(&state.identity_db, &s.user_id)
+        .await
+        .map(|d| !d.is_empty())
+        .unwrap_or(false);
+
+    Json(serde_json::json!({
+        "signed_in": true,
+        "identity_configured": identity_configured,
+        "admin_tier": s.admin_tier,
+        "totp_verified": s.totp_verified_at.is_some(),
+        "webauthn_verified": s.webauthn_verified_at.is_some(),
+        "totp_enrolled": totp_enrolled,
+        "webauthn_enrolled": webauthn_enrolled,
+    }))
+    .into_response()
+}
+
+async fn totp_is_enrolled(pool: &sqlx::SqlitePool, user_id: &str) -> anyhow::Result<bool> {
+    let enabled: Option<bool> = sqlx::query_scalar("SELECT enabled FROM totp_secrets WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(enabled.unwrap_or(false))
 }
 
 /// Extracts the caller's active session from the session cookie, or a

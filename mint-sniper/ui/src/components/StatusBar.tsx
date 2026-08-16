@@ -11,10 +11,14 @@ export function StatusBar({
   armed,
   connected,
   activeTarget,
+  onSignOut,
 }: {
   armed: boolean;
   connected: boolean;
   activeTarget?: string;
+  // step 10h — only passed when identity is configured; StatusBar has no
+  // opinion of its own about whether sign-out should be offered.
+  onSignOut?: () => void;
 }) {
   const [time, setTime] = useState(new Date());
   useEffect(() => {
@@ -46,6 +50,11 @@ export function StatusBar({
         <time className={styles.clock}>
           {time.toLocaleTimeString('en-GB', { hour12: false })}
         </time>
+        {onSignOut && (
+          <button className={styles.signOutBtn} onClick={onSignOut} title="Sign out">
+            SIGN OUT
+          </button>
+        )}
       </div>
     </header>
   );

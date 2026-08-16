@@ -101,3 +101,30 @@ export type ServerEvent =
       fireable: boolean;
     }
   | { type: 'snapshot'; armed: boolean; wallets: WalletStatus[] };
+
+// --- identity (step 10) ---
+// Mirrors api.rs's get_auth_session response shape exactly — see that
+// handler's doc comment for why totp_enrolled/webauthn_enrolled
+// (account-wide: "is a factor set up at all") are distinct fields from
+// totp_verified/webauthn_verified (this session's own login progress).
+export interface AuthSession {
+  signed_in: boolean;
+  identity_configured: boolean;
+  admin_tier?: boolean;
+  totp_verified?: boolean;
+  webauthn_verified?: boolean;
+  totp_enrolled?: boolean;
+  webauthn_enrolled?: boolean;
+}
+
+export interface TotpSetupMaterial {
+  qr_data_uri: string;
+  secret_base32: string;
+}
+
+export interface WebauthnDevice {
+  id: string;
+  device_label: string;
+  created_at: number;
+  last_used_at: number | null;
+}

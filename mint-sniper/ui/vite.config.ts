@@ -48,6 +48,10 @@ export default defineConfig({
     proxy: {
       '/api': { target: 'http://127.0.0.1:4117', changeOrigin: true },
       '/ws': { target: 'ws://127.0.0.1:4117', ws: true },
+      // step 10: Google Sign-In, TOTP, WebAuthn, session/logout routes —
+      // same reasoning as /api above, plus these set/read cookies, which
+      // only works cleanly same-origin through this proxy in dev.
+      '/auth': { target: 'http://127.0.0.1:4117', changeOrigin: true },
     },
   },
 });
