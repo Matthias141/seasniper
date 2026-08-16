@@ -219,6 +219,74 @@ export function ConfigPanel({
                 + add wallet
               </button>
             </div>
+
+            <div className={styles.field}>
+              <span>Copymint — tracked wallets</span>
+              {draft.tracked_wallets.map((addr, i) => (
+                <div className={styles.listRow} key={i}>
+                  <input
+                    value={addr}
+                    onChange={(e) => {
+                      const next = [...draft.tracked_wallets];
+                      next[i] = e.target.value;
+                      update('tracked_wallets', next);
+                    }}
+                    placeholder="0x..."
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className={styles.removeBtn}
+                    onClick={() =>
+                      update(
+                        'tracked_wallets',
+                        draft.tracked_wallets.filter((_, idx) => idx !== i),
+                      )
+                    }
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                className={styles.addBtn}
+                onClick={() => update('tracked_wallets', [...draft.tracked_wallets, ''])}
+              >
+                + add tracked wallet
+              </button>
+            </div>
+
+            <div className={styles.gasGrid}>
+              <label className={styles.field}>
+                <span>Auto-fire FREE copymints</span>
+                <input
+                  type="checkbox"
+                  checked={draft.copymint_auto_fire_free}
+                  onChange={(e) => update('copymint_auto_fire_free', e.target.checked)}
+                />
+              </label>
+              <label className={styles.field}>
+                <span>Enable manual fire for PAID copymints</span>
+                <input
+                  type="checkbox"
+                  checked={draft.copymint_auto_fire_paid}
+                  onChange={(e) => update('copymint_auto_fire_paid', e.target.checked)}
+                />
+              </label>
+              <label className={styles.field}>
+                <span>Max paid copymint value (wei)</span>
+                <input
+                  type="number"
+                  value={draft.max_copymint_price_wei}
+                  onChange={(e) => update('max_copymint_price_wei', Number(e.target.value))}
+                />
+              </label>
+            </div>
+            <p className={styles.hint}>
+              Paid copymints never auto-fire, regardless of these settings — they always require
+              a manual click, and only up to the wei ceiling above.
+            </p>
           </fieldset>
 
           {disabled && <p className={styles.lockedNote}>disarm before editing config</p>}

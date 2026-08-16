@@ -58,6 +58,47 @@ pub struct Config {
     pub jitter_ms_max: u64,
     pub gas_jitter_pct: u64,
     pub wallets: Vec<WalletCfg>,
+
+    /// --- copymint (step 6) — see src/copymint.rs's doc comment for the
+    /// full design: SeaDrop mintPublic only, always-on background watch
+    /// independent of trigger_mode/armed state, free/paid split as the
+    /// safety boundary. Empty by default — copymint does nothing at all
+    /// unless this is populated.
+    #[serde(default)]
+    pub tracked_wallets: Vec<String>,
+    /// Free copymint opportunities (mint_price_wei == 0, as read fresh
+    /// from getPublicDrop, never guessed) can auto-fire out of the box —
+    /// downside is bounded to gas, already capped by
+    /// max_priority_fee_gwei_cap above. Defaults true specifically
+    /// because the risk profile is bounded; contrast with
+    /// copymint_auto_fire_paid below.
+    #[serde(default = "default_copymint_auto_fire_free")]
+    pub copymint_auto_fire_free: bool,
+    /// Paid copymint opportunities NEVER auto-fire, regardless of this
+    /// flag's value — see copymint.rs's `should_auto_fire`, whose
+    /// signature structurally cannot see a paid opportunity as
+    /// auto-fireable (it doesn't take this field as a parameter at all).
+    /// This flag only controls whether the UI offers/enables a one-click
+    /// manual fire action for a specific paid opportunity — it is never
+    /// read by copymint.rs's watcher or by main.rs's control_loop.
+    /// Defaults false: a paid mint spends real ETH on a contract nobody
+    /// configured or reviewed in advance, unlike every other trigger
+    /// mode, and that needs an explicit opt-in.
+    #[serde(default)]
+    pub copymint_auto_fire_paid: bool,
+    /// Hard ceiling on total ETH value (mint_price_wei * quantity, not
+    /// per-token price) for a paid copymint opportunity to be considered
+    /// fireable at all — checked independently of copymint_auto_fire_paid
+    /// by both copymint.rs (for the `fireable` flag on the emitted event)
+    /// and api.rs's manual-fire route (re-verified fresh, not trusted
+    /// from a client echo). Defaults to 0, meaning NO paid opportunity is
+    /// fireable until this is explicitly raised — the safe default, not
+    /// an accidental footgun. u64 wei, same convention as this codebase's
+    /// other integer config fields; ~18.4 ETH ceiling headroom, ample for
+    /// a sanity cap and avoids the toml crate's lack of native u128
+    /// support.
+    #[serde(default)]
+    pub max_copymint_price_wei: u64,
 }
 
 fn default_mint_mode() -> String {
@@ -65,6 +106,9 @@ fn default_mint_mode() -> String {
 }
 fn default_quantity() -> u64 {
     1
+}
+fn default_copymint_auto_fire_free() -> bool {
+    true
 }
 
 impl Config {
@@ -183,6 +227,10 @@ mod tests {
             wallets: vec![WalletCfg {
                 private_key_env: "SNIPER_PK_1".to_string(),
             }],
+            tracked_wallets: Vec::new(),
+            copymint_auto_fire_free: default_copymint_auto_fire_free(),
+            copymint_auto_fire_paid: false,
+            max_copymint_price_wei: 0,
         }
     }
 
@@ -260,6 +308,43 @@ mod tests {
         cfg.trigger_mode = "timestamp".to_string();
         cfg.trigger_timestamp_unix = bus::now_ts() * 1000;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn config_without_copymint_fields_still_parses_with_safe_defaults() {
+        // A config.toml written before step 6 (no tracked_wallets,
+        // copymint_auto_fire_free/paid, or max_copymint_price_wei at all)
+        // must still deserialize — every one of those fields has
+        // #[serde(default)]. This is also where the actual default
+        // *values* get pinned down as a regression test, not just
+        // asserted in a doc comment: free auto-fires (bounded risk, gas
+        // only), paid never does until explicitly configured, and the
+        // paid ceiling starts at 0 (nothing is fireable until raised).
+        let toml_str = r#"
+            ws_rpc_url = "wss://example.invalid"
+            http_rpc_urls = ["https://example.invalid"]
+            contract_address = "0x0000000000000000000000000000000000dEaD"
+            mint_fn_signature = "mint(uint256)"
+            mint_fn_args_template = ["1"]
+            mint_state_fn_signature = "mintActive()"
+            trigger_mode = "poll_state"
+            trigger_timestamp_unix = 0
+            priority_fee_multiplier = 6.0
+            max_priority_fee_gwei_cap = 15.0
+            gas_limit_headroom_pct = 20
+            jitter_ms_min = 40
+            jitter_ms_max = 400
+            gas_jitter_pct = 8
+
+            [[wallets]]
+            private_key_env = "SNIPER_PK_1"
+        "#;
+
+        let cfg: Config = toml::from_str(toml_str).expect("old-format config.toml must still parse");
+        assert!(cfg.tracked_wallets.is_empty());
+        assert!(cfg.copymint_auto_fire_free, "free copymints must default to auto-fireable");
+        assert!(!cfg.copymint_auto_fire_paid, "paid copymints must default to NOT auto-fireable");
+        assert_eq!(cfg.max_copymint_price_wei, 0, "paid ceiling must default to 0 (nothing fireable until raised)");
     }
 
     #[test]

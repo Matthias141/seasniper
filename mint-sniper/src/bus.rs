@@ -42,6 +42,26 @@ pub enum ServerEvent {
     /// persisting every routine `Log` message (RPC errors, info noise) —
     /// see `audit.rs`'s doc comment.
     ConfigChanged,
+    /// Emitted by copymint.rs's watcher whenever a tracked wallet's mint
+    /// is detected AND independently verified live via getPublicDrop (see
+    /// copymint.rs's doc comment for why that verification is not
+    /// optional — it's what stands in for the human review every other
+    /// trigger mode gets from being manually configured). Sent for BOTH
+    /// free and paid opportunities, whether or not this one goes on to
+    /// auto-fire — the UI needs to show what happened either way.
+    /// `fireable` is independently re-derived by api.rs's manual-fire
+    /// route at fire time too, never trusted back from a client echo of
+    /// this event — see that route's doc comment.
+    CopyOpportunity {
+        tracked_wallet: String,
+        nft_contract: String,
+        fee_recipient: String,
+        mint_price_wei: String,
+        total_value_wei: String,
+        quantity: u64,
+        is_free: bool,
+        fireable: bool,
+    },
 }
 
 pub type EventBus = broadcast::Sender<ServerEvent>;

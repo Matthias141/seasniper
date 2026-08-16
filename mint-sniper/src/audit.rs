@@ -113,6 +113,28 @@ pub async fn run_audit_writer(bus: EventBus, path: String) {
                 serde_json::json!({ "address": address, "success": success, "detail": detail }),
             ),
             ServerEvent::ConfigChanged => ("config_change", serde_json::json!({})),
+            ServerEvent::CopyOpportunity {
+                tracked_wallet,
+                nft_contract,
+                fee_recipient,
+                mint_price_wei,
+                total_value_wei,
+                quantity,
+                is_free,
+                fireable,
+            } => (
+                "copy_opportunity",
+                serde_json::json!({
+                    "tracked_wallet": tracked_wallet,
+                    "nft_contract": nft_contract,
+                    "fee_recipient": fee_recipient,
+                    "mint_price_wei": mint_price_wei,
+                    "total_value_wei": total_value_wei,
+                    "quantity": quantity,
+                    "is_free": is_free,
+                    "fireable": fireable,
+                }),
+            ),
             // Log/WalletUpdate/RpcHealth are routine and/or high-volume —
             // not what RUNBOOK.md's checklists need a durable record of.
             // Deliberately not persisted here; bus.rs's live feed still

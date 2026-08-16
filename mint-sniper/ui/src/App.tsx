@@ -5,6 +5,7 @@ import { WalletGrid } from './components/WalletGrid';
 import { EventFeed, type FeedLine } from './components/EventFeed';
 import { ConfigPanel } from './components/ConfigPanel';
 import { TriggerConsole } from './components/TriggerConsole';
+import { CopyOpportunities, type CopyOpportunity } from './components/CopyOpportunities';
 import { useEventSocket } from './lib/useEventSocket';
 import { api, initAuth } from './lib/api';
 import type { Config, ServerEvent, WalletStatus } from './types';
@@ -44,6 +45,12 @@ function Control() {
   const [armed, setArmed] = useState(false);
   const [lines, setLines] = useState<FeedLine[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
+  // Keyed by nft_contract — a repeat sighting of the same drop (multiple
+  // tracked wallets, or the pending tx seen more than once) updates in
+  // place rather than piling up duplicate cards.
+  const [copyOpportunities, setCopyOpportunities] = useState<Map<string, CopyOpportunity>>(
+    new Map(),
+  );
 
   const pushLine = useCallback((level: FeedLine['level'], message: string, ts?: number) => {
     setLines((prev) => [
@@ -86,6 +93,28 @@ function Control() {
         case 'rpc_health':
           if (!event.healthy) pushLine('warn', `RPC degraded: ${event.url} (${event.latency_ms}ms)`);
           break;
+        case 'copy_opportunity':
+          setCopyOpportunities((prev) => {
+            const next = new Map(prev);
+            next.set(event.nft_contract, {
+              trackedWallet: event.tracked_wallet,
+              nftContract: event.nft_contract,
+              feeRecipient: event.fee_recipient,
+              mintPriceWei: event.mint_price_wei,
+              totalValueWei: event.total_value_wei,
+              quantity: event.quantity,
+              isFree: event.is_free,
+              fireable: event.fireable,
+            });
+            return next;
+          });
+          pushLine(
+            'warn',
+            `copymint: ${event.tracked_wallet} minting ${event.nft_contract} — ${
+              event.is_free ? 'FREE' : `${event.total_value_wei} wei`
+            }`,
+          );
+          break;
       }
     },
     [pushLine],
@@ -116,6 +145,10 @@ function Control() {
       <main className={styles.grid}>
         <div className={styles.left}>
           <WalletGrid wallets={wallets} />
+          <CopyOpportunities
+            opportunities={[...copyOpportunities.values()]}
+            allowManualFire={config?.copymint_auto_fire_paid ?? false}
+          />
           <EventFeed lines={lines} />
         </div>
 

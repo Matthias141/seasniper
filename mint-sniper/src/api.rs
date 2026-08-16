@@ -1,7 +1,9 @@
 use crate::auth;
 use crate::bus;
 use crate::config::Config;
+use crate::copymint;
 use crate::state::{ControlMsg, SharedState};
+use alloy::primitives::Address;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -13,6 +15,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde::Deserialize;
 use std::sync::atomic::Ordering;
 use tower_http::cors::CorsLayer;
 
@@ -40,6 +43,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/arm", post(post_arm))
         .route("/api/abort", post(post_abort))
         .route("/api/trigger", post(post_trigger))
+        .route("/api/copymint/fire", post(post_copymint_fire))
         .route("/ws/events", get(ws_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_token));
 
@@ -128,6 +132,43 @@ async fn post_trigger(State(state): State<SharedState>) -> impl IntoResponse {
     bus::log(&state.bus, "warn", "manual FIRE requested from UI");
     let _ = state.control_tx.send(ControlMsg::FireNow).await;
     StatusCode::ACCEPTED
+}
+
+#[derive(Deserialize)]
+struct CopymintFireRequest {
+    nft_contract: String,
+    fee_recipient: String,
+}
+
+/// Manual fire for a specific copymint opportunity — the ONLY path a
+/// paid opportunity can ever fire through (copymint.rs's watcher
+/// structurally cannot auto-fire one, see its doc comment). Deliberately
+/// does NOT read `copymint_auto_fire_paid`: that flag's whole job is
+/// telling the UI whether to show/enable the button that calls this
+/// route in the first place, not gating this route itself — once a human
+/// has authenticated and clicked fire, that IS the manual confirmation
+/// this whole design exists to require. Also deliberately does NOT trust
+/// a client-echoed price for the firing decision: `copymint::verify_and_fire`
+/// re-fetches getPublicDrop fresh and re-checks liveness + the
+/// max_copymint_price_wei ceiling right here, in case either changed
+/// since the opportunity was first surfaced.
+async fn post_copymint_fire(
+    State(state): State<SharedState>,
+    Json(req): Json<CopymintFireRequest>,
+) -> impl IntoResponse {
+    let nft_contract: Address = match req.nft_contract.parse() {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad nft_contract: {e}")).into_response(),
+    };
+    let fee_recipient: Address = match req.fee_recipient.parse() {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad fee_recipient: {e}")).into_response(),
+    };
+
+    match copymint::verify_and_fire(&state, nft_contract, fee_recipient).await {
+        Ok(value) => (StatusCode::ACCEPTED, format!("firing — verified value {value} wei")).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {

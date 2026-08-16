@@ -19,6 +19,12 @@ export interface Config {
   jitter_ms_max: number;
   gas_jitter_pct: number;
   wallets: WalletCfg[];
+
+  // --- copymint (step 6) ---
+  tracked_wallets: string[];
+  copymint_auto_fire_free: boolean;
+  copymint_auto_fire_paid: boolean;
+  max_copymint_price_wei: number;
 }
 
 export interface WalletStatus {
@@ -40,4 +46,15 @@ export type ServerEvent =
   | { type: 'rpc_health'; url: string; healthy: boolean; latency_ms: number }
   | { type: 'trigger_fired'; manual: boolean }
   | { type: 'mint_result'; address: string; success: boolean; detail: string }
+  | {
+      type: 'copy_opportunity';
+      tracked_wallet: string;
+      nft_contract: string;
+      fee_recipient: string;
+      mint_price_wei: string;
+      total_value_wei: string;
+      quantity: number;
+      is_free: boolean;
+      fireable: boolean;
+    }
   | { type: 'snapshot'; armed: boolean; wallets: WalletStatus[] };

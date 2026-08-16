@@ -11,6 +11,7 @@ mod audit;
 mod auth;
 mod bus;
 mod config;
+mod copymint;
 mod executor;
 mod seadrop;
 mod state;
@@ -199,6 +200,14 @@ async fn main() -> Result<()> {
     // touch wallets or the control channel, so it runs standalone rather
     // than through control_loop, same reasoning as balance_poll_loop.
     tokio::spawn(rpc_health_poll_loop(app_state.clone(), cfg.http_rpc_urls.clone()));
+
+    // Background: copy-mint (step 6) — watches tracked_wallets for SeaDrop
+    // mintPublic activity and surfaces/auto-fires opportunities through
+    // the same control_tx every other trigger mode uses. Always spawned;
+    // no-ops (just sleeps) whenever tracked_wallets is empty. See
+    // copymint.rs's doc comment for why this runs independently of the
+    // main trigger_mode watcher's armed state rather than through it.
+    tokio::spawn(copymint::run_copymint_watcher(app_state.clone()));
 
     // Background: owns the watcher lifecycle and executes fires. Wallets
     // (with their private key material) live only here and in the executor
@@ -673,6 +682,47 @@ async fn control_loop(
                 warmed_providers.clear();
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
+            }
+
+            ControlMsg::FireCopymint { contract: copy_contract, calldata: copy_calldata, value: copy_value } => {
+                // Deliberately does NOT touch watcher_handle/armed/
+                // warmed_providers/prepared_fire — a copymint fire is
+                // independent of the main trigger_mode's arm/disarm
+                // lifecycle (see copymint.rs's doc comment: this can fire
+                // while the main watcher is armed, disarmed, or doesn't
+                // exist at all for this run). Always JIT-signs, same
+                // fallback path FireNow uses when nothing was pre-signed
+                // — there's no "prepare ahead of time" for copymint since
+                // the target contract isn't known until the moment of
+                // detection.
+                let cfg = state.config.read().await.clone();
+                bus::log(&state.bus, "warn", format!("FIRING copymint opportunity: contract {copy_contract:#x}"));
+
+                let providers = if warmed_providers.is_empty() {
+                    executor::warm_connections(&cfg, &state.bus).await
+                } else {
+                    warmed_providers.clone()
+                };
+
+                match executor::prepare_fire(
+                    &cfg,
+                    &wallets,
+                    copy_contract,
+                    &copy_calldata,
+                    copy_value,
+                    &providers,
+                    &state.bus,
+                )
+                .await
+                {
+                    Ok(w) => {
+                        advance_nonces(&mut wallets, &w);
+                        if let Err(e) = executor::fire_prepared(&cfg, &w, &providers, &state.bus).await {
+                            bus::log(&state.bus, "error", format!("copymint fire sequence error: {e:#}"));
+                        }
+                    }
+                    Err(e) => bus::log(&state.bus, "error", format!("copymint prepare failed: {e:#}")),
+                }
             }
         }
     }

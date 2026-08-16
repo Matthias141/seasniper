@@ -1,5 +1,6 @@
 use crate::bus::EventBus;
 use crate::config::Config;
+use alloy::primitives::{Address, U256};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -28,6 +29,23 @@ pub enum ControlMsg {
     /// watcher trips. Routing it through control_tx like everything else
     /// keeps wallets touched from exactly one place.
     Prepare,
+    /// Fire an ad-hoc mint discovered by copymint.rs — carries its own
+    /// (contract, calldata, value) rather than reusing control_loop's
+    /// startup-configured mint target, since copymint targets a different,
+    /// dynamically-discovered nftContract on every opportunity. Two, and
+    /// only two, call sites ever send this: copymint.rs's watcher (only
+    /// for a FREE opportunity with copymint_auto_fire_free enabled — see
+    /// copymint.rs's `should_auto_fire`, which structurally cannot see a
+    /// paid opportunity as fireable) and api.rs's `/api/copymint/fire`
+    /// route (an authenticated manual action, gated by a human clicking a
+    /// UI button, not by any config flag). Routed through control_tx like
+    /// every other wallet-touching action, for the same single-writer
+    /// reason as Arm/FireNow/Prepare.
+    FireCopymint {
+        contract: Address,
+        calldata: Vec<u8>,
+        value: U256,
+    },
 }
 
 pub struct AppState {

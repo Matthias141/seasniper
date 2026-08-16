@@ -49,4 +49,19 @@ export const api = {
   arm: () => fetch('/api/arm', { method: 'POST', headers: authHeaders() }),
   abort: () => fetch('/api/abort', { method: 'POST', headers: authHeaders() }),
   fireNow: () => fetch('/api/trigger', { method: 'POST', headers: authHeaders() }),
+
+  // Server independently re-verifies liveness + max_copymint_price_wei
+  // fresh via getPublicDrop before firing — never trusts the price this
+  // client is currently displaying. See api.rs's post_copymint_fire.
+  // Resolves with the server's plain-text confirmation/rejection message.
+  fireCopymint: async (nftContract: string, feeRecipient: string): Promise<string> => {
+    const res = await fetch('/api/copymint/fire', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ nft_contract: nftContract, fee_recipient: feeRecipient }),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(text || `${res.status} ${res.statusText}`);
+    return text;
+  },
 };

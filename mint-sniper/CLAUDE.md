@@ -61,8 +61,15 @@ src/
                  mint-result events — see its doc comment and
                  RUNBOOK.md's post-fire-verification section
   api.rs       — axum router: GET/PUT /api/config, GET /api/status,
-                 POST /api/arm|/api/abort|/api/trigger, WS /ws/events,
-                 GET /api/token (unauthenticated bootstrap route)
+                 POST /api/arm|/api/abort|/api/trigger|/api/copymint/fire,
+                 WS /ws/events, GET /api/token (unauthenticated bootstrap
+                 route)
+  copymint.rs  — step 6: watches tracked_wallets for SeaDrop mintPublic
+                 activity and mints the same collection with our own
+                 wallets. SeaDrop-only, always-on independent of
+                 trigger_mode/armed state — see its own doc comment and
+                 the "copymint" section below for the full design and
+                 safety model.
 
 ui/            — Vite + React + TS PWA, "Terminal Command Deck" design
                  (see ui/src/styles/tokens.css for the token system)
@@ -77,7 +84,10 @@ if the UI double-clicks and the watcher triggers in the same instant.
 `executor::fire_prepared` directly; route everything through
 `control_tx`.** This now covers the prepare (pre-sign) phase too, not
 just firing — both touch wallet signers, so both have to stay inside
-`control_loop`.
+`control_loop`. `ControlMsg::FireCopymint` (step 6) follows this same
+rule for a dynamically-discovered mint target: `copymint.rs` and
+`api.rs`'s `/api/copymint/fire` route both only ever *send* it, never
+touch wallets directly themselves.
 
 Wallet signers (i.e. private key material in memory) live only in
 `control_loop`'s local scope in `main.rs` and inside `executor.rs`. They
@@ -227,6 +237,112 @@ step 7f.
     vulnerabilities — not assumed clean from the version bump alone. The
     `ignore:` suppression in `.github/workflows/ci.yml`'s `cargo audit`
     step has been removed accordingly.
+
+## copymint (step 6)
+
+Watches a list of "tracked" wallets and, when one of them mints from a
+SeaDrop public-stage drop, mints the same collection with our own
+wallets — the same idea as a Solana copy-trading bot, applied to mints
+instead of trades. This is the riskiest feature in this codebase: every
+other trigger mode (`poll_state`/`timestamp`/`mempool_watch`) fires on a
+contract someone configured in advance — a human looked at it before
+arming. Copymint fires on whatever a tracked wallet happens to touch,
+which nobody has vetted. Full design, reasoning, and safety model live in
+`src/copymint.rs`'s doc comment; summary here.
+
+**Scoped to SeaDrop `mintPublic` only, deliberately** — not "replay
+arbitrary calldata to an arbitrary contract with a different signer."
+That's dangerous in a non-obvious way: ordinary `mint()` calldata often
+bakes the caller's own address in as the recipient, so replaying it
+byte-for-byte with our signer would mint the NFT to THEM while WE pay gas
+and price. SeaDrop's `mintPublic` sidesteps this entirely —
+`minterIfNotPayer = Address::ZERO` always mints to whoever pays (per
+`seadrop.rs`'s own doc comment on that field), so this module never
+replays the tracked wallet's calldata; it only ever needs to know which
+`nftContract`/`feeRecipient` they used, then builds and signs a fresh
+call of its own.
+
+**Lifecycle is independent of `trigger_mode`/armed state.** The three
+existing watchers target ONE specific configured contract; copymint
+watches for tracked-wallet activity against ANY SeaDrop collection, so it
+runs for the whole process lifetime once `tracked_wallets` is non-empty
+(same pattern as `balance_poll_loop`/`rpc_health_poll_loop`), not gated
+by whether the main watcher is armed.
+
+**Detection → verification → free/paid split**, in that order:
+1. `copymint.rs`'s watcher subscribes to full pending transactions (same
+   `Provider::subscribe_full_pending_transactions` call
+   `watcher::run_mempool_watcher` already uses) and filters for: sender
+   in `tracked_wallets`, target is the configured SeaDrop singleton, and
+   the calldata's selector matches `mintPublic`. On a match, decodes only
+   `nftContract`/`feeRecipient` — never `minterIfNotPayer`/`quantity`.
+2. Before treating a match as an opportunity at all, calls
+   `seadrop::fetch_public_drop` fresh and confirms the drop is actually
+   currently live (`startTime <= now <= endTime`). This stands in for the
+   human review every other trigger mode gets from being manually
+   configured — a tracked wallet's tx could be to an expired,
+   malicious-lookalike, or otherwise uninteresting contract, and this is
+   what catches that.
+3. `ServerEvent::CopyOpportunity` is emitted for BOTH free and paid
+   opportunities, whether or not it goes on to auto-fire.
+4. Free (`mint_price_wei == 0`, read fresh from `getPublicDrop`, never
+   guessed) auto-fires if `copymint_auto_fire_free` (default `true`) —
+   downside bounded to gas, already capped by `max_priority_fee_gwei_cap`.
+5. Paid opportunities NEVER auto-fire. `copymint.rs`'s `should_auto_fire`
+   doesn't even accept `copymint_auto_fire_paid` as a parameter — there is
+   no code path in this file that can auto-fire a paid opportunity under
+   any config. That flag only controls whether the UI offers/enables a
+   manual fire button for a given opportunity
+   (`ui/src/components/CopyOpportunities.tsx`); the backend route it hits
+   (`POST /api/copymint/fire` in `api.rs`) doesn't read that flag either —
+   it fires because a human authenticated and clicked, which is the
+   actual manual confirmation this whole split exists to require. That
+   route also never trusts a client-echoed price: it re-runs
+   `getPublicDrop` fresh and re-checks liveness + `max_copymint_price_wei`
+   (default `0` — nothing paid is fireable until explicitly raised)
+   immediately before firing.
+6. Firing, for both free-auto and paid-manual, routes through a new
+   `ControlMsg::FireCopymint { contract, calldata, value }` sent to the
+   same single-writer `control_loop` every other action uses — JIT-signed
+   via the same prepare→fire fallback path `FireNow` already uses when
+   nothing was pre-signed (there's no "prepare ahead of time" for
+   copymint; the target isn't known until the moment of detection).
+   Deliberately does NOT touch `armed`/the main watcher's state — a
+   copymint fire can happen while the main watcher is armed, disarmed, or
+   not configured at all this run.
+
+**Safety properties traced and tested explicitly (6e), not just
+asserted** — see `src/copymint.rs`'s test module:
+- `copymint_never_propagates_tracked_wallets_own_minter_choice`: builds a
+  tracked wallet's calldata with the tracked wallet's OWN address as
+  `minterIfNotPayer` (the adversarial case this whole design exists to
+  prevent), decodes it, rebuilds our own call from the decoded values via
+  `seadrop::encode_mint_public`, and asserts the resulting
+  `minterIfNotPayer` is `Address::ZERO` — never the tracked wallet's
+  address. A real, executable proof of property #1, not a comment.
+- `paid_opportunities_never_auto_fire_regardless_of_config`: asserts
+  `should_auto_fire(false, true)` and `should_auto_fire(false, false)`
+  are both `false` — property #2, made testable by the fact that the
+  function's signature structurally cannot express "auto-fire a paid
+  opportunity" at all (it has no parameter for
+  `copymint_auto_fire_paid`).
+
+**KNOWN LIMITATION — inherits gap #11 in full, does not close it.**
+Copymint's entire detection mechanism is
+`subscribe_full_pending_transactions`, the exact same call gap #11 flags
+as never having been successfully fire-tested end-to-end against a live
+chain from this sandbox (alloy's WS transport fails TLS validation
+against this sandbox's intercepting proxy — structural, confirmed as
+recently as step 9e). Copymint's parsing/filtering/decoding/firing-
+decision logic is unit-tested against synthetic pending-tx-shaped data
+(see `src/copymint.rs`'s tests), but has NOT been live-fired here. This
+feature landed after step 5's original testnet plan was written and
+after step 9e's dry run, so it carries its own, so-far-unmet validation
+requirement on top of gap #11's existing one: **needs real testnet
+validation — tracked-wallet detection actually firing, an opportunity
+actually surfacing in the UI, manual fire actually working — from an
+environment without this sandbox's WS/TLS limitation before it's
+trustworthy for a real drop.**
 
 ## Alloy 0.9 → 2.4.1 upgrade (step 9)
 

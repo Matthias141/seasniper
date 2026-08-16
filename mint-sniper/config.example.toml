@@ -91,3 +91,31 @@ private_key_env = "SNIPER_PK_3"
 # contract_address / mint_fn_signature / mint_state_fn_signature are unused
 # in this mode (mint target is the SeaDrop singleton, ABI is fixed).
 
+# --- Copymint (step 6) — watch tracked wallets for SeaDrop mintPublic
+# activity and mint the same collection ourselves. SeaDrop-only, always
+# runs in the background independent of trigger_mode/armed state above —
+# see src/copymint.rs's doc comment for the full design and its safety
+# model. Empty by default: copymint does nothing until tracked_wallets is
+# populated. NOT live-fire-verified from this authoring environment (see
+# CLAUDE.md's "copymint" section and known gap #11) — validate on testnet
+# before trusting this for a real drop.
+tracked_wallets = []              # e.g. ["0xSomeWalletYouWantToCopy", ...]
+
+# Free copymint opportunities (mint_price_wei == 0, verified fresh via
+# getPublicDrop, never guessed) can auto-fire out of the box — downside
+# is bounded to gas, same ceiling as max_priority_fee_gwei_cap above.
+copymint_auto_fire_free = true
+
+# Paid copymint opportunities NEVER auto-fire regardless of this value —
+# see copymint.rs's should_auto_fire, which doesn't even take this field
+# as a parameter. This only controls whether the UI offers a one-click
+# manual fire button for a specific paid opportunity.
+copymint_auto_fire_paid = false
+
+# Hard ceiling (wei, TOTAL value = price * quantity_per_wallet, not
+# per-token) above which a paid copymint opportunity is never offered as
+# fireable — checked independently of copymint_auto_fire_paid, both when
+# the opportunity is first surfaced and again, fresh, at manual-fire time.
+# 0 = nothing paid is fireable until you raise this deliberately.
+max_copymint_price_wei = 0
+
