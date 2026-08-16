@@ -217,27 +217,101 @@ step 7f.
     a live result. Needs a live run from an environment without this
     sandbox's WS/TLS limitation before either mode should be trusted for
     a real drop.
-12. **`ruint` 1.16.0 (transitive, via `alloy-primitives` 0.8.26 — this
-    bot's nonce/gas/value math sits on top of it) has two open RustSec
-    advisories: RUSTSEC-2025-0137 (unsoundness in an internal division
-    function, only live in release builds since the bounds check is a
-    `debug_assert!`) and RUSTSEC-2026-0220 (incorrect overflow flags on
-    checked/saturating/wrapping shift ops, worst on non-limb-aligned
-    widths — U256, what this bot actually uses, is limb-aligned and not
-    the worst case, though the advisory isn't scoped to exclude it
-    either).** `cargo update -p ruint` confirms 1.16.0 is already the
-    newest version `alloy-primitives` 0.8.26 permits — the only real fix
-    is `alloy` 0.9.2 → 2.4.1 (current latest), a major-version jump.
-    Explicitly NOT done as part of step 7's CI fix: this repo's own
-    "Status" section above already warns alloy's surface shifts across
-    even minor versions, so a 0.9 → 2.x jump touching every RPC/signing
-    call site is real, separate work with its own compile/test/dry-run
-    cycle — not something to fold silently into getting CI green.
-    Currently suppressed in `.github/workflows/ci.yml`'s `cargo audit`
-    step via `ignore: RUSTSEC-2025-0137,RUSTSEC-2026-0220`, with the same
-    reasoning duplicated in that file's comment. This is flagged, not
-    fixed — treat the alloy upgrade as its own task before assuming this
-    gap is closed.
+12. ~~`ruint` 1.16.0 (transitive, via `alloy-primitives` 0.8.26) had two
+    open RustSec advisories: RUSTSEC-2025-0137 and RUSTSEC-2026-0220.~~
+    Fixed — see git history and "Alloy 0.9 → 2.4.1 upgrade (step 9)"
+    below. `alloy` 2.4.1 pulls in `alloy-primitives` 1.6.1, which permits
+    `ruint` ≥1.20.0 (both advisories' fixed version) rather than pinning
+    it at 1.16.0. `cargo update -p ruint` picked up 1.20.0, and `cargo
+    audit` run directly against the resulting `Cargo.lock` confirms zero
+    vulnerabilities — not assumed clean from the version bump alone. The
+    `ignore:` suppression in `.github/workflows/ci.yml`'s `cargo audit`
+    step has been removed accordingly.
+
+## Alloy 0.9 → 2.4.1 upgrade (step 9)
+
+Done specifically to clear gap #12 above (the two `ruint` advisories,
+whose only real fix was this major-version jump) — not a routine bump,
+treated as its own dedicated, careful piece of work per this repo's own
+"Status" section warning that alloy's surface shifts even across minor
+versions. See git history for the individual 9a-9g commits.
+
+**Scoped first (9a), before touching code.** Read alloy's actual v1.0
+migration guide and docs.rs for 2.4.1, checked every alloy API this
+codebase calls. Two confirmed hit sites going in: `FunctionExt::
+abi_decode_output` losing its `validate: bool` parameter (hits
+`seadrop.rs` directly), and the `ReqwestProvider` type alias being
+removed (hits `executor.rs`). Everything else was either confirmed
+unaffected or explicitly flagged unknown-pending-compile, not assumed.
+
+**Compiled and fixed mechanically (9b)** — see `src/*.rs` and git
+history for the full file-by-file diff. Two changes were judgment calls,
+not mechanical renames:
+- Every `ProviderBuilder::new()` call site (8 total) now chains
+  `.disable_recommended_fillers()`. Alloy 2.x attaches a default gas/
+  nonce/chain-id filler stack by default now; this codebase's entire
+  prepare/fire split exists specifically to avoid exactly that kind of
+  implicit RPC-time filling (see `executor.rs`'s own comment on why
+  manual `gas_limit` became load-bearing). This bot never calls
+  `.send_transaction()` (signs manually, calls `.send_raw_transaction()`)
+  so the filler stack likely never engaged either way, but disabling it
+  restores exact 0.9.x bare-provider semantics and keeps `HttpProvider =
+  RootProvider` a simple type instead of the default's verbose
+  `FillProvider<JoinFill<...>, RootProvider>`.
+- `watcher.rs`'s `tx.from == admin` (load-bearing for `mempool_watch`'s
+  admin-address match) became `tx.inner.signer() == admin` — `Transaction`
+  no longer has a direct `from` field (compiler-confirmed field list:
+  `inner`, `block_hash`, `block_number`, `transaction_index`,
+  `effective_gas_price`, `block_timestamp`). Inferred the accessor from
+  `tx.inner.tx_hash()` already working elsewhere in the same file, then
+  confirmed against the compiler rather than guessing from memory.
+
+**Re-verified `seadrop.rs`'s `getPublicDrop` decode live (9c)**, same
+dual-decoder rigor as step 2's original verification — a wrong decode
+here fails silently as a wrong price/timestamp, not a compile error, so
+a clean `cargo build` was explicitly not treated as sufficient evidence.
+Called `getPublicDrop` on the real SeaDrop 1.0 mainnet singleton for
+EVERYBODYS (the same real collection step 2 used) through the upgraded
+alloy, from a standalone scratch binary. Decoded the raw response via
+the actual post-upgrade call shape (`abi_decode_output(&raw)`, no
+`validate` arg) AND an independent hand-written raw-byte decoder with
+zero alloy decode logic involved. Both agree, and both match step 2's
+original values byte-for-byte: `mintPrice=36000000000000000 wei`,
+`startTime=1666908000`, `endTime=1669590000`, `maxTotalMintableByWallet=
+20`, `feeBps=750`, `restrictFeeRecipients=true`.
+
+**Re-read the test assertions, not just pass/fail (9d).** The calldata
+encoding tests (`seadrop.rs`, `main.rs`) route through `Function::parse`,
+`DynSolType::coerce_str`, `abi_encode_input`, `Function::selector` — none
+of which required a single edit during 9b's compile-fix pass, meaning
+these tests still exercise the identical code path they always did, not
+a coincidentally-passing different one. `executor.rs`'s gas-jitter tests
+are pure `u128`/`i128` arithmetic, not applicable to this upgrade at all.
+
+**Pubsub / gap #11 (9e) — NOT closed, confirmed not closable in this
+environment, not just assumed still blocked.** Freshly re-tested (this
+session's container had no leftover `.testnet-keys/` or `forge`/`cast`
+install from step 5's — a different container instance): a raw Python
+`websockets` client reached `wss://ethereum-sepolia-rpc.publicnode.com`
+and received a live block header with no issue. Alloy 2.4.1's own WS
+transport, hitting the identical URL from a standalone scratch binary,
+failed with `invalid peer certificate: UnknownIssuer` — the exact same
+failure mode as step 5, for the exact same reason (alloy's WS stack is
+hard-compiled against `webpki-roots`, which structurally can't be pointed
+at this sandbox's TLS-interception proxy the way `reqwest`/HTTP can).
+Gap #11's wording is unchanged, not because it wasn't reconsidered but
+because this result is more evidence for the same conclusion, not new
+information. Confirmed separately: `subscribe_full_pending_transactions`
+itself required zero changes during the upgrade (only `.connect_ws()`'s
+name earlier in the same chain changed) — its signature and behavior are
+identical to before.
+
+**Close-out (9f):** `cargo build --all-targets` / `cargo test` (19/19) /
+`cargo clippy --all-targets -- -D warnings` all clean throughout.
+`cargo audit` confirmed clean directly (zero vulnerabilities; two
+pre-existing, unrelated "unmaintained" informational warnings remain —
+`derivative`, `paste` — not gated, not new). Gap #12 marked resolved
+above; `.github/workflows/ci.yml`'s `ignore:` suppression removed.
 
 ## Security (step 7)
 

@@ -64,36 +64,17 @@ jobs:
           # for exactly this — "The directory of the Cargo.toml /
           # Cargo.lock files to scan," defaulting to `.`.
           working-directory: mint-sniper
-          # EXPLICIT ACCEPTED-RISK EXCEPTION — flagged to a human, not
-          # silently swallowed (see the npm audit step below for the same
-          # policy applied to the UI side). Confirmed live on this exact
-          # Cargo.lock, both against `ruint` 1.16.0, pulled in transitively
-          # via alloy-primitives 0.8.26 (`cargo tree -i ruint`), which this
-          # bot's arithmetic (nonce/gas/value math via alloy's U256) sits on
-          # top of:
-          #   - RUSTSEC-2025-0137: unsoundness in ruint::algorithms::div::
-          #     reciprocal_mg10 (a debug_assert-only bounds check, compiled
-          #     out in release builds). Fixed in ruint >=1.17.1.
-          #   - RUSTSEC-2026-0220: incorrect overflow flags on checked/
-          #     overflowing/saturating/wrapping shl/shr, worst on non-limb-
-          #     aligned widths (e.g. U160) — U256, what this bot actually
-          #     uses for value/gas math, is limb-aligned (4×64-bit) and not
-          #     the case the advisory calls out as worst-affected, though
-          #     the advisory does not scope itself to only non-aligned
-          #     widths. Fixed in ruint >=1.20.0.
-          # `cargo update -p ruint --dry-run` confirms 1.16.0 is already
-          # the newest version alloy-primitives 0.8.26's own Cargo.toml
-          # permits — the only fix is bumping alloy 0.9.2 -> 2.4.1 (current
-          # latest), a major-version jump. This repo's own CLAUDE.md
-          # ("Status" section) explicitly flags alloy's API surface as
-          # shifting across even *minor* versions and warns against
-          # assuming compatibility — a 0.9 -> 2.x jump touching every RPC/
-          # signing call site is a real, separate, non-trivial piece of
-          # work with its own compile/test/dry-run cycle, not something to
-          # fold silently into a CI-plumbing fix. Ignored here by advisory
-          # ID with this reasoning on record; revisit as its own dedicated
-          # task, not deferred indefinitely.
-          ignore: RUSTSEC-2025-0137,RUSTSEC-2026-0220
+          # No `ignore:` list here. RUSTSEC-2025-0137 and RUSTSEC-2026-0220
+          # (both in `ruint`, transitive via alloy-primitives) were
+          # suppressed by advisory ID from here through step 9 — see git
+          # history for that commit's full reasoning — until the alloy
+          # 0.9.2 -> 2.4.1 upgrade (step 9) pulled in alloy-primitives
+          # 1.6.1, which permits ruint >=1.20.0 (both advisories' fixed
+          # version) instead of pinning it at 1.16.0. `cargo audit` is
+          # clean on this Cargo.lock as of that upgrade — confirmed
+          # directly (`cargo audit` run locally, zero vulnerabilities),
+          # not assumed from the version bump alone. See CLAUDE.md's
+          # known-gaps list, formerly gap #12, now resolved.
 
   ui:
     name: UI (typecheck, build, audit)
