@@ -180,6 +180,21 @@ can't produce a negative (wrapped) gas value.
     Switched to `{e:#}` (anyhow's alternate Display), which joins the full
     context chain, so a real RPC/revert reason isn't hidden behind a
     generic "estimating gas" or similar.
+11. **`poll_state` and `mempool_watch` trigger logic has not been
+    fire-tested against a live chain — only the underlying transport has
+    been confirmed working outside the bot.** The step 5 dry run verified
+    `eth_subscribe("newHeads")` and `eth_subscribe("newPendingTransactions",
+    true)` work against a live Sepolia RPC via a raw WS client, but never
+    got either watcher connected and running inside the bot itself (see
+    "Testnet dry run" section above for why — a sandbox-local TLS issue,
+    not a code defect). That means `run_state_poll_watcher`'s block-poll
+    loop and `run_mempool_watcher`'s (from, to) pending-tx filter have
+    never actually fired a real trigger under real timing and real chain
+    conditions, in this dry run or any prior one — everything known about
+    their correctness so far is code review and unit-level reasoning, not
+    a live result. Needs a live run from an environment without this
+    sandbox's WS/TLS limitation before either mode should be trusted for
+    a real drop.
 
 ## Testnet dry run (step 5) — what a live run against Sepolia found
 
@@ -210,23 +225,35 @@ report):**
   load over this environment's network — cosmetic, unrelated to the app.)
 
 **What could NOT be verified in this specific run, and why (environment
-limitation, not a code defect):** `poll_state` and `mempool_watch` both use
-`ws_rpc_url` via alloy's WS transport, which is hard-compiled against
-`webpki-roots` (a fixed public CA bundle — see `alloy-transport-ws`'s
-Cargo.toml, `tokio-tungstenite` with the `rustls-tls-webpki-roots` feature).
-The sandbox this dry run ran in terminates TLS through a local proxy with
-its own CA, which `reqwest` (used for all HTTP RPC calls) was configured to
-trust but this hard-coded WS stack structurally cannot be pointed at. Their
-underlying wire protocols (`eth_subscribe("newHeads")` and
+limitation on the connection, NOT proof the watcher logic itself is
+sound — see below for why those are different claims):** `poll_state` and
+`mempool_watch` both use `ws_rpc_url` via alloy's WS transport, which is
+hard-compiled against `webpki-roots` (a fixed public CA bundle — see
+`alloy-transport-ws`'s Cargo.toml, `tokio-tungstenite` with the
+`rustls-tls-webpki-roots` feature). The sandbox this dry run ran in
+terminates TLS through a local proxy with its own CA, which `reqwest`
+(used for all HTTP RPC calls) was configured to trust but this hard-coded
+WS stack structurally cannot be pointed at. A real deployment on a normal
+network without TLS interception would not hit this specific connection
+failure. It's exactly what surfaced gap #9 above though: arming
+poll_state in this environment used to just hang forever with the UI
+still saying ARMED; now it fails loudly and disarms within ~150ms, with
+the real error in the log.
+
+**Be precise about what this does and doesn't prove.** The underlying
+wire protocols (`eth_subscribe("newHeads")` and
 `eth_subscribe("newPendingTransactions", true)`) were independently
 confirmed to work against the same Sepolia RPC via a raw Python WS client
-outside the bot, so this is specifically about this Rust dependency's fixed
-TLS trust store in this sandboxed network, not a reachability problem with
-the RPC or a logic problem in `watcher.rs`. A real deployment on a normal
-network without TLS interception would not hit this. It's exactly what
-surfaced gap #9 above though: arming poll_state in this environment used to
-just hang forever with the UI still saying ARMED; now it fails loudly and
-disarms within ~150ms, with the real error in the log.
+outside the bot — that's real evidence the *transport* is reachable and
+the RPC supports both subscription types. It is NOT evidence that
+`run_state_poll_watcher`'s block-poll loop or `run_mempool_watcher`'s
+(from, to) pending-tx filter behave correctly under real timing and real
+chain conditions — neither watcher has ever actually connected and fired
+against a live chain, in this dry run or any prior one. Every review of
+that logic so far (steps 1-4, and the "what could not be verified" note
+above) is code review and unit-level reasoning, not a live result. Don't
+read the transport check as having verified more than it did — see gap
+#11 below.
 
 **A UI display gap noticed, not fixed:** each `WalletStatus.nonce` shown by
 `/api/status` and the WS `snapshot` event is set once at process boot (from
