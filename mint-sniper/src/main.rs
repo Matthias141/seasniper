@@ -7,6 +7,7 @@
 // exact same mint-gating logic first.
 
 mod api;
+mod audit;
 mod auth;
 mod bus;
 mod config;
@@ -30,6 +31,7 @@ use tracing::info;
 
 const CONFIG_PATH: &str = "config.toml";
 const TOKEN_PATH: &str = ".sniper-token";
+const AUDIT_LOG_PATH: &str = "audit.log";
 const API_BIND_ADDR: &str = "127.0.0.1:4117";
 
 #[tokio::main]
@@ -38,6 +40,12 @@ async fn main() -> Result<()> {
 
     let mut cfg = config::Config::load(CONFIG_PATH).context("loading config.toml")?;
     let event_bus = bus::new_bus();
+    // Never awaited — runs for the process lifetime, persisting
+    // arm/disarm/fire/config-change/mint-result events. See audit.rs's
+    // doc comment for why this is a bus subscriber rather than scattered
+    // call sites, and why a separate file rather than reusing tracing's
+    // stdout output.
+    tokio::spawn(audit::run_audit_writer(event_bus.clone(), AUDIT_LOG_PATH.to_string()));
 
     // admin_watch_target is only used by mempool_watch (see
     // watcher::run_mempool_watcher's doc comment for why it's not always

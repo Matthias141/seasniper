@@ -102,6 +102,7 @@ async fn put_config(
         }
     }
     bus::log(&state.bus, "info", "config updated via UI");
+    let _ = state.bus.send(bus::ServerEvent::ConfigChanged);
     StatusCode::OK.into_response()
 }
 
