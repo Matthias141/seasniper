@@ -217,6 +217,27 @@ step 7f.
     a live result. Needs a live run from an environment without this
     sandbox's WS/TLS limitation before either mode should be trusted for
     a real drop.
+12. **`ruint` 1.16.0 (transitive, via `alloy-primitives` 0.8.26 — this
+    bot's nonce/gas/value math sits on top of it) has two open RustSec
+    advisories: RUSTSEC-2025-0137 (unsoundness in an internal division
+    function, only live in release builds since the bounds check is a
+    `debug_assert!`) and RUSTSEC-2026-0220 (incorrect overflow flags on
+    checked/saturating/wrapping shift ops, worst on non-limb-aligned
+    widths — U256, what this bot actually uses, is limb-aligned and not
+    the worst case, though the advisory isn't scoped to exclude it
+    either).** `cargo update -p ruint` confirms 1.16.0 is already the
+    newest version `alloy-primitives` 0.8.26 permits — the only real fix
+    is `alloy` 0.9.2 → 2.4.1 (current latest), a major-version jump.
+    Explicitly NOT done as part of step 7's CI fix: this repo's own
+    "Status" section above already warns alloy's surface shifts across
+    even minor versions, so a 0.9 → 2.x jump touching every RPC/signing
+    call site is real, separate work with its own compile/test/dry-run
+    cycle — not something to fold silently into getting CI green.
+    Currently suppressed in `.github/workflows/ci.yml`'s `cargo audit`
+    step via `ignore: RUSTSEC-2025-0137,RUSTSEC-2026-0220`, with the same
+    reasoning duplicated in that file's comment. This is flagged, not
+    fixed — treat the alloy upgrade as its own task before assuming this
+    gap is closed.
 
 ## Security (step 7)
 
