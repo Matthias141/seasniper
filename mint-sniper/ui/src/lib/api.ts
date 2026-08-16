@@ -1,4 +1,4 @@
-import type { Config, StatusResponse } from '../types';
+import type { Config, ResolvedTarget, StatusResponse } from '../types';
 
 // Bootstrapped once at app startup from GET /api/token — the one route the
 // Rust backend doesn't require the token on, since this is how the token
@@ -64,4 +64,22 @@ export const api = {
     if (!res.ok) throw new Error(text || `${res.status} ${res.statusText}`);
     return text;
   },
+
+  // Read-only — resolves + verifies without changing any bot state. See
+  // api.rs's post_target_resolve.
+  resolveTarget: (input: string) =>
+    fetch('/api/target/resolve', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ input }),
+    }).then((r) => json<ResolvedTarget>(r)),
+
+  // Server re-verifies fresh (never trusts this client's earlier
+  // /resolve result) before committing. See api.rs's post_target_set.
+  setTarget: (nftContract: string) =>
+    fetch('/api/target/set', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ nft_contract: nftContract }),
+    }).then((r) => json<ResolvedTarget>(r)),
 };

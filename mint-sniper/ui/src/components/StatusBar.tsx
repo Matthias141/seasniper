@@ -1,7 +1,21 @@
 import styles from './StatusBar.module.css';
 import { useEffect, useState } from 'react';
 
-export function StatusBar({ armed, connected }: { armed: boolean; connected: boolean }) {
+/**
+ * step 8b: the active target should always be visible, not buried behind
+ * an "open config" click — it's the single fact that determines where the
+ * next mint's money goes, so it stays in the persistent header alongside
+ * ARMED/LINK, not just inside ConfigPanel or the target resolver.
+ */
+export function StatusBar({
+  armed,
+  connected,
+  activeTarget,
+}: {
+  armed: boolean;
+  connected: boolean;
+  activeTarget?: string;
+}) {
   const [time, setTime] = useState(new Date());
   useEffect(() => {
     const id = setInterval(() => setTime(new Date()), 1000);
@@ -17,6 +31,10 @@ export function StatusBar({ armed, connected }: { armed: boolean; connected: boo
       </div>
 
       <div className={styles.right}>
+        <div className={styles.pill} title={activeTarget ? `Active target: ${activeTarget}` : 'No target set'}>
+          <span className={styles.dot} />
+          {activeTarget ? `TGT ${activeTarget.slice(0, 6)}…${activeTarget.slice(-4)}` : 'NO TARGET'}
+        </div>
         <div className={`${styles.pill} ${connected ? styles.pillOk : styles.pillDown}`}>
           <span className={styles.dot} />
           {connected ? 'LINK OK' : 'NO LINK'}

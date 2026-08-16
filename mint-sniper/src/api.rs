@@ -3,6 +3,7 @@ use crate::bus;
 use crate::config::Config;
 use crate::copymint;
 use crate::state::{ControlMsg, SharedState};
+use crate::target;
 use alloy::primitives::Address;
 use axum::{
     extract::{
@@ -44,6 +45,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/api/abort", post(post_abort))
         .route("/api/trigger", post(post_trigger))
         .route("/api/copymint/fire", post(post_copymint_fire))
+        .route("/api/target/resolve", post(post_target_resolve))
+        .route("/api/target/set", post(post_target_set))
         .route("/ws/events", get(ws_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_token));
 
@@ -169,6 +172,157 @@ async fn post_copymint_fire(
         Ok(value) => (StatusCode::ACCEPTED, format!("firing — verified value {value} wei")).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     }
+}
+
+fn resolved_target_json(r: &target::ResolvedTarget, now: u64) -> serde_json::Value {
+    serde_json::json!({
+        "nft_contract": format!("{:#x}", r.nft_contract),
+        "name": r.name,
+        "links": r.links,
+        "mint_price_wei": r.mint_price_wei.to_string(),
+        "total_value_wei": r.total_value_wei().to_string(),
+        "quantity_per_wallet": r.quantity_per_wallet,
+        "start_time": r.start_time,
+        "end_time": r.end_time,
+        "max_per_wallet": r.max_per_wallet,
+        "restrict_fee_recipients": r.restrict_fee_recipients,
+        "fee_recipient": format!("{:#x}", r.fee_recipient),
+        "fee_recipient_ok": r.fee_recipient_ok,
+        "is_live": r.is_live(now),
+        // A target can be a real, live drop and still not be settable —
+        // either it's not live yet/anymore, or the configured
+        // fee_recipient isn't accepted. The UI should gate its "set as
+        // active target" action on this, not just fee_recipient_ok alone.
+        "settable": r.is_live(now) && r.fee_recipient_ok,
+    })
+}
+
+#[derive(Deserialize)]
+struct TargetResolveRequest {
+    input: String,
+}
+
+/// Read-only: resolves + verifies `input` (a raw address or OpenSea
+/// collection URL) and returns the details, without changing any bot
+/// state. A separate, explicit `/api/target/set` call is required to
+/// actually make this the active target — same "verify, then surface,
+/// then a separate commit action" shape copymint.rs already uses (see
+/// its doc comment), and the same "no auto-arm on resolve" principle
+/// every money-spending action in this codebase follows.
+async fn post_target_resolve(
+    State(state): State<SharedState>,
+    Json(req): Json<TargetResolveRequest>,
+) -> impl IntoResponse {
+    match target::resolve(&state, &state.http_client, &req.input).await {
+        Ok(resolved) => Json(resolved_target_json(&resolved, bus::now_ts())).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct TargetSetRequest {
+    nft_contract: String,
+}
+
+// TODO(step 10f — identity/step-up auth, not merged as of this writing):
+// this route changes where the bot's next mint sends money, the same
+// sensitivity class as /api/arm and /api/trigger. It currently only
+// requires the same local bearer token every other route needs. When
+// step 10's step-up auth lands, this route should require it too — don't
+// let this get missed just because it shipped before step 10 did.
+//
+/// Actually swaps the active seadrop target. Deliberately does NOT trust
+/// anything the client sent beyond `nft_contract` — re-runs the full
+/// `target::resolve_address` verification fresh (never a cached result
+/// from an earlier `/resolve` call, which could be stale by the time the
+/// operator clicks confirm) and refuses to proceed unless the drop is
+/// both live and `fee_recipient_ok`. Only seadrop mode is supported —
+/// custom mode has no `getPublicDrop`/collection concept to resolve
+/// against. On success: sends `ControlMsg::SetTarget` (see its doc
+/// comment in state.rs for the control_loop-side cleanup this triggers)
+/// and persists `nft_contract` into `config.toml` via the same
+/// validate-then-write path `PUT /api/config` uses.
+async fn post_target_set(
+    State(state): State<SharedState>,
+    Json(req): Json<TargetSetRequest>,
+) -> impl IntoResponse {
+    let cfg = state.config.read().await.clone();
+
+    if cfg.mint_mode != "seadrop" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "target resolution/set is only supported for mint_mode = \"seadrop\"".to_string(),
+        )
+            .into_response();
+    }
+
+    let nft_contract: Address = match req.nft_contract.parse() {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad nft_contract: {e}")).into_response(),
+    };
+
+    let resolved = match target::resolve_address(&cfg, nft_contract).await {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    };
+
+    let now = bus::now_ts();
+    if !resolved.is_live(now) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "drop is not currently live (start {}, end {}, now {})",
+                resolved.start_time, resolved.end_time, now
+            ),
+        )
+            .into_response();
+    }
+    if !resolved.fee_recipient_ok {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "configured fee_recipient {:#x} is not accepted on this drop \
+                 (restrictFeeRecipients=true) — update fee_recipient before setting this target",
+                resolved.fee_recipient
+            ),
+        )
+            .into_response();
+    }
+
+    let mint_calldata = match resolved.mint_calldata() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("encoding mintPublic calldata failed: {e}")).into_response(),
+    };
+    let mint_value = resolved.total_value_wei();
+
+    // Persist nft_contract into config.toml — same validate-then-write
+    // path PUT /api/config uses, so this and a manual config edit get
+    // identical treatment (7f's validation applies here too).
+    let mut new_cfg = cfg.clone();
+    new_cfg.nft_contract = format!("{nft_contract:#x}");
+    if let Err(e) = new_cfg.validate() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("resolved target failed config validation: {e:#}")).into_response();
+    }
+    {
+        let mut w = state.config.write().await;
+        *w = new_cfg.clone();
+    }
+    match toml::to_string_pretty(&new_cfg) {
+        Ok(toml_str) => {
+            if let Err(e) = tokio::fs::write(&state.config_path, toml_str).await {
+                bus::log(&state.bus, "error", format!("target set in memory but disk write failed: {e}"));
+            }
+        }
+        Err(e) => bus::log(&state.bus, "error", format!("target set in memory but config serialize failed: {e}")),
+    }
+    let _ = state.bus.send(bus::ServerEvent::ConfigChanged);
+
+    let _ = state
+        .control_tx
+        .send(ControlMsg::SetTarget { nft_contract, mint_calldata, mint_value })
+        .await;
+
+    Json(resolved_target_json(&resolved, now)).into_response()
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<SharedState>) -> impl IntoResponse {

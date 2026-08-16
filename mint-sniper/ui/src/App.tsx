@@ -6,6 +6,7 @@ import { EventFeed, type FeedLine } from './components/EventFeed';
 import { ConfigPanel } from './components/ConfigPanel';
 import { TriggerConsole } from './components/TriggerConsole';
 import { CopyOpportunities, type CopyOpportunity } from './components/CopyOpportunities';
+import { TargetResolver } from './components/TargetResolver';
 import { useEventSocket } from './lib/useEventSocket';
 import { api, initAuth } from './lib/api';
 import type { Config, ServerEvent, WalletStatus } from './types';
@@ -138,7 +139,7 @@ function Control() {
 
   return (
     <div className={styles.shell}>
-      <StatusBar armed={armed} connected={connected} />
+      <StatusBar armed={armed} connected={connected} activeTarget={config?.nft_contract || undefined} />
 
       {loadError && <div className={styles.banner}>config load failed: {loadError}</div>}
 
@@ -154,6 +155,7 @@ function Control() {
 
         <div className={styles.right}>
           <TriggerConsole armed={armed} />
+          <TargetResolver onTargetSet={(nftContract) => setConfig((c) => (c ? { ...c, nft_contract: nftContract } : c))} />
           {config && (
             <ConfigPanel config={config} onSaved={setConfig} disabled={armed} />
           )}

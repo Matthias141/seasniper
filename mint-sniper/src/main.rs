@@ -13,8 +13,10 @@ mod bus;
 mod config;
 mod copymint;
 mod executor;
+mod opensea;
 mod seadrop;
 mod state;
+mod target;
 mod wallet;
 mod watcher;
 
@@ -181,6 +183,7 @@ async fn main() -> Result<()> {
         control_tx: control_tx.clone(),
         config_path: CONFIG_PATH.to_string(),
         api_token,
+        http_client: reqwest::Client::new(),
     });
 
     // Background: refresh wallet ETH balances every 15s and push updates
@@ -374,6 +377,13 @@ async fn control_loop(
     // on every Prepare that isn't timestamp mode's single lead-time call —
     // see the ControlMsg::Prepare handler below.
     let mut mint_value = mint_value;
+    // Runtime-mutable as of step 8b — ControlMsg::SetTarget updates these
+    // when the operator swaps the active target via the UI. `contract`
+    // (the SeaDrop singleton address in seadrop mode) deliberately stays
+    // a fixed local, not `mut`: 8b only swaps the nft_contract within the
+    // singleton's mintPublic calls, never the singleton itself.
+    let mut admin_watch_target = admin_watch_target;
+    let mut mint_calldata = mint_calldata;
     // Both watcher fns (run_timestamp_watcher, run_state_poll_watcher) return
     // anyhow::Result<()>, not (); the handle type has to match whichever the
     // `match` below spawns, and it's the same for either arm.
@@ -779,6 +789,41 @@ async fn control_loop(
                     }
                     Err(e) => bus::log(&state.bus, "error", format!("copymint prepare failed: {e:#}")),
                 }
+            }
+
+            ControlMsg::SetTarget { nft_contract, mint_calldata: new_calldata, mint_value: new_value } => {
+                // Same cleanup discipline Disarm already has (step 3b) —
+                // a target swap must not leave an in-flight prepared fire
+                // or re-prepare loop signed for the OLD nft_contract's
+                // calldata sitting around to be broadcast by mistake.
+                if let Some(h) = watcher_handle.take() {
+                    h.abort();
+                }
+                if let Some(h) = prepare_timer_handle.take() {
+                    h.abort();
+                }
+                if let Some(h) = reprepare_handle.take() {
+                    h.abort();
+                }
+                prepared_fire = None;
+                warmed_providers.clear();
+                let was_armed = state.armed.swap(false, Ordering::Relaxed);
+                if was_armed {
+                    let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
+                }
+
+                admin_watch_target = nft_contract;
+                mint_calldata = new_calldata;
+                mint_value = new_value;
+
+                bus::log(
+                    &state.bus,
+                    "info",
+                    format!(
+                        "active target set to {nft_contract:#x}{}",
+                        if was_armed { " — disarmed (re-arm to watch the new target)" } else { "" }
+                    ),
+                );
             }
         }
     }

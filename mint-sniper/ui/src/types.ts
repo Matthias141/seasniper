@@ -5,6 +5,7 @@ export interface WalletCfg {
 export interface Config {
   ws_rpc_url: string;
   http_rpc_urls: string[];
+  mint_mode: 'custom' | 'seadrop';
   contract_address: string;
   mint_fn_signature: string;
   mint_fn_args_template: string[];
@@ -12,6 +13,13 @@ export interface Config {
   trigger_mode: 'poll_state' | 'timestamp' | 'mempool_watch';
   trigger_timestamp_unix: number;
   mint_enable_admin: string;
+  seadrop_address: string;
+  // The bot's active seadrop target — see StatusBar's TGT pill and
+  // TargetResolver.tsx (step 8b). Editable directly here too (existing
+  // behavior), or swapped via the resolver's verify-then-confirm flow.
+  nft_contract: string;
+  fee_recipient: string;
+  quantity_per_wallet: number;
   priority_fee_multiplier: number;
   max_priority_fee_gwei_cap: number;
   gas_limit_headroom_pct: number;
@@ -25,6 +33,9 @@ export interface Config {
   copymint_auto_fire_free: boolean;
   copymint_auto_fire_paid: boolean;
   max_copymint_price_wei: number;
+
+  // --- target resolution (step 8b/8c) ---
+  opensea_api_key_env: string;
 }
 
 export interface WalletStatus {
@@ -37,6 +48,31 @@ export interface WalletStatus {
 export interface StatusResponse {
   armed: boolean;
   wallets: WalletStatus[];
+}
+
+export interface OfficialLinks {
+  twitter_username: string | null;
+  discord_url: string | null;
+  instagram_username: string | null;
+  telegram_url: string | null;
+  project_url: string | null;
+}
+
+export interface ResolvedTarget {
+  nft_contract: string;
+  name: string | null;
+  links: OfficialLinks;
+  mint_price_wei: string;
+  total_value_wei: string;
+  quantity_per_wallet: number;
+  start_time: number;
+  end_time: number;
+  max_per_wallet: number;
+  restrict_fee_recipients: boolean;
+  fee_recipient: string;
+  fee_recipient_ok: boolean;
+  is_live: boolean;
+  settable: boolean;
 }
 
 export type ServerEvent =

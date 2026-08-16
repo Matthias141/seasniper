@@ -99,6 +99,20 @@ pub struct Config {
     /// support.
     #[serde(default)]
     pub max_copymint_price_wei: u64,
+
+    /// --- target resolution (step 8b/8c) ---
+    /// Env var NAME holding an OpenSea API key — same pattern as
+    /// `WalletCfg::private_key_env`: the value round-trips to the UI (it's
+    /// just a name), the actual key never does. Needed for resolving an
+    /// OpenSea collection URL/slug (8b) or running a name search (8c);
+    /// NOT needed for a plain contract address, which needs zero external
+    /// calls at all. Empty by default. See opensea.rs's doc comment for
+    /// the two ways to obtain a key as of this writing: an instant
+    /// self-serve key (expires in 7 days — needs periodic rotation, not
+    /// a set-once credential) or the traditional application-form key
+    /// (no documented turnaround).
+    #[serde(default)]
+    pub opensea_api_key_env: String,
 }
 
 fn default_mint_mode() -> String {
@@ -194,6 +208,19 @@ impl Config {
             })
             .collect()
     }
+
+    /// Resolves the OpenSea API key from `opensea_api_key_env`, if
+    /// configured. `None` (not an error) when unset or the env var it
+    /// names isn't set — unlike wallet keys, missing this isn't fatal to
+    /// the whole bot, it just means OpenSea URL/slug resolution and name
+    /// search are unavailable until it's configured (a raw contract
+    /// address still works with zero external calls either way).
+    pub fn resolve_opensea_api_key(&self) -> Option<String> {
+        if self.opensea_api_key_env.is_empty() {
+            return None;
+        }
+        env::var(&self.opensea_api_key_env).ok()
+    }
 }
 
 #[cfg(test)]
@@ -231,6 +258,7 @@ mod tests {
             copymint_auto_fire_free: default_copymint_auto_fire_free(),
             copymint_auto_fire_paid: false,
             max_copymint_price_wei: 0,
+            opensea_api_key_env: String::new(),
         }
     }
 
