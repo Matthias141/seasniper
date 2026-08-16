@@ -58,11 +58,11 @@ pub enum ControlMsg {
     /// the SeaDrop singleton address itself (`contract` in
     /// control_loop's scope) does not change on a target swap.
     ///
-    /// SECURITY NOTE for step 10 (identity, in progress as of this
-    /// writing): this changes where money goes on the next fire, the
-    /// same sensitivity class as Arm/FireNow. Not step-up-auth-gated yet
-    /// because step 10 isn't merged — this is a known TODO, not an
-    /// oversight; see the route's own doc comment in api.rs.
+    /// SECURITY NOTE: this changes where money goes on the next fire, the
+    /// same sensitivity class as Arm/FireNow. Step-up-auth-gated as of
+    /// step 10f — the TODO this comment used to point at is resolved; see
+    /// `post_target_set`'s own doc comment in api.rs, which calls
+    /// `require_step_up` before anything else in the handler.
     SetTarget {
         nft_contract: Address,
         mint_calldata: Vec<u8>,

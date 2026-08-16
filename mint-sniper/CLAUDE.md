@@ -790,6 +790,26 @@ for every new secret-bearing file this step introduced.
   already-`admin_tier` session, not a substitute for the login chain
   itself.
 
+**10j / wrap-up.** A final pass over step 10 as a whole (not just 10i's
+narrower secrets/cookies/gitignore scope) looking for anything left
+inconsistent across the sub-steps — found one: `state.rs`'s doc comment
+on `ControlMsg::SetTarget` still said `/api/target/set` was "not
+step-up-auth-gated yet... because step 10 isn't merged," a leftover
+from when that comment was written (step 8b) predicting 10f. 10f had
+already fixed the actual gap — `post_target_set` in api.rs calls
+`require_step_up` first thing, and api.rs's own comment already says
+so correctly — but the state.rs side was never updated to match, so it
+sat there actively misleading (falsely implying an unfixed security
+gap) for as long as 10f-10i took to land. Checked every other route
+this codebase treats as money-adjacent (`/api/arm`, `/api/trigger`,
+`/api/copymint/fire`, `PUT /api/config`, `/api/target/set`) against
+`require_step_up`'s actual call sites, not against their comments —
+all five call it. No other stale TODO/FIXME exists anywhere in `src/`
+or `ui/src/` as of this pass (`grep -rn "TODO\|FIXME\|XXX"` — the two
+remaining hits are the now-accurate api.rs/state.rs comments
+themselves, cross-referencing each other). Step 10 (10a-10j) is
+complete.
+
 ## Before touching a real mint
 
 1. Confirm the target contract's `mint()` isn't merkle-allowlist gated —
