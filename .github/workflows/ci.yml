@@ -46,10 +46,16 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          # rustsec/audit-check runs cargo-audit against the whole repo by
-          # default (it doesn't take a working-directory input); the
-          # Cargo.lock it needs lives under mint-sniper/, which is fine
-          # since it walks the tree to find it.
+          # `uses:` steps do NOT inherit this job's `defaults.run.working-
+          # directory: mint-sniper` — that only applies to `run:` steps.
+          # Confirmed live (see the failed CI run this comment replaces):
+          # the action ran from the checkout root and failed with
+          # "Couldn't load ./Cargo.lock" since the real file is at
+          # mint-sniper/Cargo.lock. rustsec/audit-check's own `action.yml`
+          # (checked directly, not assumed) exposes `working-directory`
+          # for exactly this — "The directory of the Cargo.toml /
+          # Cargo.lock files to scan," defaulting to `.`.
+          working-directory: mint-sniper
 
   ui:
     name: UI (typecheck, build, audit)
