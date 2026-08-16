@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+# Secret scanning needs full history to catch anything committed and later
+# "removed" but still present in an earlier commit, not just the working
+# tree — see the secrets job below.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (build, test, clippy, audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mint-sniper
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mint-sniper
+
+      - name: cargo build
+        run: cargo build --all-targets
+
+      - name: cargo test
+        run: cargo test
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # rustsec/audit-check runs cargo-audit against the whole repo by
+          # default (it doesn't take a working-directory input); the
+          # Cargo.lock it needs lives under mint-sniper/, which is fine
+          # since it walks the tree to find it.
+
+  ui:
+    name: UI (typecheck, build, audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: mint-sniper/ui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mint-sniper/ui/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: npm run typecheck
+        run: npm run typecheck
+
+      - name: npm run build
+        run: npm run build
+
+      - name: npm audit
+        # --omit=dev: audits only what ships in ui/dist. Explicit, checked
+        # decision, not a blanket weakening — as of this workflow's authoring
+        # there is exactly one advisory in the full (dev+prod) tree: esbuild
+        # <=0.24.2 / GHSA-67mh-4wv8-2f99, "esbuild enables any website to
+        # send any requests to the development server and read the
+        # response." It's a `vite`/`vite-plugin-pwa` transitive devDependency,
+        # only reachable by something that can already reach your machine's
+        # `npm run dev` process — it ships in nothing this job builds. The
+        # only available fix is vite 8 (breaking, unverified against this
+        # project). Revisit --omit=dev (or bump to vite 8 and drop it) next
+        # time dependencies are touched. Fails on any moderate-or-higher
+        # advisory in production dependencies — those DO ship, so there's no
+        # equivalent excuse to soften that half of the check.
+        run: npm audit --omit=dev --audit-level=moderate
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history, not just the pushed diff — a secret committed and
+          # then "removed" in a later commit is still sitting in history and
+          # still just as compromised. This is the single highest-value
+          # check in this whole workflow given this project's own CLAUDE.md
+          # security rules exist because exactly that happened once already
+          # in a sibling project (see AbiaEats' CLAUDE.md) — don't skip this
+          # even though 7a already did a one-time manual pass.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

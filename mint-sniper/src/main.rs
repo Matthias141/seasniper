@@ -337,6 +337,10 @@ const POLL_STATE_REPREPARE_INTERVAL_SECS: u64 = 30;
 /// for the same single-writer reason as firing itself. `Prepare` is a
 /// `ControlMsg` for that reason too — it's never sent from api.rs, only
 /// self-sent the same way auto-fire already self-sends `FireNow`.
+// Called exactly once, from main(), with startup-computed values each
+// used throughout the function body — a wrapper struct here would be
+// indirection without real clarity benefit for a single call site.
+#[allow(clippy::too_many_arguments)]
 async fn control_loop(
     state: SharedState,
     mut control_rx: mpsc::Receiver<ControlMsg>,
