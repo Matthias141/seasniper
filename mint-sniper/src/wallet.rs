@@ -21,7 +21,7 @@ pub async fn load_wallets(
     private_keys: &[String],
     http_rpc_url: &str,
 ) -> Result<Vec<ManagedWallet>> {
-    let provider = ProviderBuilder::new().on_http(http_rpc_url.parse()?);
+    let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_rpc_url.parse()?);
 
     let mut wallets = Vec::with_capacity(private_keys.len());
     for pk in private_keys {

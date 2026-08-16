@@ -2,9 +2,9 @@ use crate::bus::{self, EventBus, ServerEvent};
 use crate::config::Config;
 use crate::wallet::{wallet_to_eth_wallet, ManagedWallet};
 use alloy::eips::eip2718::Encodable2718;
-use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::network::{EthereumWallet, NetworkTransactionBuilder};
 use alloy::primitives::{Address, TxHash, U256};
-use alloy::providers::{Provider, ProviderBuilder, ReqwestProvider};
+use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -19,7 +19,7 @@ use tracing::{error, info};
 /// broadcast, which is what this file did before, throws away the warmed
 /// TCP/TLS connection and pays for a new handshake at exactly the moment
 /// that handshake is most expensive.
-pub type HttpProvider = ReqwestProvider;
+pub type HttpProvider = RootProvider;
 
 /// One wallet's transaction, signed and serialized ahead of the trigger.
 /// `fire_prepared` does nothing with this but write `raw_tx` to a socket —
@@ -59,7 +59,7 @@ pub async fn warm_connections(cfg: &Config, bus: &EventBus) -> Vec<HttpProvider>
                 continue;
             }
         };
-        let provider = ProviderBuilder::new().on_http(parsed);
+        let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(parsed);
 
         match provider.get_block_number().await {
             Ok(_) => bus::log(bus, "info", format!("connection warmed: {url}")),
@@ -130,7 +130,7 @@ pub async fn prepare_fire(
         probe_tx = probe_tx.from(from);
     }
     let estimated_gas = reader
-        .estimate_gas(&probe_tx)
+        .estimate_gas(probe_tx)
         .await
         .context("estimating gas")?;
     let gas_limit = estimated_gas + (estimated_gas * cfg.gas_limit_headroom_pct) / 100;

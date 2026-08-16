@@ -51,7 +51,7 @@ pub async fn fetch_public_drop(
     seadrop: Address,
     nft_contract: Address,
 ) -> Result<PublicDropInfo> {
-    let provider = ProviderBuilder::new().on_http(http_rpc.parse()?);
+    let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_rpc.parse()?);
 
     let func = Function::parse(
         "getPublicDrop(address) returns (uint80,uint48,uint48,uint16,uint16,bool)",
@@ -62,12 +62,12 @@ pub async fn fetch_public_drop(
     let tx = TransactionRequest::default().to(seadrop).input(calldata.into());
 
     let raw = provider
-        .call(&tx)
+        .call(tx)
         .await
         .context("getPublicDrop call failed — check seadrop address and chain")?;
 
     let decoded = func
-        .abi_decode_output(&raw, true)
+        .abi_decode_output(&raw)
         .context("decoding PublicDrop struct")?;
 
     // Field order matches the struct declaration above, not storage-slot
@@ -118,7 +118,7 @@ pub async fn is_fee_recipient_allowed(
     nft_contract: Address,
     fee_recipient: Address,
 ) -> Result<bool> {
-    let provider = ProviderBuilder::new().on_http(http_rpc.parse()?);
+    let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_rpc.parse()?);
     let func = Function::parse("getFeeRecipientIsAllowed(address,address) returns (bool)")
         .context("parsing getFeeRecipientIsAllowed signature")?;
     let calldata = func.abi_encode_input(&[
@@ -126,8 +126,8 @@ pub async fn is_fee_recipient_allowed(
         DynSolValue::Address(fee_recipient),
     ])?;
     let tx = TransactionRequest::default().to(seadrop).input(calldata.into());
-    let raw = provider.call(&tx).await.context("getFeeRecipientIsAllowed call failed")?;
-    let decoded = func.abi_decode_output(&raw, true)?;
+    let raw = provider.call(tx).await.context("getFeeRecipientIsAllowed call failed")?;
+    let decoded = func.abi_decode_output(&raw)?;
     decoded[0].as_bool().context("decoding bool result")
 }
 

@@ -19,7 +19,8 @@ pub async fn run_state_poll_watcher(
 ) -> Result<()> {
     let ws = WsConnect::new(ws_url);
     let provider = ProviderBuilder::new()
-        .on_ws(ws)
+        .disable_recommended_fillers()
+        .connect_ws(ws)
         .await
         .context("poll_state: opening the WebSocket RPC connection")?;
 
@@ -36,7 +37,7 @@ pub async fn run_state_poll_watcher(
             .to(contract)
             .input(mint_state_selector.clone().into());
 
-        match provider.call(&call).await {
+        match provider.call(call).await {
             Ok(result) => {
                 // mintActive() -> bool ABI-encodes as a single 32-byte word,
                 // last byte 0x01 == true. Adjust decoding if the view fn
@@ -103,7 +104,8 @@ pub async fn run_mempool_watcher(
 ) -> Result<()> {
     let ws = WsConnect::new(ws_url);
     let provider = ProviderBuilder::new()
-        .on_ws(ws)
+        .disable_recommended_fillers()
+        .connect_ws(ws)
         .await
         .context("mempool_watch: opening the WebSocket RPC connection")?;
 
@@ -122,7 +124,7 @@ pub async fn run_mempool_watcher(
 
     let mut stream = sub.into_stream();
     while let Some(tx) = stream.next().await {
-        if tx.from == admin && tx.to() == Some(watch_target) {
+        if tx.inner.signer() == admin && tx.to() == Some(watch_target) {
             let tx_hash = *tx.inner.tx_hash();
             info!(%tx_hash, "TRIGGER: admin tx seen pending (unconfirmed)");
             bus::log(

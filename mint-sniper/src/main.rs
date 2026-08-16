@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
 }
 
 async fn balance_poll_loop(state: SharedState, http_url: String, addrs: Vec<Address>) {
-    let provider = ProviderBuilder::new().on_http(http_url.parse().unwrap());
+    let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_url.parse().unwrap());
     loop {
         for addr in &addrs {
             if let Ok(balance) = provider.get_balance(*addr).await {
@@ -256,7 +256,7 @@ async fn rpc_health_poll_loop(state: SharedState, http_rpc_urls: Vec<String>) {
     let providers: Vec<(String, executor::HttpProvider)> = http_rpc_urls
         .into_iter()
         .filter_map(|url| match url.parse() {
-            Ok(parsed) => Some((url, ProviderBuilder::new().on_http(parsed))),
+            Ok(parsed) => Some((url, ProviderBuilder::new().disable_recommended_fillers().connect_http(parsed))),
             Err(e) => {
                 // A malformed URL in config is a config error, not an RPC
                 // health event — nothing to ping, so nothing to report.
