@@ -734,3 +734,28 @@ What's actually out of scope:
 - UI: keep the token system in `ui/src/styles/tokens.css` as the single
   source of color/type/spacing truth. Don't hardcode hex values or px
   sizes in component CSS modules.
+- **After every push, confirm the real GitHub Actions run went green
+  before reporting any step done — local build/test/clippy passing is
+  necessary but has been proven NOT sufficient on its own.** Incident:
+  a step 9g commit broke `.github/workflows/ci.yml`'s YAML syntax (an
+  edit deleted a `with:` block's only real key while expanding the
+  comment above it, leaving `with:` mapped to nothing — invalid per
+  GitHub's schema). That failure happens at workflow-parse time, before
+  any job ever dispatches, so every run from 9g through 10h (13
+  consecutive runs, CI 13-25) showed 0 jobs total — yet every one of
+  those sub-steps was reported "done, clippy/build/test clean, pushed"
+  without anyone actually opening the run and checking. On top of that,
+  local verification throughout 10b-10h ran plain `cargo clippy
+  --all-targets`, not CI's actual `cargo clippy --all-targets -- -D
+  warnings` — a real dead_code warning (session.rs's `Session` struct)
+  that had been logged as an acceptable pending warning was in fact a
+  hard compile error under CI's real flags, and would have failed the
+  rust job independently of the YAML bug. **The fix, going forward:**
+  after any push, use the GitHub MCP Actions tools (or the equivalent
+  API) to fetch the resulting run and its per-job status, wait for
+  `status: completed`, and read every job's `conclusion` individually —
+  not just the top-level run conclusion, and not "no news is good
+  news." Don't reuse local verification commands that differ from CI's
+  actual invocation (flags, working directory, etc.) as a stand-in for
+  checking CI itself. A step is not done until this has actually been
+  observed once, this session, against a real run.
