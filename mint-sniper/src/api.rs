@@ -76,6 +76,16 @@ async fn put_config(
     State(state): State<SharedState>,
     Json(new_cfg): Json<Config>,
 ) -> impl IntoResponse {
+    // Reject before touching in-memory state or disk — a bad PUT should
+    // fail cleanly with a reason, not silently overwrite a working config
+    // with something that'll only surface as a confusing failure at
+    // arm/fire time. See Config::validate's doc comment for exactly what
+    // is and isn't checked.
+    if let Err(e) = new_cfg.validate() {
+        bus::log(&state.bus, "error", format!("rejected config update: {e:#}"));
+        return (StatusCode::BAD_REQUEST, format!("invalid config: {e:#}")).into_response();
+    }
+
     {
         let mut cfg = state.config.write().await;
         *cfg = new_cfg.clone();
