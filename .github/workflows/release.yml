@@ -1,0 +1,80 @@
+name: Release
+
+# Tag push only — pushing a `v*` tag is a deliberate, one-time act, unlike
+# every ordinary commit that ci.yml already covers. Keeps this workflow's
+# blast radius obvious: nothing here runs unless someone explicitly cuts a
+# release.
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build release artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to attach artifacts to the GitHub Release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Reproducibility means building from exactly what the tag points
+          # at — a clean checkout of that ref, not whatever happens to be
+          # lying around from a previous job. actions/checkout does this by
+          # default; stated explicitly because it's the entire point of
+          # this workflow existing separately from ci.yml.
+          ref: ${{ github.ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: mint-sniper
+
+      - name: Build release binary
+        working-directory: mint-sniper
+        run: cargo build --release
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mint-sniper/ui/package-lock.json
+
+      - name: Build UI
+        working-directory: mint-sniper/ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package release archive
+        # One archive, binary + ui/dist together — this is how the app
+        # actually runs (see ui/README.md: one process serves both the API
+        # and the built PWA via ServeDir). Shipping them separately would
+        # invite someone to run a stale UI against a new binary or vice
+        # versa.
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          STAGE="mint-sniper-${VERSION}-x86_64-linux"
+          mkdir -p "$STAGE"
+          cp mint-sniper/target/release/mint-sniper "$STAGE/"
+          cp mint-sniper/config.example.toml "$STAGE/"
+          cp mint-sniper/README.md "$STAGE/"
+          cp mint-sniper/RUNBOOK.md "$STAGE/" 2>/dev/null || true
+          cp -r mint-sniper/ui/dist "$STAGE/ui-dist"
+          tar czf "${STAGE}.tar.gz" "$STAGE"
+          echo "ARCHIVE=${STAGE}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ARCHIVE }}
+          # No deployment step beyond this — per the task, this workflow's
+          # job ends at "artifacts attached to a release," nothing installs
+          # or runs them anywhere.
+          generate_release_notes: true
+          draft: false
