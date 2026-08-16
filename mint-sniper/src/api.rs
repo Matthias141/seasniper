@@ -58,7 +58,18 @@ const FLOW_COOKIE: &str = "sniper_oidc_flow";
 /// shape of unauthenticated local API. The token is the actual defense
 /// (it also stops non-browser local callers, which CORS never could);
 /// the allow-list narrows the browser-JS attack surface on top of that.
-pub fn router(state: SharedState) -> Router {
+/// `google_oauth_redirect_url` (empty if identity isn't configured) is
+/// passed in explicitly, not read from `state.config` here, because CORS
+/// origins are decided once at boot — same "decided once, not re-derived
+/// per request" shape as `auth::require_token_or_session`'s own mode
+/// choice. When set, its origin (scheme+host+port — see
+/// `identity::webauthn::derive_origin`, the same parse WebAuthn's
+/// rp_origin uses, so this can never drift from it) is added as a fourth
+/// explicit CORS origin alongside the three step 7b ones below — step
+/// 10.5b's Cloudflare Tunnel hostname, added here rather than as a
+/// separate config field so there remains exactly ONE place this
+/// codebase decides "this is our public origin."
+pub fn router(state: SharedState, google_oauth_redirect_url: &str) -> Router {
     let protected = Router::new()
         .route("/api/config", get(get_config).put(put_config))
         .route("/api/status", get(get_status))
@@ -99,11 +110,26 @@ pub fn router(state: SharedState) -> Router {
     let prod_origin_a = HeaderValue::from_static("http://127.0.0.1:4117");
     let prod_origin_b = HeaderValue::from_static("http://localhost:4117");
 
+    let mut allowed_origins = vec![dev_origin, prod_origin_a, prod_origin_b];
+    if !google_oauth_redirect_url.is_empty() {
+        // Errors here mean `Config::validate` didn't run or didn't catch
+        // a bad URL — fail loudly at boot rather than silently serving
+        // with a narrower-than-intended CORS allow-list (the same
+        // "broken config should fail startup, not degrade quietly"
+        // stance main.rs already takes for Google Sign-In/WebAuthn init).
+        let origin = crate::identity::webauthn::derive_origin(google_oauth_redirect_url)
+            .expect("google_oauth_redirect_url must already be a valid URL by the time router() is called — Config::validate should have caught this");
+        allowed_origins.push(
+            HeaderValue::from_str(origin.as_str().trim_end_matches('/'))
+                .expect("a parsed URL's origin string is always a valid header value"),
+        );
+    }
+
     protected
         .merge(public)
         .layer(
             CorsLayer::new()
-                .allow_origin([dev_origin, prod_origin_a, prod_origin_b])
+                .allow_origin(allowed_origins)
                 .allow_methods([Method::GET, Method::POST, Method::PUT])
                 .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]),
         )
@@ -1133,5 +1159,110 @@ mod step_up_tests {
         let mut headers = session_cookie_header(&state, &session_id);
         headers.insert("x-step-up-totp", next_code.parse().unwrap());
         assert!(require_step_up(&state, &headers).await.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    //! Step 10.5b: the Cloudflare Tunnel hostname is added to the CORS
+    //! allow-list by deriving it from `google_oauth_redirect_url`, the
+    //! same value WebAuthn's rp_origin already uses (see
+    //! `identity::webauthn::derive_origin`'s doc comment). Real assertions
+    //! against real HTTP responses through the actual `router()` —
+    //! not just "the code that builds the layer compiles" — same bar
+    //! the rest of this codebase holds CORS/auth to.
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn minimal_state(google_oauth_redirect_url: &str) -> (SharedState, String) {
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::{mpsc, RwLock};
+        let mut cfg = crate::config::test_config();
+        cfg.google_oauth_redirect_url = google_oauth_redirect_url.to_string();
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("id.db");
+        Box::leak(Box::new(dir));
+        let state = std::sync::Arc::new(crate::state::AppState {
+            config: RwLock::new(cfg),
+            wallet_status: RwLock::new(Vec::new()),
+            armed: AtomicBool::new(false),
+            bus: bus::new_bus(),
+            control_tx,
+            config_path: "unused-in-this-test".to_string(),
+            api_token: "test-token".to_string(),
+            http_client: reqwest::Client::new(),
+            identity_db: futures::executor::block_on(crate::db::open(db_path.to_str().unwrap())).unwrap(),
+            identity_cookie_key: axum_extra::extract::cookie::Key::generate(),
+            identity_totp_cipher: {
+                use aes_gcm::{Aes256Gcm, KeyInit};
+                Aes256Gcm::new_from_slice(&[0u8; 32]).unwrap()
+            },
+            google_oidc: None,
+            webauthn: None,
+        });
+        (state, google_oauth_redirect_url.to_string())
+    }
+
+    async fn cors_response_for(state: SharedState, redirect_url: &str, request_origin: &str) -> Option<String> {
+        let app = router(state, redirect_url);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/token")
+                    .header("Origin", request_origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn public_hostname_is_echoed_back_when_configured() {
+        let redirect_url = "https://sniper.example.com/auth/google/callback";
+        let (state, _) = minimal_state(redirect_url);
+        let allowed = cors_response_for(state, redirect_url, "https://sniper.example.com").await;
+        assert_eq!(
+            allowed.as_deref(),
+            Some("https://sniper.example.com"),
+            "an Origin matching the derived public hostname must be echoed back, no path/query included"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_origin_is_rejected_even_with_public_hostname_configured() {
+        let redirect_url = "https://sniper.example.com/auth/google/callback";
+        let (state, _) = minimal_state(redirect_url);
+        let allowed = cors_response_for(state, redirect_url, "https://attacker.example").await;
+        assert_eq!(allowed, None, "configuring one public origin must not turn CORS into an allow-any policy");
+    }
+
+    #[tokio::test]
+    async fn no_public_hostname_configured_leaves_only_the_three_step_7b_origins() {
+        let (state, _) = minimal_state("");
+        let allowed = cors_response_for(state, "", "https://sniper.example.com").await;
+        assert_eq!(
+            allowed, None,
+            "an unconfigured google_oauth_redirect_url must not silently allow an arbitrary origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_dev_origin_still_works_alongside_a_configured_public_hostname() {
+        let redirect_url = "https://sniper.example.com/auth/google/callback";
+        let (state, _) = minimal_state(redirect_url);
+        let allowed = cors_response_for(state, redirect_url, "http://localhost:5173").await;
+        assert_eq!(
+            allowed.as_deref(),
+            Some("http://localhost:5173"),
+            "adding the public hostname must not have replaced or crowded out the existing step 7b origins"
+        );
     }
 }

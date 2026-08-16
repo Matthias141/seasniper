@@ -810,6 +810,65 @@ remaining hits are the now-accurate api.rs/state.rs comments
 themselves, cross-referencing each other). Step 10 (10a-10j) is
 complete.
 
+## Cloudflare Tunnel + Access (step 10.5)
+
+Adds phone reachability with no app install (vs. Tailscale, which needs
+the Tailscale app on the phone) — an OUTER layer in front of step 10's
+own auth, not a replacement for it. Full setup and the precise
+"what Access does/doesn't protect against" boundary live in
+`ui/README.md`'s "Reaching this from your phone" section;
+`RUNBOOK.md` §6 covers a compromised Access policy. Summary here.
+
+**10.5a — one canonical origin, not two.** Considered treating Tailscale
+and Cloudflare as separate live origins (separate passkey registrations
+per origin), rejected: `trg_webauthn_admin_cap` caps at 2 admin-tier
+WebAuthn credentials **per user**, with no per-origin dimension in the
+schema at all — a single laptop registering against two origins alone
+would burn both slots, leaving zero room for a phone. Chose instead:
+`Config::google_oauth_redirect_url`'s host is the ONE origin for
+everything — Google's OAuth redirect target, the Cloudflare Tunnel's
+public hostname, AND WebAuthn's rp_origin, all derived from the same
+value (see `identity::webauthn::derive_origin`, extracted specifically
+so CORS and WebAuthn can never independently drift on what "our origin"
+means — used by both `WebauthnState::new` and `api::router`'s CORS
+allow-list). Switching from a Tailscale hostname to a public Cloudflare
+one is a real cutover, not an additive change: every existing passkey
+is origin-bound and stops validating the moment the origin changes —
+budget for re-registering devices right after, not mid-incident.
+
+**10.5b — the bind address does not change.** `API_BIND_ADDR` in
+main.rs stays `127.0.0.1:4117`; `cloudflared` runs as a local client
+that reaches IN to that address over an outbound connection to
+Cloudflare's edge, same shape as step 7b's original bind-to-localhost
+reasoning — a token/session model narrows who can act once a request
+arrives, it was never a substitute for not exposing the port directly,
+and that's still true here. `api::router` now takes
+`google_oauth_redirect_url` as an explicit parameter (rather than
+reading `state.config` internally) because CORS origins are a
+decided-once-at-boot property, same shape as `auth::require_token_or_
+session`'s own mode choice — see the function's doc comment. Covered by
+real request-level tests (`api.rs`'s `cors_tests` module) asserting the
+actual `access-control-allow-origin` response header, not just that the
+code compiles: the configured origin is echoed back, an unrelated
+origin is rejected even with one configured, an unconfigured
+`google_oauth_redirect_url` doesn't silently allow anything, and the
+existing step 7b dev/prod origins keep working unchanged alongside it.
+
+**10.5c — Access reuses step 10c's Google OAuth setup for its own login
+gate** (rather than email-OTP as a second, independent identity system
+to keep in sync) and is scoped to an Access **group**, not a flat email
+list, so step 11 can add operators to it at invite time without
+touching the Access policy itself. Stated precisely, because this is
+easy to overstate: Access blocks unauthenticated traffic at Cloudflare's
+edge (real attack-surface reduction — none of that traffic reaches this
+process at all) but has no knowledge of `admin_tier`/step-up state;
+passing Access gets you exactly as far as step 10's own login wall, not
+one step further. **A compromised or over-broad Access policy is a
+reduced-attack-surface incident, not automatically an
+arm/fire-capable-attacker incident** — RUNBOOK.md §6's first move is
+always to cross-check step 10's own audit trail/`sessions` table before
+assuming the worst.
+
 ## Before touching a real mint
 
 1. Confirm the target contract's `mint()` isn't merkle-allowlist gated —

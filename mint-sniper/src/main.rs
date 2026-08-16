@@ -287,7 +287,11 @@ async fn main() -> Result<()> {
     info!(addr = API_BIND_ADDR, "control API listening");
     bus::log(&event_bus, "info", format!("control API listening on {API_BIND_ADDR}"));
 
-    axum::serve(listener, api::router(app_state)).await?;
+    // 127.0.0.1 above is unchanged by step 10.5 — a Cloudflare Tunnel
+    // (cloudflared) reaches IN to this bind address as a local client, it
+    // is not a reason to widen the bind itself. See ui/README.md's
+    // Cloudflare Tunnel + Access section.
+    axum::serve(listener, api::router(app_state, &cfg.google_oauth_redirect_url)).await?;
     Ok(())
 }
 

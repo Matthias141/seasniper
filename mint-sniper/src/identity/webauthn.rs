@@ -39,24 +39,39 @@ pub struct WebauthnState {
     pending_authentications: RwLock<HashMap<String, PasskeyAuthentication>>,
 }
 
+/// Derives the scheme+host+port origin (no path/query/fragment) from
+/// `Config::google_oauth_redirect_url`. Shared by `WebauthnState::new`
+/// (rp_origin) and `api::router`'s CORS allow-list (step 10.5b) so there
+/// is exactly ONE place this codebase parses "our origin" out of that
+/// config value — see this module's doc comment for why a second,
+/// independently-drifting parse of the same URL would be worse than
+/// reusing this one.
+pub fn derive_origin(redirect_url: &str) -> Result<url::Url> {
+    let parsed = url::Url::parse(redirect_url).context("parsing google_oauth_redirect_url as an origin")?;
+    parsed
+        .host_str()
+        .context("google_oauth_redirect_url has no host — cannot derive an origin from it")?;
+    // scheme+host+port with no path — matches WebauthnBuilder's own
+    // requirement for rp_origin, and is exactly what a CORS Origin header
+    // looks like too (browsers never send path/query/fragment in it).
+    let mut origin = parsed.clone();
+    origin.set_path("");
+    origin.set_query(None);
+    origin.set_fragment(None);
+    Ok(origin)
+}
+
 impl WebauthnState {
     /// `redirect_url` is `Config::google_oauth_redirect_url` — see this
     /// module's doc comment for why. Fails loudly if that URL is missing
     /// a host (can't happen if `Config::validate` already ran, but this
     /// function doesn't assume that).
     pub fn new(redirect_url: &str, rp_name: &str) -> Result<Self> {
-        let parsed = url::Url::parse(redirect_url).context("parsing google_oauth_redirect_url as WebAuthn rp_origin")?;
-        let rp_id = parsed
+        let origin = derive_origin(redirect_url)?;
+        let rp_id = origin
             .host_str()
             .context("google_oauth_redirect_url has no host — cannot derive a WebAuthn rp_id from it")?
             .to_string();
-        // rp_origin must be scheme+host+port with no path — WebauthnBuilder
-        // rejects anything else. Build it fresh from the parsed components
-        // rather than trying to string-trim the original URL.
-        let mut origin = parsed.clone();
-        origin.set_path("");
-        origin.set_query(None);
-        origin.set_fragment(None);
 
         let webauthn = WebauthnBuilder::new(&rp_id, &origin)
             .context("building WebauthnBuilder")?

@@ -271,3 +271,67 @@ is.
    merely lost/wiped by you, also work through Section 1 (suspected
    private key compromise) and Section 4 (API token compromised) above,
    since a stolen laptop/phone may carry more than just a passkey.
+
+---
+
+## 6. Cloudflare Access policy compromised (step 10.5c)
+
+Trigger: the Access application's allow-list was misconfigured (too
+broad an email/group), a team member's Google account on the allow-list
+was itself compromised, or you simply need to revoke public reachability
+entirely — e.g. before extended travel, or the moment you notice
+unexpected activity in Cloudflare's Access audit log.
+
+**Read this first — what Access actually gates.** Per `ui/README.md`'s
+10.5c section: Access blocks unauthenticated traffic at Cloudflare's
+edge, before it ever reaches this machine. It is NOT step 10's
+authorization boundary — someone who passes a compromised/over-broad
+Access policy still hits Google Sign-In + TOTP + WebAuthn + step-up auth
+exactly as before. **This means a compromised Access policy is a
+reduced-attack-surface incident, not an "attacker can arm/fire" incident
+by itself** — check step 10's own audit trail (below) before assuming
+the worst, but still treat it seriously: it's the layer that was
+supposed to keep credential-stuffing/scanning traffic away from this
+process at all, and an attacker who gets THROUGH Access still gets to
+try their luck against step 10's real auth, which they otherwise
+wouldn't have been able to reach.
+
+1. **Immediately tighten or disable the Access application** — Cloudflare
+   dashboard → Zero Trust → Access → Applications → the tunnel's
+   application → either edit the policy down to just your own account,
+   or toggle the application off entirely. This takes effect immediately
+   at Cloudflare's edge; no restart of this bot is needed.
+2. **Check Cloudflare's Access audit log** (Zero Trust → Logs → Access)
+   for who actually authenticated through the compromised policy and
+   when — this tells you whether anyone besides you got past Access at
+   all, which scopes how seriously to treat the rest of this list.
+3. **Cross-reference against step 10's own record of what happened past
+   Access**, since Access's log only proves someone reached the login
+   wall, not what they did after: check `audit.log` (step 7g,
+   DB-attribution pending step 11e) for any arm/fire/config-change/
+   target-set event in the same window Access's log flagged, and check
+   `identity.db`'s `sessions` table for any session created in that
+   window you don't recognize
+   (`SELECT * FROM sessions WHERE created_at > <window_start>;`).
+4. **If step 3 shows a session or action you don't recognize**, this
+   escalates to a real step 10 identity incident, not just an Access
+   misconfiguration — work through Section 5 above (clearing WebAuthn/
+   TOTP) for the affected user, and Section 1/4 if wallet-adjacent
+   actions are involved.
+5. **If step 3 comes back clean** (Access was reachable by more people
+   than intended, but nobody who reached it got past step 10's own
+   login), fixing the Access policy in step 1 is the complete remediation
+   — no identity.db changes needed, since step 10's own boundary held.
+6. **Rotate the underlying credential if the compromise was a Google
+   account on the allow-list being taken over** (not just a policy
+   configured too broadly) — remove that account from the Access
+   group/policy AND, if that account also has a step 10 `users` row,
+   treat it as Section 5's "lost device" hard case for that user, since
+   whoever controls their Google account can now also pass step 10c's
+   own Google Sign-In step.
+7. **Once step 11 lands**, re-scope the Access group down to exactly the
+   operators who still hold an active invite — an operator whose access
+   was revoked at the step 10/11 identity layer but left in the
+   Cloudflare Access group can still reach the login wall (harmless on
+   its own, per this section's opening note, but pointless exposure);
+   keep the two lists in sync as part of any operator offboarding.

@@ -128,14 +128,26 @@ pub struct Config {
     /// appear in config.toml or round-trip to the UI.
     #[serde(default)]
     pub google_oauth_client_secret_env: String,
-    /// Full callback URL Google redirects back to
-    /// (e.g. `https://<tailscale-magicdns-name>:4117/auth/google/callback`).
-    /// Must exactly match a Redirect URI registered on the OAuth client
-    /// in Google Cloud Console — Google rejects any mismatch. See
-    /// identity/oidc.rs's doc comment for why this can be a Tailscale
-    /// MagicDNS name without exposing anything to the public internet:
-    /// the OAuth server only needs the user's browser to be able to
-    /// reach it, not Google's own backend.
+    /// Full callback URL Google redirects back to. Must exactly match a
+    /// Redirect URI registered on the OAuth client in Google Cloud
+    /// Console — Google rejects any mismatch. This is also the ONE
+    /// canonical origin for this whole instance (WebAuthn's rp_origin
+    /// AND the CORS allow-list's public-hostname entry both derive from
+    /// it — see `identity::webauthn::derive_origin`'s doc comment) —
+    /// step 10.5a's explicit decision, made when Cloudflare Tunnel
+    /// access was added, against maintaining two separate live origins.
+    /// Two acceptable shapes, pick one:
+    /// - `https://<tailscale-magicdns-name>:4117/auth/google/callback` —
+    ///   Tailscale-only, nothing reachable off your tailnet. See
+    ///   identity/oidc.rs's doc comment for why this needs no public DNS:
+    ///   the OAuth server only needs the user's browser to reach it, not
+    ///   Google's own backend.
+    /// - `https://<your-domain>/auth/google/callback` — a real domain
+    ///   fronted by a Cloudflare Tunnel + Access (step 10.5b/c, see
+    ///   ui/README.md), for phone reachability with no app install.
+    ///   Switching to this from the Tailscale form invalidates every
+    ///   existing WebAuthn passkey (origin-bound; see 10.5a) — plan on
+    ///   re-registering devices right after the switch, not mid-incident.
     #[serde(default)]
     pub google_oauth_redirect_url: String,
 }
