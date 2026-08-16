@@ -284,14 +284,13 @@ impl Config {
     }
 }
 
+/// A minimal, otherwise-valid config — used by this module's own tests
+/// (mutated per-test to focus on one field at a time) and reused as-is
+/// by other modules' tests that need a real `Config` value without
+/// constructing one field-by-field (e.g. `api.rs`'s step-up-auth tests).
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // A minimal, otherwise-valid config to mutate per test — keeps each
-    // test focused on the one field it's actually checking.
-    fn valid_config() -> Config {
-        Config {
+pub(crate) fn test_config() -> Config {
+    Config {
             ws_rpc_url: "wss://eth-mainnet.g.alchemy.com/v2/KEY".to_string(),
             http_rpc_urls: vec!["https://eth-mainnet.g.alchemy.com/v2/KEY".to_string()],
             mint_mode: default_mint_mode(),
@@ -326,42 +325,46 @@ mod tests {
         }
     }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
     #[test]
     fn accepts_a_valid_config() {
-        assert!(valid_config().validate().is_ok());
+        assert!(test_config().validate().is_ok());
     }
 
     #[test]
     fn rejects_malformed_rpc_url() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.ws_rpc_url = "not a url at all".to_string();
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_malformed_http_rpc_url() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.http_rpc_urls = vec!["also not a url".to_string()];
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_empty_wallet_list() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.wallets = vec![];
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_negative_priority_fee_multiplier() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.priority_fee_multiplier = -1.0;
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn rejects_negative_max_priority_fee_cap() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.max_priority_fee_gwei_cap = -0.5;
         assert!(cfg.validate().is_err());
     }
@@ -370,7 +373,7 @@ mod tests {
     fn timestamp_mode_accepts_zero() {
         // 0 means "not configured yet" — distinct from an invalid/past
         // timestamp, and must not be rejected just for being unset.
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.trigger_mode = "timestamp".to_string();
         cfg.trigger_timestamp_unix = 0;
         assert!(cfg.validate().is_ok());
@@ -378,7 +381,7 @@ mod tests {
 
     #[test]
     fn timestamp_mode_accepts_plausible_future_time() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.trigger_mode = "timestamp".to_string();
         cfg.trigger_timestamp_unix = bus::now_ts() + 3600;
         assert!(cfg.validate().is_ok());
@@ -386,7 +389,7 @@ mod tests {
 
     #[test]
     fn timestamp_mode_rejects_past_time() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.trigger_mode = "timestamp".to_string();
         cfg.trigger_timestamp_unix = bus::now_ts().saturating_sub(3600);
         assert!(cfg.validate().is_err());
@@ -396,7 +399,7 @@ mod tests {
     fn timestamp_mode_rejects_implausibly_far_future_time() {
         // The classic ms-vs-seconds mistake: a millisecond timestamp
         // pasted into a seconds field lands ~1000x too far out.
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.trigger_mode = "timestamp".to_string();
         cfg.trigger_timestamp_unix = bus::now_ts() * 1000;
         assert!(cfg.validate().is_err());
@@ -441,12 +444,12 @@ mod tests {
 
     #[test]
     fn google_oauth_fields_all_empty_is_valid() {
-        assert!(valid_config().validate().is_ok());
+        assert!(test_config().validate().is_ok());
     }
 
     #[test]
     fn google_oauth_fields_all_set_is_valid() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.google_oauth_client_id = "abc.apps.googleusercontent.com".to_string();
         cfg.google_oauth_client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET".to_string();
         cfg.google_oauth_redirect_url = "https://sniper.tailnet-name.ts.net:4117/auth/google/callback".to_string();
@@ -455,7 +458,7 @@ mod tests {
 
     #[test]
     fn google_oauth_partial_config_is_rejected() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.google_oauth_client_id = "abc.apps.googleusercontent.com".to_string();
         // secret env and redirect url left empty — must be rejected, not
         // silently accepted and left to fail at login time.
@@ -464,7 +467,7 @@ mod tests {
 
     #[test]
     fn google_oauth_bad_redirect_url_is_rejected() {
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.google_oauth_client_id = "abc.apps.googleusercontent.com".to_string();
         cfg.google_oauth_client_secret_env = "GOOGLE_OAUTH_CLIENT_SECRET".to_string();
         cfg.google_oauth_redirect_url = "not a url".to_string();
@@ -476,7 +479,7 @@ mod tests {
         // trigger_timestamp_unix is only meaningful in timestamp mode —
         // poll_state/mempool_watch configs shouldn't be rejected over a
         // leftover or stale value in a field they don't use.
-        let mut cfg = valid_config();
+        let mut cfg = test_config();
         cfg.trigger_mode = "poll_state".to_string();
         cfg.trigger_timestamp_unix = 1; // long past, would fail if checked
         assert!(cfg.validate().is_ok());

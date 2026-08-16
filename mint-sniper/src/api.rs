@@ -124,8 +124,15 @@ async fn get_config(State(state): State<SharedState>) -> Json<Config> {
 
 async fn put_config(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(new_cfg): Json<Config>,
 ) -> impl IntoResponse {
+    // Step-up auth (10f) — config includes wallets/mint targets/trigger
+    // settings, the same sensitivity class as arming or firing directly.
+    if let Err((code, msg)) = require_step_up(&state, &headers).await {
+        return (code, msg).into_response();
+    }
+
     // Reject before touching in-memory state or disk — a bad PUT should
     // fail cleanly with a reason, not silently overwrite a working config
     // with something that'll only surface as a confusing failure at
@@ -164,20 +171,35 @@ async fn get_status(State(state): State<SharedState>) -> Json<serde_json::Value>
     }))
 }
 
-async fn post_arm(State(state): State<SharedState>) -> impl IntoResponse {
+async fn post_arm(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    // Step-up auth (10f) — arming starts a watcher that will auto-fire
+    // real money on trigger, the same sensitivity class as firing itself.
+    if let Err((code, msg)) = require_step_up(&state, &headers).await {
+        return (code, msg).into_response();
+    }
     let _ = state.control_tx.send(ControlMsg::Arm).await;
-    StatusCode::ACCEPTED
+    StatusCode::ACCEPTED.into_response()
 }
 
+// Deliberately NOT step-up-gated: disarming only ever makes the bot do
+// LESS (stop watching, stop firing) — there is no "quiet, dangerous"
+// interpretation of disarm the way there is for arm/fire/config/target,
+// and step-up-gating an emergency stop would be actively harmful if the
+// operator's authenticator app were unavailable at exactly the wrong
+// moment. See CLAUDE.md's "Identity (step 10)" section for this being a
+// deliberate scope boundary, not an oversight.
 async fn post_abort(State(state): State<SharedState>) -> impl IntoResponse {
     let _ = state.control_tx.send(ControlMsg::Disarm).await;
     StatusCode::ACCEPTED
 }
 
-async fn post_trigger(State(state): State<SharedState>) -> impl IntoResponse {
+async fn post_trigger(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err((code, msg)) = require_step_up(&state, &headers).await {
+        return (code, msg).into_response();
+    }
     bus::log(&state.bus, "warn", "manual FIRE requested from UI");
     let _ = state.control_tx.send(ControlMsg::FireNow).await;
-    StatusCode::ACCEPTED
+    StatusCode::ACCEPTED.into_response()
 }
 
 #[derive(Deserialize)]
@@ -200,8 +222,13 @@ struct CopymintFireRequest {
 /// since the opportunity was first surfaced.
 async fn post_copymint_fire(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(req): Json<CopymintFireRequest>,
 ) -> impl IntoResponse {
+    if let Err((code, msg)) = require_step_up(&state, &headers).await {
+        return (code, msg).into_response();
+    }
+
     let nft_contract: Address = match req.nft_contract.parse() {
         Ok(a) => a,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad nft_contract: {e}")).into_response(),
@@ -267,28 +294,29 @@ struct TargetSetRequest {
     nft_contract: String,
 }
 
-// TODO(step 10f — identity/step-up auth, not merged as of this writing):
-// this route changes where the bot's next mint sends money, the same
-// sensitivity class as /api/arm and /api/trigger. It currently only
-// requires the same local bearer token every other route needs. When
-// step 10's step-up auth lands, this route should require it too — don't
-// let this get missed just because it shipped before step 10 did.
-//
-/// Actually swaps the active seadrop target. Deliberately does NOT trust
-/// anything the client sent beyond `nft_contract` — re-runs the full
-/// `target::resolve_address` verification fresh (never a cached result
-/// from an earlier `/resolve` call, which could be stale by the time the
-/// operator clicks confirm) and refuses to proceed unless the drop is
-/// both live and `fee_recipient_ok`. Only seadrop mode is supported —
-/// custom mode has no `getPublicDrop`/collection concept to resolve
-/// against. On success: sends `ControlMsg::SetTarget` (see its doc
-/// comment in state.rs for the control_loop-side cleanup this triggers)
-/// and persists `nft_contract` into `config.toml` via the same
-/// validate-then-write path `PUT /api/config` uses.
+/// Actually swaps the active seadrop target. Step-up-gated (10f) —
+/// resolved TODO from step 8b: this route changes where the bot's next
+/// mint sends money, the same sensitivity class as /api/arm and
+/// /api/trigger. Deliberately does NOT trust anything the client sent
+/// beyond `nft_contract` — re-runs the full `target::resolve_address`
+/// verification fresh (never a cached result from an earlier `/resolve`
+/// call, which could be stale by the time the operator clicks confirm)
+/// and refuses to proceed unless the drop is both live and
+/// `fee_recipient_ok`. Only seadrop mode is supported — custom mode has
+/// no `getPublicDrop`/collection concept to resolve against. On success:
+/// sends `ControlMsg::SetTarget` (see its doc comment in state.rs for
+/// the control_loop-side cleanup this triggers) and persists
+/// `nft_contract` into `config.toml` via the same validate-then-write
+/// path `PUT /api/config` uses.
 async fn post_target_set(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(req): Json<TargetSetRequest>,
 ) -> impl IntoResponse {
+    if let Err((code, msg)) = require_step_up(&state, &headers).await {
+        return (code, msg).into_response();
+    }
+
     let cfg = state.config.read().await.clone();
 
     if cfg.mint_mode != "seadrop" {
@@ -581,6 +609,72 @@ async fn require_session(state: &SharedState, headers: &HeaderMap) -> Result<ses
     Ok(session)
 }
 
+/// Step-up auth (step 10f). A valid, admin_tier session (Google + TOTP +
+/// a recognized WebAuthn device, all completed at LOGIN time) is enough
+/// to VIEW — `get_status`/`ws_handler` never call this. It is NOT enough
+/// to arm/fire/change config/change target: those additionally require a
+/// FRESH TOTP code submitted on that specific request, via the
+/// `X-Step-Up-Totp` header, checked through the exact same
+/// `totp::verify_login` (and its replay protection — see totp.rs's
+/// migration 0003) that a real login uses. A stale session doesn't get a
+/// pass just because it's old; a code doesn't get reused just because it
+/// worked a minute ago for something else.
+///
+/// Returns a DISTINCT, specific error for each failure mode — this is a
+/// deliberately testable property (see this module's test coverage
+/// below), not just "401 for everything":
+/// - no session at all → 401 (from `require_session`)
+/// - a real but non-admin-tier session (Google done, TOTP/WebAuthn still
+///   pending) → 403, a different failure than "not signed in"
+/// - missing `X-Step-Up-Totp` header entirely → 428 Precondition Required
+/// - present but wrong/expired/already-used code → 412 Precondition Failed
+///
+/// If identity isn't configured at all (`google_oauth_client_id` unset),
+/// step-up is inapplicable and these routes fall back to exactly their
+/// pre-10f behavior (bearer-token-gated only) — same "opt-in, never
+/// breaks an existing non-identity setup" convention as every other
+/// step 10 route.
+async fn require_step_up(state: &SharedState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    if state.google_oidc.is_none() {
+        return Ok(());
+    }
+
+    let session = require_session(state, headers).await?;
+    if !session.admin_tier {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "session has not completed Google + TOTP + WebAuthn — this action requires a fully admin-tier session".to_string(),
+        ));
+    }
+
+    let code = headers
+        .get("x-step-up-totp")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or((
+            StatusCode::PRECONDITION_REQUIRED,
+            "missing X-Step-Up-Totp header — this action requires a fresh TOTP code on this specific request".to_string(),
+        ))?;
+
+    let email = session::get_user_email(&state.identity_db, &session.user_id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+    let ok = totp::verify_login(&state.identity_db, &state.identity_totp_cipher, &session.user_id, &email, code)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+
+    if !ok {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "step-up TOTP code was incorrect, expired, or already used".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Generates a fresh TOTP secret for the signed-in user and returns a QR
 /// code + base32 manual-entry fallback (step 10d). Does NOT enable
 /// anything yet — see totp.rs's start_setup doc comment.
@@ -811,5 +905,205 @@ async fn stream_events(mut socket: WebSocket, state: SharedState) {
                 break; // client disconnected
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod step_up_tests {
+    //! Step-up auth (10f) as a real, testable property — same standard
+    //! copymint's 6e safety tests set: a request to a fund-moving route
+    //! with a stale or missing step-up token must fail with a clear,
+    //! DISTINCT error, not a generic 401. Builds a real `SharedState`
+    //! (real identity DB, real cookie/TOTP keys, a real `GoogleOidc` from
+    //! live discovery — same network dependency 10c's own test already
+    //! established) and calls `require_step_up` directly rather than
+    //! spinning up a full HTTP server, since it's a plain async fn in
+    //! this module.
+    use super::*;
+    use crate::identity::{crypto, oidc};
+    use axum_extra::extract::cookie::Cookie;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::{mpsc, RwLock};
+
+    async fn test_state(identity_configured: bool) -> SharedState {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("id.db");
+        let key_path = dir.path().join(".session-key");
+        Box::leak(Box::new(dir)); // keep the TempDir (and its directory) alive for the test's duration
+        let db = crate::db::open(db_path.to_str().unwrap()).await.unwrap();
+        let keys = crypto::load_or_create(key_path.to_str().unwrap()).unwrap();
+
+        let google_oidc = if identity_configured {
+            Some(std::sync::Arc::new(
+                oidc::GoogleOidc::discover(
+                    "test-client-id".to_string(),
+                    "test-client-secret".to_string(),
+                    "https://example.invalid/auth/google/callback".to_string(),
+                )
+                .await
+                .expect("live discovery against accounts.google.com should succeed"),
+            ))
+        } else {
+            None
+        };
+
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        std::sync::Arc::new(crate::state::AppState {
+            config: RwLock::new(crate::config::test_config()),
+            wallet_status: RwLock::new(Vec::new()),
+            armed: AtomicBool::new(false),
+            bus: bus::new_bus(),
+            control_tx,
+            config_path: "unused-in-this-test".to_string(),
+            api_token: "unused-in-this-test".to_string(),
+            http_client: reqwest::Client::new(),
+            identity_db: db,
+            identity_cookie_key: keys.cookie_key,
+            identity_totp_cipher: keys.totp_cipher,
+            google_oidc,
+            webauthn: None,
+        })
+    }
+
+    /// Builds a request `Cookie:` header carrying `session_id`, encrypted
+    /// with `state`'s real cookie key — the same round trip a real
+    /// browser does (queue a cookie via `.add()`, read back the
+    /// `Set-Cookie` the jar would have sent, and reuse just its
+    /// `name=value` pair as what the NEXT request's `Cookie:` header
+    /// would contain).
+    fn session_cookie_header(state: &SharedState, session_id: &str) -> HeaderMap {
+        let jar = PrivateCookieJar::from_headers(&HeaderMap::new(), state.identity_cookie_key.clone())
+            .add(Cookie::new(SESSION_COOKIE, session_id.to_string()));
+        let resp = jar.into_response();
+        let set_cookie = resp
+            .headers()
+            .get(axum::http::header::SET_COOKIE)
+            .expect("jar with an added cookie must produce a Set-Cookie header")
+            .to_str()
+            .unwrap();
+        let name_value = set_cookie.split(';').next().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::COOKIE, name_value.parse().unwrap());
+        headers
+    }
+
+    async fn make_user_and_session(state: &SharedState, admin_tier: bool) -> (String, String) {
+        let user_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query("INSERT INTO users (id, google_sub, email, created_at) VALUES (?, ?, ?, 0)")
+            .bind(&user_id)
+            .bind(format!("sub-{user_id}"))
+            .bind("stepup-test@example.com")
+            .execute(&state.identity_db)
+            .await
+            .unwrap();
+        let session_id = session::create_google_verified_session(&state.identity_db, &user_id).await.unwrap();
+        if admin_tier {
+            // Directly promote to admin_tier for test setup speed — the
+            // real promotion path (mark_totp_verified + mark_webauthn_
+            // verified) is already covered by totp.rs's and
+            // webauthn.rs's own tests; what THIS test suite needs is a
+            // session in each of the two possible states, not a second
+            // copy of that promotion logic.
+            sqlx::query("UPDATE sessions SET admin_tier = 1 WHERE id = ?")
+                .bind(&session_id)
+                .execute(&state.identity_db)
+                .await
+                .unwrap();
+        }
+        (user_id, session_id)
+    }
+
+    #[tokio::test]
+    async fn identity_not_configured_bypasses_step_up_entirely() {
+        let state = test_state(false).await;
+        // No session cookie at all, no step-up header — still Ok(()),
+        // because identity isn't configured for this instance. Matches
+        // every other step 10 route's "opt-in, never breaks an existing
+        // non-identity setup" convention.
+        assert!(require_step_up(&state, &HeaderMap::new()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_session_is_401_not_a_silent_pass() {
+        let state = test_state(true).await;
+        let err = require_step_up(&state, &HeaderMap::new()).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn non_admin_tier_session_is_403_distinct_from_401() {
+        let state = test_state(true).await;
+        let (_user_id, session_id) = make_user_and_session(&state, false).await;
+        let headers = session_cookie_header(&state, &session_id);
+
+        let err = require_step_up(&state, &headers).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN, "a real-but-partial session must not be treated the same as no session");
+    }
+
+    #[tokio::test]
+    async fn admin_tier_session_missing_step_up_header_is_428() {
+        let state = test_state(true).await;
+        let (_user_id, session_id) = make_user_and_session(&state, true).await;
+        let headers = session_cookie_header(&state, &session_id);
+
+        let err = require_step_up(&state, &headers).await.unwrap_err();
+        assert_eq!(
+            err.0,
+            StatusCode::PRECONDITION_REQUIRED,
+            "a fully-valid, old session must still be rejected without a FRESH code on this request"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_tier_session_wrong_code_is_412() {
+        let state = test_state(true).await;
+        let (_user_id, session_id) = make_user_and_session(&state, true).await;
+        let mut headers = session_cookie_header(&state, &session_id);
+        headers.insert("x-step-up-totp", "000000".parse().unwrap());
+
+        let err = require_step_up(&state, &headers).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    async fn admin_tier_session_correct_fresh_code_succeeds_and_cannot_be_reused() {
+        let state = test_state(true).await;
+        let (user_id, session_id) = make_user_and_session(&state, true).await;
+
+        // Enroll and enable a real TOTP secret for this user, exactly the
+        // way 10d's setup flow does, so there's a real code to check
+        // step-up against.
+        let material = totp::start_setup(&state.identity_db, &state.identity_totp_cipher, &user_id, "stepup-test@example.com")
+            .await
+            .unwrap();
+        let secret = totp_rs::Secret::try_from_base32(&material.secret_base32).unwrap();
+        let live_totp = totp_rs::Builder::new()
+            .with_algorithm(totp_rs::Algorithm::SHA1)
+            .with_digits(6)
+            .with_step_duration(30)
+            .with_secret(secret.as_bytes().to_vec())
+            .with_issuer(Some("mint-sniper"))
+            .with_account_name("stepup-test@example.com")
+            .build()
+            .unwrap();
+        let code = live_totp.generate_current().to_string();
+        totp::verify_setup(&state.identity_db, &state.identity_totp_cipher, &user_id, "stepup-test@example.com", &code)
+            .await
+            .unwrap();
+
+        // That same code already got consumed by verify_setup above —
+        // step-up must reject reusing it (this IS the replay-protection
+        // property, exercised through the actual HTTP-facing function,
+        // not just totp.rs's own unit tests).
+        let mut headers = session_cookie_header(&state, &session_id);
+        headers.insert("x-step-up-totp", code.parse().unwrap());
+        let err = require_step_up(&state, &headers).await.unwrap_err();
+        assert_eq!(err.0, StatusCode::PRECONDITION_FAILED, "a code already consumed by setup must not be replayable as step-up");
+
+        // A genuinely fresh next-step code succeeds.
+        let next_code = live_totp.generate(crate::bus::now_ts() + 30).to_string();
+        let mut headers = session_cookie_header(&state, &session_id);
+        headers.insert("x-step-up-totp", next_code.parse().unwrap());
+        assert!(require_step_up(&state, &headers).await.is_ok());
     }
 }
