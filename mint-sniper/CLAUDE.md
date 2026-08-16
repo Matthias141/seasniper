@@ -711,6 +711,85 @@ What's actually out of scope:
   confirm that's really the intent before writing anything — it's a
   different and more adversarial problem than a public contract call.
 
+## Identity (step 10)
+
+Adds real operator identity in front of the control API, replacing the
+step 7 bearer-token-only model where anyone with `.sniper-token` (or
+network access to it, if that model's own precise threat boundary is
+ever misjudged) had full control. Google Sign-In (10c) establishes who
+you are; TOTP (10d) and WebAuthn/passkey (10e) each add a second factor,
+required together before a session reaches `admin_tier`; step-up auth
+(10f) then layers a short-lived, per-request freshness re-check on top
+of an `admin_tier` session for the money-moving routes specifically
+(arm/trigger/config/target-set). `src/identity/*.rs` and
+`migrations/000{1,2,3}_*.sql` hold the implementation; `src/auth.rs`'s
+`require_token_or_session`/`require_step_up` are where the control API
+actually enforces it. Bearer-token-only mode (step 7) still works
+unchanged when identity isn't configured for a given instance — see
+`AuthGate` in `ui/src/App.tsx`.
+
+**10i — security self-audit, findings below (all clean; nothing here
+required a code change).** Scope, per this step's own purpose as the
+trust-check on everything 10a-10h built: secrets never reaching a log
+or the durable audit trail, cookie hardening, and `.gitignore` coverage
+for every new secret-bearing file this step introduced.
+
+- **`.gitignore` coverage, verified with `git check-ignore -v`, not
+  just read from the file:** `identity.db`, `identity.db-wal`,
+  `identity.db-shm`, and `.session-key` are all genuinely ignored.
+- **Secrets never reach `bus::log`/`audit.log`.** Grepped every
+  `bus::log` call site touching the identity module: none embed a raw
+  TOTP code, TOTP secret, session id, cookie signing key, or WebAuthn
+  assertion — only structural `anyhow` context strings (`{e:#}`),
+  session/device row ids (opaque, not secrets), and one user-visible
+  Google account email (`"google sign-in succeeded for {email}"`).
+  That email only reaches already-authenticated admin clients over
+  `/ws/events` (itself gated by `require_token_or_session`) — it's
+  never persisted, since `audit.rs`'s bus subscriber explicitly skips
+  `ServerEvent::Log` (see its own comment: "routine and/or high-volume
+  — not what RUNBOOK.md's checklists need a durable record of").
+  `src/identity/oidc.rs` and `src/identity/webauthn.rs` have zero
+  logging call sites at all. No request-body-logging middleware exists
+  anywhere in `main.rs`/`api.rs` that could accidentally capture a
+  POSTed TOTP code or WebAuthn ceremony payload.
+- **Cookies (`sniper_session`, `sniper_oidc_flow`), read directly from
+  the `Cookie::build` call sites in `api.rs`:** both set
+  `.http_only(true)`, `.secure(true)`, `.same_site(SameSite::Lax)`, and
+  are carried through axum-extra's `PrivateCookieJar` (encrypted +
+  signed, not just signed) — the raw session id is never visible
+  client-side even via devtools. `sniper_oidc_flow` is additionally
+  scoped to `.path("/auth/google")`, narrower than the session cookie's
+  `.path("/")`, matching its short-lived, single-purpose role.
+- **Key material (`.session-key`, `identity/crypto.rs`):** 96 random
+  bytes generated with `rand::thread_rng()` on first run, `chmod 600`
+  on Unix (same pattern `auth::load_or_create_token` already used for
+  `.sniper-token`), split into the cookie-jar key (64 bytes) and an
+  AES-256-GCM key for TOTP secrets at rest (32 bytes) — one file rather
+  than two, since both have the same "leaks it → forge a session or
+  decrypt a TOTP secret" blast radius (see the file's own doc comment).
+  TOTP ciphertext uses a fresh random nonce per encryption, verified by
+  `crypto.rs`'s own test that ciphertext never equals plaintext and
+  that a wrong key fails to decrypt.
+- **DB schema (`migrations/0001_identity.sql`) has no plaintext secret
+  columns.** `totp_secrets.secret_ciphertext`/`secret_nonce` are the
+  AES-256-GCM output above, never the raw secret.
+  `webauthn_credentials.passkey_json` is `webauthn_rs`'s public-key
+  credential data — WebAuthn private keys never leave the
+  authenticator by design, so this isn't secret material to begin
+  with. `sessions.id` is the only thing that ever goes in the
+  encrypted cookie (per the migration's own comment) — no separate
+  session-secret column exists to leak.
+- **One informational, non-blocking observation, not a finding:** TOTP
+  setup (`post_totp_setup_start`/`post_totp_setup_verify`) and WebAuthn
+  registration are gated by `require_session` (an active session)
+  rather than `require_step_up`. This is correct by the design already
+  documented in `session.rs`'s doc comment — a session mid-chain
+  (Google done, TOTP/WebAuthn still pending) has to be able to reach
+  these routes to ever complete the chain at all, and step-up auth is
+  explicitly a separate, later concept layered on top of an
+  already-`admin_tier` session, not a substitute for the login chain
+  itself.
+
 ## Before touching a real mint
 
 1. Confirm the target contract's `mint()` isn't merkle-allowlist gated —
