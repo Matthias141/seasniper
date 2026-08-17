@@ -869,6 +869,129 @@ arm/fire-capable-attacker incident** — RUNBOOK.md §6's first move is
 always to cross-check step 10's own audit trail/`sessions` table before
 assuming the worst.
 
+## Robinhood Chain support (step 13)
+
+Adds Robinhood Chain (Arbitrum Orbit, EVM-compatible, gas paid in ETH —
+mainnet chain id 4663, testnet 46630) as a supported network, plus
+real, chain-agnostic fire-path timing instrumentation across every
+network this bot targets. Combined because the timing work is what
+turns "Robinhood Chain is supported" into a checked claim against
+MintDash's own published numbers, not just "it compiles."
+
+**13a — SeaDrop's singleton confirmed live, not assumed from
+morsyxbt/nft-public-mint's chain list.** Real `eth_getCode` calls
+against `0x00005EA00Ac477B1030CE78506496e8C2dE24bf5` on both Robinhood
+mainnet and testnet returned real bytecode, byte-identical to Ethereum
+mainnet's own deployment except for one ~20-byte segment — a
+per-chain-id EIP-712 domain-separator immutable, confirmed by locating
+its literal chain-id hex (`1237`/`b626`) at the exact diff offset, not
+a sign of a different or tampered deployment. Full detail in
+`seadrop.rs`'s doc comment.
+
+**13b — no config schema changes needed.** `chain_id` was already read
+live per-instance (`executor.rs`'s `get_chain_id()` call, confirmed by
+reading the code, not assumed) rather than hardcoded — the exact
+footgun this step set out to check for doesn't exist here.
+`ws_rpc_url`/`http_rpc_urls`/`seadrop_address` were already free-text
+and overridable. Added a Robinhood Chain example to
+`config.example.toml` with confirmed Alchemy endpoints
+(`robinhood-mainnet/testnet.g.alchemy.com` — Alchemy's own docs
+confirm support, checked directly).
+
+**13c — block-time scaling, examined and decided, not silently
+ignored.** `run_state_poll_watcher` does one `eth_call` per block;
+Robinhood Chain's ~100ms blocks mean roughly 120x the call volume of
+mainnet's ~12s blocks. Decision: don't throttle it — a per-block check
+is exactly correct sniper behavior, and an artificial delay would work
+against the tool's whole purpose. The real mitigation is an
+adequately-provisioned RPC plan for a fast chain, not a code change —
+see `watcher.rs`'s doc comment for the full reasoning. **13d could not
+directly measure the per-block call rate this predicts** (see below) —
+the reasoning is confirmed sound, the specific number is not yet
+independently observed.
+
+**13d — live dry run against Robinhood Chain testnet, from real funded
+wallets (`.testnet-keys/wallet1`), not simulated:**
+- Found a genuinely live, currently-open free-mint SeaDrop collection
+  on testnet by reading real successful `mintPublic` transactions
+  against the singleton (`nftContract =
+  0xc4A245473372AD4c83DA323791A8815957A94b70`), rather than deploying
+  a fresh test token — a real target was already there.
+- **timestamp mode: fully live-fired and independently verified.**
+  Armed → prepared → fired → confirmed, then checked directly via
+  `eth_getTransactionReceipt` (status `0x1`) and the receipt's own
+  ERC721 `Transfer` log (from the zero address to our wallet, tokenId
+  3) — not just trusting the bot's own report, same bar step 5's
+  original Sepolia dry run set. Real numbers, this specific attempt
+  (n=1, not a distribution): `send_to_ack_ms = 236`,
+  `dispatch_to_inclusion_ms = 7551`.
+- **poll_state mode: armed, and failed exactly the way gap #11
+  predicted — confirmed, not assumed to still apply.** The watcher's
+  WS connection failed with `invalid peer certificate: UnknownIssuer`,
+  the identical error signature step 9e's Sepolia dry run hit against
+  a completely different RPC endpoint — definitive evidence this is
+  this sandbox's TLS-interception limitation (alloy's WS transport
+  hard-compiled against `webpki-roots`), not anything specific to
+  Robinhood Chain. The safety net from gap #9 worked correctly: failed
+  loudly and auto-disarmed within about a second (confirmed via
+  `audit.log`'s arm/disarm timestamps one second apart), not a silent
+  hang. This means 13c's ~10-calls/sec prediction remains reasoned
+  analysis, not a directly observed number — poll_state has never
+  successfully connected on ANY chain from this specific sandbox, gap
+  #11's scope, unchanged by this step.
+- mempool_watch was not attempted separately — it shares poll_state's
+  exact WS-connection dependency and would fail identically.
+
+**13e — real timing instrumentation, chain-agnostic by construction.**
+`ServerEvent::MintResult` now carries `trigger_to_dispatch_ms`,
+`send_to_ack_ms`, `dispatch_to_inclusion_ms`, and `prepare_age_ms` —
+plain `Instant` deltas in `executor.rs` with zero chain-specific
+logic, persisted in `audit.log` and shown in the UI's event feed per
+attempt. This is what made 13d's numbers above possible to capture at
+all, and what a future mainnet or Sepolia run would produce directly
+comparable numbers from too.
+
+**13f — honest comparison against MintDash's published Robinhood Chain
+figures (send→ack p50 117ms, mintDuration p50 136ms):**
+
+| Metric | This run (n=1) | MintDash (p50) |
+|---|---|---|
+| send→ack | 236ms | 117ms |
+| dispatch→inclusion | 7551ms | 136ms |
+
+**Read this precisely, not as "we're slow":**
+- **n=1 vs. p50.** MintDash's numbers are a distribution's median over
+  presumably many attempts; this is one single attempt. A single data
+  point isn't comparable to a p50 the same way two p50s would be —
+  this table is a starting reference point, not a verdict.
+- **send→ack (236ms vs 117ms) is a fair-ish comparison** — same
+  concept (RPC accepting the broadcast), and this bot's number came
+  from Robinhood's own public testnet RPC from a cloud sandbox with no
+  particular network proximity to it, not a colocated or
+  low-latency-optimized path. MintDash explicitly runs their own
+  colocated node (per this task's own framing) — a ~2x gap between an
+  arbitrary public RPC and a colocated node's own accept latency is
+  plausible and not alarming on its face.
+- **dispatch→inclusion (7551ms vs 136ms) is NOT an apples-to-apples
+  comparison and shouldn't be read as "56x slower."** Robinhood
+  Chain's ~100ms blocks mean 136ms is roughly one block's worth of
+  time — MintDash's `mintDuration` most likely measures actual
+  on-chain inclusion latency at the protocol level. This bot's
+  `dispatch_to_inclusion_ms` measures wall-clock time until
+  `get_receipt()`'s own internal polling loop (alloy's default
+  poll-and-retry implementation, not a push-based subscription) notices
+  the receipt — that polling interval, not raw chain inclusion speed,
+  plausibly dominates a 7.5-second result on a 100ms-block chain. This
+  number reflects THIS bot's current receipt-detection method more
+  than it reflects Robinhood Chain's real inclusion speed, and isn't
+  safe to read as a direct chain-speed comparison without first
+  confirming (not yet done) whether switching `fire_prepared` to a
+  push-based subscription for inclusion detection meaningfully closes
+  this gap on a fast-block chain specifically. Flagged as a real,
+  concrete next step rather than treated as settled — the honest
+  conclusion of 13f is "we don't yet know how close we are on
+  inclusion speed," not "we're roughly on par" or "we're far behind."
+
 ## Before touching a real mint
 
 1. Confirm the target contract's `mint()` isn't merkle-allowlist gated —
