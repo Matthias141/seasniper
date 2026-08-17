@@ -130,12 +130,25 @@ function Control({ onSignOut }: { onSignOut?: () => void }) {
             ),
           );
           break;
-        case 'mint_result':
+        case 'mint_result': {
+          // step 13e — real per-attempt timing, shown alongside
+          // success/failure rather than only in the audit log, so the
+          // control deck's own feed is where you'd actually check "how
+          // fast did that fire" right after it happens.
+          const timing = [
+            `prepare age ${event.prepare_age_ms}ms`,
+            event.trigger_to_dispatch_ms != null ? `trigger→dispatch ${event.trigger_to_dispatch_ms}ms` : null,
+            event.send_to_ack_ms != null ? `send→ack ${event.send_to_ack_ms}ms` : null,
+            event.dispatch_to_inclusion_ms != null ? `dispatch→inclusion ${event.dispatch_to_inclusion_ms}ms` : null,
+          ]
+            .filter(Boolean)
+            .join(', ');
           pushLine(
             event.success ? 'info' : 'error',
-            `${event.address}: ${event.success ? 'confirmed' : 'failed'} — ${event.detail}`,
+            `${event.address}: ${event.success ? 'confirmed' : 'failed'} — ${event.detail}${timing ? ` (${timing})` : ''}`,
           );
           break;
+        }
         case 'trigger_fired':
           pushLine('warn', `trigger fired (${event.manual ? 'manual' : 'auto'})`);
           break;

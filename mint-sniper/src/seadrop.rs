@@ -8,9 +8,22 @@
 //!
 //! Deployment (same address on every chain it's deployed to, deterministic
 //! CREATE2 deploy): 0x00005EA00Ac477B1030CE78506496e8C2dE24bf5
-//! Confirmed on Ethereum mainnet and Polygon as of this writing —
-//! verify on the target chain's block explorer before relying on it,
-//! deployments do vary by chain and this list can go stale.
+//! Confirmed on Ethereum mainnet and Polygon as of this writing, and (step
+//! 13a) Robinhood Chain mainnet (4663) AND testnet (46630) — real
+//! `eth_getCode` calls against both, not assumed from
+//! morsyxbt/nft-public-mint's chain-support list alone. Runtime bytecode
+//! is byte-identical to Ethereum mainnet's own deployment except for one
+//! ~20-byte segment containing the literal chain id (an EIP-712 domain
+//! separator immutable, baked in per-chain at deploy time — CREATE2 keeps
+//! the ADDRESS deterministic from init-code+salt alone, but the compiled
+//! runtime code legitimately differs by this one chain-dependent constant;
+//! this is expected and not a sign of a different/tampered deployment).
+//! `SEADROP_1_0_MAINNET`'s name is a holdover from when only Ethereum
+//! mainnet was in scope — despite the name, this same constant is the
+//! correct default on every chain confirmed above, not a mainnet-only
+//! value. Still verify on any NEW target chain's block explorer before
+//! relying on it — deployments do vary by chain and this list can go
+//! stale.
 //!
 //! IMPORTANT SCOPE LIMIT: this only covers `mintPublic` — the no-allowlist,
 //! no-signature public stage. SeaDrop also supports `mintAllowList` (needs

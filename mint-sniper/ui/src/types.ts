@@ -88,7 +88,21 @@ export type ServerEvent =
   | { type: 'wallet_update'; address: string; balance_eth: string; nonce: number; healthy: boolean }
   | { type: 'rpc_health'; url: string; healthy: boolean; latency_ms: number }
   | { type: 'trigger_fired'; manual: boolean }
-  | { type: 'mint_result'; address: string; success: boolean; detail: string }
+  | {
+      type: 'mint_result';
+      address: string;
+      success: boolean;
+      detail: string;
+      // step 13e — real, chain-agnostic fire-path timing. trigger_to_dispatch_ms
+      // is set on every real fire; send_to_ack_ms/dispatch_to_inclusion_ms are
+      // null only when every RPC rejected the broadcast outright (no ack ever
+      // happened). Named to match MintDash's own published terms (send→ack,
+      // mintDuration) — see CLAUDE.md's step 13 section.
+      trigger_to_dispatch_ms: number | null;
+      send_to_ack_ms: number | null;
+      dispatch_to_inclusion_ms: number | null;
+      prepare_age_ms: number;
+    }
   | {
       type: 'copy_opportunity';
       tracked_wallet: string;

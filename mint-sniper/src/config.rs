@@ -36,9 +36,12 @@ pub struct Config {
     pub mint_enable_admin: String,
 
     /// --- seadrop-mode-only fields, ignored when mint_mode = "custom" ---
-    /// SeaDrop singleton contract address. Defaults to the mainnet/Polygon
-    /// deployment; override for other chains (verify on that chain's
-    /// explorer first — see seadrop.rs doc comment).
+    /// SeaDrop singleton contract address. Defaults to
+    /// `seadrop::SEADROP_1_0_MAINNET` — despite the name, this same
+    /// address is confirmed deployed (step 13a, real `eth_getCode` calls)
+    /// on Ethereum mainnet, Polygon, AND Robinhood Chain mainnet+testnet;
+    /// override only if targeting a chain not yet confirmed — verify on
+    /// that chain's explorer first, see seadrop.rs's doc comment.
     #[serde(default)]
     pub seadrop_address: String,
     /// The actual NFT collection contract for this drop. Distinct from

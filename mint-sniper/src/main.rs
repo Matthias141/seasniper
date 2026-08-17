@@ -743,6 +743,15 @@ async fn control_loop(
             }
 
             ControlMsg::FireNow => {
+                // STEP 13e — the earliest point THIS process can call
+                // "trigger detected": right as control_loop starts acting
+                // on it, whether that's a watcher's auto-trigger (which
+                // reaches here via trigger_rx.changed() -> one mpsc send,
+                // sub-millisecond in practice, not separately instrumented)
+                // or a manual UI "Fire Now" click (where this genuinely IS
+                // the detection instant — there is no earlier "trigger" to
+                // measure from for a manual fire).
+                let trigger_detected_at = std::time::Instant::now();
                 let cfg = state.config.read().await.clone();
                 bus::log(&state.bus, "warn", "FIRING all wallets");
 
@@ -751,7 +760,7 @@ async fn control_loop(
                     // one place next_nonce advances (see prepare_fire's doc
                     // comment for why it doesn't advance on its own).
                     advance_nonces(&mut wallets, &pf.wallets);
-                    executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus).await
+                    executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus, trigger_detected_at).await
                 } else {
                     // Manual fire (UI "Fire Now") without a prior arm, or a
                     // prepare that failed above — fall back to signing right
@@ -782,7 +791,7 @@ async fn control_loop(
                     {
                         Ok(w) => {
                             advance_nonces(&mut wallets, &w);
-                            executor::fire_prepared(&cfg, &w, &providers, &state.bus).await
+                            executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at).await
                         }
                         Err(e) => Err(e),
                     }
@@ -822,6 +831,7 @@ async fn control_loop(
                 // — there's no "prepare ahead of time" for copymint since
                 // the target contract isn't known until the moment of
                 // detection.
+                let trigger_detected_at = std::time::Instant::now(); // step 13e — see FireNow's identical note above
                 let cfg = state.config.read().await.clone();
                 bus::log(&state.bus, "warn", format!("FIRING copymint opportunity: contract {copy_contract:#x}"));
 
@@ -844,7 +854,7 @@ async fn control_loop(
                 {
                     Ok(w) => {
                         advance_nonces(&mut wallets, &w);
-                        if let Err(e) = executor::fire_prepared(&cfg, &w, &providers, &state.bus).await {
+                        if let Err(e) = executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at).await {
                             bus::log(&state.bus, "error", format!("copymint fire sequence error: {e:#}"));
                         }
                     }

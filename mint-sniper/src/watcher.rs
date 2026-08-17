@@ -10,6 +10,33 @@ use tracing::{info, warn};
 /// Fires exactly once (watch channel flips to `true`) the moment the mint
 /// condition is satisfied. Kept dead simple on purpose: complexity here is
 /// latency you're paying at the worst possible moment.
+///
+/// STEP 13c — block-time scaling, examined not ignored. This does one
+/// `eth_call` per new block header, unconditionally. On Ethereum mainnet
+/// (~12s blocks) that's ~1 call/12s; on Robinhood Chain (~100ms blocks,
+/// confirmed via its own `eth_getBlockByNumber` timestamps during the
+/// step 13d dry run — see CLAUDE.md's step 13 section) the SAME code
+/// runs roughly 120x more often, on the order of 10 calls/sec while
+/// armed. Real cost, not hypothetical: sustained for an hour that's
+/// ~36,000 calls against whatever RPC endpoint is configured, vs. ~300 on
+/// mainnet — plausibly enough to hit a free/shared public RPC's
+/// per-second rate limit in a way mainnet's own 120x-slower natural
+/// ceiling never would.
+///
+/// Decision: do NOT throttle this. A per-block check on a 100ms-block
+/// chain is exactly the correct behavior for a sniper, not an
+/// accident to fix — introducing an artificial minimum interval would
+/// mean detecting a live mint slower than the chain itself can confirm
+/// blocks, which directly works against this whole tool's purpose
+/// (see step 13e's timing instrumentation, added specifically to make
+/// "how fast did we actually detect+fire" a real measured number, not
+/// a guess). The actual mitigation belongs at the OPERATOR/provisioning
+/// layer, not in this loop: use an RPC plan with rate limits sized for
+/// sub-second polling (Alchemy's paid tiers, not a free/shared public
+/// endpoint) when arming poll_state against a fast chain — same
+/// judgment call this project already expects for `mempool_watch`'s
+/// full-mempool-visibility requirement (see that function's own doc
+/// comment on why many free RPCs don't support it either).
 pub async fn run_state_poll_watcher(
     ws_url: String,
     contract: Address,

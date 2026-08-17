@@ -35,6 +35,26 @@ pub enum ServerEvent {
         address: String,
         success: bool,
         detail: String,
+        /// STEP 13e — real fire-path timing, chain-agnostic (plain
+        /// `Instant` deltas, no chain-specific logic anywhere in how
+        /// these are computed — see `executor::fire_prepared`'s doc
+        /// comment). All `None` only for the pre-13e-shaped tests /
+        /// call sites; a real fire always sets `trigger_to_dispatch_ms`
+        /// at minimum, and `send_to_ack_ms`/`dispatch_to_inclusion_ms`
+        /// too once broadcast is actually acked/included. Named to
+        /// match MintDash's own published Robinhood Chain terms
+        /// (send→ack, mintDuration) for a direct, honest comparison —
+        /// see CLAUDE.md's step 13 section.
+        trigger_to_dispatch_ms: Option<u64>,
+        send_to_ack_ms: Option<u64>,
+        dispatch_to_inclusion_ms: Option<u64>,
+        /// How long this wallet's tx sat pre-signed before dispatch — the
+        /// "prepare complete (signed)" stage. Near-zero in the FireNow
+        /// no-prior-prepare fallback (signs right before dispatch); can be
+        /// seconds-to-tens-of-seconds in normal armed operation, up to
+        /// `POLL_STATE_REPREPARE_INTERVAL_SECS` in poll_state mode. Always
+        /// set — every fired wallet has a real `prepared_at`.
+        prepare_age_ms: u64,
     },
     /// Emitted by `api::put_config` after a validated config write. Kept as
     /// its own typed variant, not folded into `Log`, specifically so

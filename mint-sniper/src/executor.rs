@@ -28,6 +28,14 @@ pub struct PreparedWallet {
     pub address: Address,
     pub raw_tx: Vec<u8>,
     pub tx_hash: TxHash,
+    /// STEP 13e — when this wallet's tx was actually signed. `Instant`,
+    /// not a wall-clock timestamp: only ever compared against another
+    /// `Instant` from the same process to compute a duration, never
+    /// serialized or shown as an absolute time, so monotonic-clock
+    /// semantics (immune to a clock adjustment mid-fire) are exactly
+    /// what's wanted here. Chain-agnostic by construction — nothing
+    /// below reads chain id or network name, only wall-clock deltas.
+    pub prepared_at: std::time::Instant,
 }
 
 /// Output of the prepare phase: every wallet's signed tx, plus the warmed
@@ -193,6 +201,7 @@ pub async fn prepare_fire(
 
         let raw_tx = envelope.encoded_2718();
         let tx_hash = *envelope.tx_hash();
+        let prepared_at = std::time::Instant::now();
 
         info!(address = %w.address, %tx_hash, nonce, "wallet prepared (signed, not broadcast)");
         bus::log(
@@ -204,6 +213,7 @@ pub async fn prepare_fire(
         prepared.push(PreparedWallet {
             address: w.address,
             raw_tx,
+            prepared_at,
             tx_hash,
         });
     }
@@ -218,11 +228,25 @@ pub async fn prepare_fire(
 /// The only thing decided at this point is the per-wallet broadcast-timing
 /// jitter, which is about *when* the already-built bytes hit the wire, not
 /// what's in them, so there's no reason to fix it before the trigger.
+///
+/// STEP 13e — `trigger_detected_at` is when the CALLER first knew firing
+/// should happen (a watcher tripping, or a manual/copymint fire request
+/// being received) — see `main.rs`'s `control_loop` for where each of
+/// those is actually captured. Everything here is plain wall-clock
+/// `Instant` math with zero chain-specific logic, so the resulting
+/// `trigger_to_dispatch_ms`/`send_to_ack_ms`/`dispatch_to_inclusion_ms`
+/// on `ServerEvent::MintResult` are directly comparable across mainnet,
+/// Sepolia, and Robinhood Chain runs — that's what makes step 13d's dry
+/// run produce a real number to check against MintDash's own published
+/// Robinhood Chain figures (send→ack p50 117ms, mintDuration p50 136ms —
+/// see CLAUDE.md's step 13 section), not a mainnet number with nothing
+/// to compare it to.
 pub async fn fire_prepared(
     cfg: &Config,
     prepared: &[PreparedWallet],
     providers: &[HttpProvider],
     bus: &EventBus,
+    trigger_detected_at: std::time::Instant,
 ) -> Result<()> {
     let _ = bus.send(ServerEvent::TriggerFired { manual: false });
 
@@ -236,6 +260,7 @@ pub async fn fire_prepared(
         let raw_tx = pw.raw_tx.clone();
         let address = pw.address;
         let expected_hash = pw.tx_hash;
+        let prepared_at = pw.prepared_at;
         let providers = providers.to_vec(); // RootProvider is a cheap Arc-clone — same pooled connections
         let bus = bus.clone();
 
@@ -243,6 +268,14 @@ pub async fn fire_prepared(
 
         handles.push(tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+
+            // Measured AFTER the jitter sleep, deliberately — jitter is an
+            // intentional anti-clustering delay this codebase chose to
+            // pay, not fire-path overhead to report as latency. This is
+            // the moment these bytes actually start going out the door.
+            let dispatch_started = std::time::Instant::now();
+            let trigger_to_dispatch_ms = dispatch_started.saturating_duration_since(trigger_detected_at).as_millis() as u64;
+            let prepare_age_ms = dispatch_started.saturating_duration_since(prepared_at).as_millis() as u64;
 
             // Race the same raw bytes across every warmed RPC; first to
             // land wins. Unlike the old select_ok-based version, every
@@ -272,13 +305,20 @@ pub async fn fire_prepared(
                     // into; the index is attached after, on the way out,
                     // since neither of those error types otherwise unify
                     // with (usize, anyhow::Error) directly.
-                    let result: Result<TransactionReceipt, anyhow::Error> = async {
-                        let receipt = provider
-                            .send_raw_transaction(&raw_tx)
-                            .await?
-                            .get_receipt()
-                            .await?;
-                        Ok(receipt)
+                    //
+                    // STEP 13e: send_to_ack_ms is captured the instant
+                    // send_raw_transaction itself returns — the RPC
+                    // accepting the raw bytes and handing back a pending-tx
+                    // handle, NOT inclusion — this is the number directly
+                    // comparable to MintDash's published "send→ack" figure.
+                    // Captured OUTSIDE the `?` on get_receipt() below so a
+                    // slow/failed receipt wait never loses it.
+                    let result: Result<(TransactionReceipt, u64, u64), anyhow::Error> = async {
+                        let pending = provider.send_raw_transaction(&raw_tx).await?;
+                        let send_to_ack_ms = dispatch_started.elapsed().as_millis() as u64;
+                        let receipt = pending.get_receipt().await?;
+                        let dispatch_to_inclusion_ms = dispatch_started.elapsed().as_millis() as u64;
+                        Ok((receipt, send_to_ack_ms, dispatch_to_inclusion_ms))
                     }
                     .await;
                     result.map_err(|e| (i, e))
@@ -287,7 +327,7 @@ pub async fn fire_prepared(
 
             let results = join_all(sends).await;
 
-            if let Some(receipt) = results.iter().find_map(|r| r.as_ref().ok()) {
+            if let Some((receipt, send_to_ack_ms, dispatch_to_inclusion_ms)) = results.iter().find_map(|r| r.as_ref().ok()) {
                 let tx_hash = receipt.transaction_hash;
                 // The RPC's returned hash should always equal the hash
                 // computed at prepare time — raw_tx fully determines it,
@@ -300,11 +340,15 @@ pub async fn fire_prepared(
                 }
 
                 if receipt.status() {
-                    info!(%address, %tx_hash, "mint confirmed");
+                    info!(%address, %tx_hash, send_to_ack_ms, dispatch_to_inclusion_ms, "mint confirmed");
                     let _ = bus.send(ServerEvent::MintResult {
                         address: format!("{address:#x}"),
                         success: true,
                         detail: format!("{tx_hash:#x}"),
+                        trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
+                        prepare_age_ms,
+                        send_to_ack_ms: Some(*send_to_ack_ms),
+                        dispatch_to_inclusion_ms: Some(*dispatch_to_inclusion_ms),
                     });
                 } else {
                     // Included, but reverted. Not a broadcast failure —
@@ -314,7 +358,9 @@ pub async fn fire_prepared(
                     // reason decoding here (would need an extra eth_call
                     // trace replay); block number + gas used is enough to
                     // confirm "this really happened" without a whole
-                    // subsystem for why.
+                    // subsystem for why. Timing is still real and still
+                    // reported — a revert still measures real send→ack and
+                    // dispatch→inclusion numbers, same as a success.
                     let detail = format!(
                         "reverted on-chain — tx {tx_hash:#x}, block {}, gas used {}",
                         receipt.block_number.map_or("?".to_string(), |b| b.to_string()),
@@ -325,6 +371,10 @@ pub async fn fire_prepared(
                         address: format!("{address:#x}"),
                         success: false,
                         detail,
+                        trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
+                        prepare_age_ms,
+                        send_to_ack_ms: Some(*send_to_ack_ms),
+                        dispatch_to_inclusion_ms: Some(*dispatch_to_inclusion_ms),
                     });
                 }
             } else {
@@ -337,10 +387,18 @@ pub async fn fire_prepared(
                     .collect::<Vec<_>>()
                     .join(" | ");
                 error!(%address, error = %detail, "all RPC broadcasts failed for this wallet");
+                // No ack/inclusion time exists when every RPC rejected the
+                // broadcast outright — but trigger_to_dispatch_ms is still
+                // real and worth keeping, since it's independent of what
+                // happened after dispatch.
                 let _ = bus.send(ServerEvent::MintResult {
                     address: format!("{address:#x}"),
                     success: false,
                     detail,
+                    trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
+                    prepare_age_ms,
+                    send_to_ack_ms: None,
+                    dispatch_to_inclusion_ms: None,
                 });
             }
         }));
