@@ -1199,10 +1199,15 @@ VPS is live.
 
 ### 15a — VPS provider + region recommendation
 
-**Hetzner Cloud, Ashburn (US East, "ash") region, CPX11 or equivalent
-small shared-vCPU instance (~2 vCPU/4GB RAM class).** Two real,
-independently-sourced signals converge on Ashburn, not assumed from
-habit:
+**UPDATED: AWS EC2, `us-east-1` directly, `t4g.small`.** The original
+recommendation below (Hetzner Cloud, Ashburn) is confirmed unavailable
+for this operator — not a preference change, a hard constraint. The
+swap to EC2 `us-east-1` is not a downgrade from the original reasoning;
+it's actually a tighter match to it, since `us-east-1` was always the
+literal region the evidence pointed at — Ashburn was only ever a
+same-metro approximation of proximity to that region, never the region
+itself. The underlying reasoning is unchanged, carried forward rather
+than re-derived:
 - Alchemy — a named Robinhood Chain infra partner — has its own status
   history naming "US East" as a real serving region for chain traffic
   (a July 2026 Hyperliquid latency incident was explicitly scoped to
@@ -1216,26 +1221,68 @@ habit:
   of Robinhood's AWS footprint, not a separate one — inference, not a
   confirmed fact from Robinhood's own docs, stated as such.
 
-Ashburn, VA is the same metro area as AWS `us-east-1` itself — literally
-the densest interconnection point on the US East Coast — so a
-non-AWS VPS provider with a real Ashburn presence gets the shortest
-plausible physical path to both signals above without paying AWS's
-markup for a workload that doesn't need it. Hetzner confirmed to have a
-real, dedicated Ashburn datacenter (not just US-adjacent) with
-CPX-series shared-vCPU instances sized correctly for this workload:
-SQLite, a handful of concurrent wallet signers, a few WS connections —
-not compute-heavy, so a larger instance would be pure waste. Sized
-against the actual workload, not over-provisioned on the theory that
-"a trading bot probably needs more."
+**Instance: `t4g.small`** (2 vCPU / 2GB RAM, Graviton/ARM,
+~$0.0168/hr) over `t3.small` (identical 2 vCPU/2GB spec, ~$0.0208/hr,
+x86_64) — checked against current EC2 pricing directly, not assumed
+still accurate, and ~19% cheaper for the same spec. Worth the ARM
+architecture specifically because `deploy.sh`'s `source` mode (the
+only real deploy path today — no `v*` tag has been cut yet) runs
+`cargo build --release` natively on the target machine, which compiles
+for whatever CPU it's running on with zero script changes — confirmed
+by reading `deploy.sh`, not assumed. Checked the other direction too,
+not just assumed compatible: `release.yml` (step 7d) only ever builds
+on `ubuntu-latest` with no `aarch64` target, so `deploy.sh release`
+mode (a prebuilt tarball) would NOT work on `t4g` until that workflow
+gains an ARM target — moot today since `source` is the only option,
+but a real, documented limitation for later, not silently glossed
+over. `t3.small` is the direct x86_64 fallback if that distinction
+isn't wanted. 2GB RAM is less than the original Hetzner CPX11
+recommendation's ~4GB class — flagged explicitly rather than silently
+substituted; this workload (SQLite, a handful of wallet signers, a few
+WS connections) has no obvious reason to need more, but actual memory
+use after the first deploy should be watched, not assumed fine. EC2
+also bills a `gp3` EBS root volume separately from compute — a real
+cost line Hetzner's bundled pricing didn't have (~$1.60/mo for 20GB).
 
-Alternatives considered and why Ashburn/Hetzner won: DigitalOcean's
-closest East Coast presence is NYC (measurably farther from Ashburn's
-interconnection density than Hetzner's own Ashburn DC); Vultr's
-closest is New Jersey, similarly farther; AWS `us-east-1` directly
-would be the tightest possible proximity but at meaningfully higher
-cost and operational complexity (IAM, VPC, security groups) for a
-single always-on process that needs none of that. Full recommendation
-and the step-by-step provisioning checklist live in `DEPLOY.md`.
+**AWS's networking model needed real, checked additions to the
+provisioning checklist, not just a button-label swap** — confirmed by
+reading through the actual EC2 launch flow, not assumed identical to
+Hetzner's: an explicit region-selector check (AWS remembers your last
+region per browser/account, which may not default to `us-east-1` —
+launching in the wrong region would silently defeat the entire
+recommendation with no error), a Security Group with one inbound SSH
+rule restricted to the operator's IP (AWS defaults to deny-all inbound,
+unlike Hetzner; no other port is needed — the bot still binds
+`127.0.0.1` only, unchanged by any of this), and an EC2 key pair
+(`.pem`, downloaded once at launch) in place of Hetzner's SSH-key-upload
+flow. **Everything below the OS layer needed zero changes, confirmed
+by re-reading each file, not assumed** — `deploy/mint-sniper.service`,
+`deploy/deploy.sh`, `deploy/mint-sniper.env.example`, and the `ServeDir`
+fix below are all plain-Linux/systemd concerns with no cloud-provider
+awareness in them at all; this was a provider swap, not a
+re-architecture. Full checklist in `DEPLOY.md`.
+
+<details>
+<summary>Original Hetzner/Ashburn recommendation (superseded above, kept for the reasoning trail)</summary>
+
+Two real, independently-sourced signals converged on Ashburn: the same
+Alchemy/Robinhood evidence above, plus Ashburn, VA being the same
+metro area as AWS `us-east-1` itself — literally the densest
+interconnection point on the US East Coast — so a non-AWS VPS provider
+with a real Ashburn presence would get the shortest plausible physical
+path to both signals without AWS's markup for a workload that doesn't
+need it. Hetzner had a real, dedicated Ashburn datacenter with
+CPX-series shared-vCPU instances (~2 vCPU/4GB RAM class) sized
+correctly for this workload. Alternatives considered at the time:
+DigitalOcean's closest East Coast presence is NYC (farther from
+Ashburn's interconnection density); Vultr's closest is New Jersey,
+similarly farther; AWS `us-east-1` directly was noted even then as the
+tightest possible proximity, just judged higher-cost/complexity than
+needed — the operator's actual constraint (Hetzner unavailable) is
+what settled that tradeoff in AWS's favor, not a re-evaluation of the
+complexity judgment itself.
+
+</details>
 
 ### 15b — deploy preparation (done now, ready for handoff)
 
