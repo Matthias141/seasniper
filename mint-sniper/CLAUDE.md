@@ -1183,6 +1183,121 @@ sandbox's WS/TLS limitation) before it can inform that decision at
 all — proposing colocation to fix a gap that might be substantially a
 detection-method artifact would be solving the wrong problem.
 
+## Live infra validation + colocation decision (step 15)
+
+Every prior step ran either in this coding sandbox or against testnets
+from it — nothing has run anywhere else yet, and gap #11 (WS transport
+blocked by the sandbox's own TLS-interception proxy) has shadowed every
+report since step 5 with a "should work outside this sandbox" caveat.
+Step 15 is split explicitly around what this session can and can't do:
+15a/15b are research and preparation, completed now; 15c-15e need a real
+VPS the operator provisions — no VPS account or credentials exist in
+this session, same reason step 10.5's Cloudflare API token had to come
+from the operator directly. **15c-15e have not started as of this
+writing** — this section will be updated once the operator confirms the
+VPS is live.
+
+### 15a — VPS provider + region recommendation
+
+**Hetzner Cloud, Ashburn (US East, "ash") region, CPX11 or equivalent
+small shared-vCPU instance (~2 vCPU/4GB RAM class).** Two real,
+independently-sourced signals converge on Ashburn, not assumed from
+habit:
+- Alchemy — a named Robinhood Chain infra partner — has its own status
+  history naming "US East" as a real serving region for chain traffic
+  (a July 2026 Hyperliquid latency incident was explicitly scoped to
+  "US East region" in Alchemy's own status reporting), not just a
+  generic multi-region claim.
+- Robinhood's own production stack visibly depends on AWS `us-east-1` —
+  it was among the services affected by the October 2025 `us-east-1`
+  outage. Robinhood operates Robinhood Chain's sequencer directly (a
+  single Arbitrum-Orbit sequencer, confirmed via Robinhood's own docs);
+  the most likely place for it to live is the same region as the rest
+  of Robinhood's AWS footprint, not a separate one — inference, not a
+  confirmed fact from Robinhood's own docs, stated as such.
+
+Ashburn, VA is the same metro area as AWS `us-east-1` itself — literally
+the densest interconnection point on the US East Coast — so a
+non-AWS VPS provider with a real Ashburn presence gets the shortest
+plausible physical path to both signals above without paying AWS's
+markup for a workload that doesn't need it. Hetzner confirmed to have a
+real, dedicated Ashburn datacenter (not just US-adjacent) with
+CPX-series shared-vCPU instances sized correctly for this workload:
+SQLite, a handful of concurrent wallet signers, a few WS connections —
+not compute-heavy, so a larger instance would be pure waste. Sized
+against the actual workload, not over-provisioned on the theory that
+"a trading bot probably needs more."
+
+Alternatives considered and why Ashburn/Hetzner won: DigitalOcean's
+closest East Coast presence is NYC (measurably farther from Ashburn's
+interconnection density than Hetzner's own Ashburn DC); Vultr's
+closest is New Jersey, similarly farther; AWS `us-east-1` directly
+would be the tightest possible proximity but at meaningfully higher
+cost and operational complexity (IAM, VPC, security groups) for a
+single always-on process that needs none of that. Full recommendation
+and the step-by-step provisioning checklist live in `DEPLOY.md`.
+
+### 15b — deploy preparation (done now, ready for handoff)
+
+- `deploy/mint-sniper.service` — systemd unit. Dedicated unprivileged
+  `mint-sniper` system user (never root), `Restart=on-failure`,
+  secrets loaded from a 0600 `EnvironmentFile` (never inline in the
+  unit — unit files under `/etc/systemd/system` are typically
+  world-readable, same "secrets never touch a loosely-permissioned
+  file" standard `config.toml`/`.sniper-token`/`identity.db` already
+  get).
+- `deploy/mint-sniper.env.example` — template for that env file,
+  matching `config.toml`'s existing `private_key_env`-name-not-value
+  convention exactly.
+- `deploy/deploy.sh` — idempotent; supports building from source
+  (`git clone`/`pull` + `cargo build --release` + `npm run build`, the
+  only real option as of this writing) or from a GitHub release
+  tarball (`deploy.sh release` — works once step 7d's workflow has
+  actually produced one; no `v*` tag has been pushed yet, checked
+  directly against the repo's tag list, not assumed). Never touches
+  `config.toml`, the env file, or the identity DB — a redeploy only
+  ever rebuilds code.
+- **Found and fixed a real gap while preparing this, not a
+  hypothetical one:** `ui/README.md`'s "Prod" section had described
+  `tower_http::services::ServeDir` serving `ui/dist` as the plan since
+  before step 10, but it was never actually wired into `api.rs`'s
+  router — confirmed by reading the code, not the docs. A deploy
+  script written against the documented plan would have shipped a
+  binary with no way to serve the UI at all on a real VPS. Fixed in
+  `api.rs`'s `router()`: `ServeDir` with an `index.html` fallback (this
+  app has no client-side router — confirmed, not assumed — so the
+  fallback exists purely for PWA reload-to-a-cached-path safety),
+  mounted outside `require_token_or_session` on purpose — the static
+  shell has to load before the browser can even call `GET /api/token`,
+  so auth applies to the API calls the shell makes, never to the shell
+  itself. `README.md`'s stale "the API has no auth" security note
+  (accurate before step 7b, false since) and its Tailscale/SSH-only
+  reachability advice (predating step 10.5's Cloudflare Tunnel option)
+  were also found stale during this same cross-check and corrected.
+- Release tarball note: `release.yml` names the UI directory `ui-dist`
+  inside the archive; the binary expects `ui/dist` relative to its
+  CWD. Reconciled in `deploy.sh`'s `release` mode rather than editing
+  `release.yml` itself, since changing that workflow would need
+  re-verification by actually cutting a tag — out of scope for this
+  step.
+
+### 15c-15e — gated behind real VPS provisioning
+
+Not started. Once the operator confirms a VPS is live and the bot is
+deployed on it (`DEPLOY.md`), this section will be replaced with: real
+confirmation that `subscribe_blocks`/`subscribe_full_pending_transactions`/
+14a's PUSH path connect cleanly outside this sandbox's TLS limitation
+(closing gap #11 for real, with actual evidence — a connected
+subscription, a real detected trigger — not "should work now"); a
+re-run of 14b's benchmark methodology with PUSH actually engaged; and a
+final, per-metric colocation recommendation — send→ack's ~22ms gap
+already has a plausible proximity explanation from 14b that this step
+should either confirm or correct with real numbers from an
+actually-well-placed host; dispatch→inclusion's verdict depends
+entirely on numbers that don't exist yet, per 14b's own explicit
+gating (don't propose self-hosting a node for a gap that might still be
+a detection-method artifact until PUSH is validated live).
+
 ## Before touching a real mint
 
 1. Confirm the target contract's `mint()` isn't merkle-allowlist gated —

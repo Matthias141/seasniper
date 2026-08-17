@@ -7,7 +7,9 @@ the numbered steps in order; each is written to be done, not pondered.
 
 Cross-reference: `CLAUDE.md`'s "Known gaps" section for what's unverified,
 `ui/README.md`'s "Security model" section for exactly what the API token
-does and doesn't protect against.
+does and doesn't protect against, `DEPLOY.md` (step 15) for the first-time
+VPS setup checklist — this file is for when something's already running
+and something's gone wrong, not for standing it up in the first place.
 
 ---
 

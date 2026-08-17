@@ -25,10 +25,19 @@ setup needed.
 cd ui && npm run build
 ```
 
-Outputs to `ui/dist/`. Point `tower_http::services::ServeDir` at that
-directory from the Rust binary (add a fallback route in `api.rs`'s router)
-so one process serves both the control API and the installable PWA — no
-second server, one less network hop between you and the fire button.
+Outputs to `ui/dist/`. `api.rs`'s router serves it directly via
+`tower_http::services::ServeDir` as a fallback (step 15b — this was
+described as the plan since before step 10 but not actually wired up
+until preparing this repo's first real off-sandbox deploy; found and
+fixed as part of that, not left as a stale TODO) — one process serves
+both the control API and the installable PWA, no second server, one
+less network hop between you and the fire button. The path is relative
+to the process's working directory (`ui/dist`) — see `DEPLOY.md` for
+where that resolves to on a real deploy. This route sits outside the
+auth gate described below: the static shell has to be loadable before
+the browser can even call `GET /api/token` or check session state, so
+auth applies to the API calls the shell makes, never to the shell
+itself.
 
 Install as a PWA from the browser's "Install app" prompt (or Add to Home
 Screen on mobile) once served over `https://` or `localhost` — service

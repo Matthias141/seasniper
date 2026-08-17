@@ -134,6 +134,29 @@ pub fn router(state: SharedState, google_oauth_redirect_url: &str) -> Router {
                 .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::AUTHORIZATION]),
         )
         .with_state(state)
+        // STEP 15b — ui/README.md's "Prod" section has described this as
+        // the plan since before step 10, but it was never actually wired
+        // up until now (found while preparing this repo's first-ever
+        // real off-sandbox deploy — a real gap, not a hypothetical one,
+        // since a deploy script assuming this worked would have left the
+        // operator with no way to serve the UI at all). `ServeDir` for
+        // static assets, falling back to `index.html` for anything it
+        // doesn't recognize — this app has no client-side router (no
+        // react-router — confirmed by checking, not assumed) so that
+        // fallback exists purely for PWA reload-to-a-cached-path safety,
+        // not because multiple real routes need it. Deliberately OUTSIDE
+        // `require_token_or_session`: the static shell (HTML/JS/CSS) must
+        // be loadable BEFORE the browser can call `GET /api/token` or
+        // check session state at all — auth applies to the API calls the
+        // shell makes, never to the shell itself, same boundary
+        // `AuthGate` in App.tsx already assumes client-side. Path is
+        // relative to CWD ("ui/dist"), same convention as config.toml/
+        // .sniper-token/identity.db — the binary must be run from the
+        // repo root, per RUNBOOK.md and the step 15b deploy checklist.
+        .fallback_service(
+            tower_http::services::ServeDir::new("ui/dist")
+                .fallback(tower_http::services::ServeFile::new("ui/dist/index.html")),
+        )
 }
 
 /// The one unauthenticated route. Returns the local bearer token so the

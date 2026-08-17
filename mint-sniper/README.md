@@ -64,12 +64,20 @@ cargo run                 # terminal 1 — bot + API on :4117
 cd ui && npm install && npm run dev   # terminal 2 — PWA on :5173
 ```
 
-Security note: the API has no auth and binds to loopback only on purpose.
-Fine for "this runs on my own machine." If you ever run this on a VPS to
-get better RPC latency, put it behind a tunnel (Tailscale, SSH port
-forward) rather than exposing 4117 to the internet — there is nothing
-stopping an unauthenticated caller from rewriting the mint target or
-firing your wallets.
+Security note: this has changed since step 7b — the API is no longer
+unauthenticated. Every route requires either a local bearer token (step
+7b, the default when identity isn't configured) or a real per-identity
+session (Google Sign-In + TOTP + WebAuthn, step 10) — see
+`ui/README.md`'s "Security model" section for the exact boundary either
+mode does and doesn't protect. It still binds to `127.0.0.1` only,
+unconditionally, regardless of auth mode or where it's deployed — the
+token/session model narrows who can act once a request arrives, it was
+never a substitute for not exposing the port directly. As of step 15
+this bot runs on a real VPS for the first time (see `DEPLOY.md`) to get
+better RPC latency; reaching it from elsewhere goes through Tailscale
+or a Cloudflare Tunnel + Access (step 10.5, see `ui/README.md`'s
+"Reaching this from your phone" section), never by exposing 4117
+directly to the internet.
 
 ## Mint modes
 
