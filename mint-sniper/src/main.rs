@@ -15,6 +15,7 @@ mod copymint;
 mod db;
 mod executor;
 mod identity;
+mod inclusion;
 mod opensea;
 mod seadrop;
 mod state;
@@ -463,6 +464,20 @@ async fn control_loop(
     // never be paired with a fresh prepare, or vice versa.
     let mut warmed_providers: Vec<executor::HttpProvider> = Vec::new();
     let mut prepared_fire: Option<executor::PreparedFire> = None;
+    // STEP 14a — established at Arm time, same lifecycle as
+    // warmed_providers and for the same reason: establishing a WS
+    // subscription takes up to inclusion::establish_block_ticker's own
+    // 5s connect ceiling, which MUST happen ahead of the trigger, not at
+    // fire time — adding up to 5s of synchronous latency to every single
+    // fire would defeat the entire point of this file's prepare/fire
+    // split. `None` means the WS path is unavailable (expected in this
+    // sandbox specifically, see gap #11/inclusion.rs's own doc comment)
+    // and every fire_prepared call falls back to HTTP polling instead —
+    // that fallback decision is made once here, not re-attempted per
+    // fire. Cleared on Disarm/after-firing alongside warmed_providers so
+    // a stale subscription from a previous arm session is never reused
+    // across a re-arm.
+    let mut block_ticker: Option<inclusion::BlockTicker> = None;
 
     while let Some(msg) = control_rx.recv().await {
         match msg {
@@ -478,6 +493,23 @@ async fn control_loop(
                 // endpoint has had its TCP/TLS handshake done at least once
                 // before we're relying on it, not at broadcast time.
                 warmed_providers = executor::warm_connections(&cfg, &state.bus).await;
+                // STEP 14a — same "pay this cost now, not at fire time"
+                // principle as the line above. See block_ticker's own
+                // declaration comment for why this can't be deferred to
+                // fire_prepared itself.
+                block_ticker = inclusion::establish_block_ticker(&cfg.ws_rpc_url).await;
+                bus::log(
+                    &state.bus,
+                    "info",
+                    format!(
+                        "inclusion detection: {} for this arm session",
+                        if block_ticker.is_some() {
+                            "WS push path established"
+                        } else {
+                            "WS push path unavailable, using HTTP poll fallback"
+                        }
+                    ),
+                );
                 prepared_fire = None;
 
                 state.armed.store(true, Ordering::Relaxed);
@@ -737,6 +769,7 @@ async fn control_loop(
                 }
                 prepared_fire = None;
                 warmed_providers.clear();
+                block_ticker = None; // drops the watch::Sender's clone; the ticker task exits once every receiver is gone
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
                 bus::log(&state.bus, "warn", "disarmed");
@@ -760,7 +793,7 @@ async fn control_loop(
                     // one place next_nonce advances (see prepare_fire's doc
                     // comment for why it doesn't advance on its own).
                     advance_nonces(&mut wallets, &pf.wallets);
-                    executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus, trigger_detected_at).await
+                    executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus, trigger_detected_at, block_ticker.clone()).await
                 } else {
                     // Manual fire (UI "Fire Now") without a prior arm, or a
                     // prepare that failed above — fall back to signing right
@@ -778,6 +811,17 @@ async fn control_loop(
                     } else {
                         warmed_providers.clone()
                     };
+                    // STEP 14a — reuse an already-established arm-time
+                    // ticker if one exists (matches warmed_providers'
+                    // reuse just above); only pay establish_block_ticker's
+                    // own up-to-5s connect cost here, in this
+                    // already-known-slower fallback path, if this fire
+                    // never went through Arm at all.
+                    let ticker_for_fire = if block_ticker.is_some() {
+                        block_ticker.clone()
+                    } else {
+                        inclusion::establish_block_ticker(&cfg.ws_rpc_url).await
+                    };
                     match executor::prepare_fire(
                         &cfg,
                         &wallets,
@@ -791,7 +835,7 @@ async fn control_loop(
                     {
                         Ok(w) => {
                             advance_nonces(&mut wallets, &w);
-                            executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at).await
+                            executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at, ticker_for_fire).await
                         }
                         Err(e) => Err(e),
                     }
@@ -816,6 +860,7 @@ async fn control_loop(
                 }
                 prepared_fire = None;
                 warmed_providers.clear();
+                block_ticker = None;
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
             }
@@ -840,6 +885,13 @@ async fn control_loop(
                 } else {
                     warmed_providers.clone()
                 };
+                // STEP 14a — same reuse-if-armed, establish-fresh-if-not
+                // logic as FireNow's fallback path above.
+                let ticker_for_fire = if block_ticker.is_some() {
+                    block_ticker.clone()
+                } else {
+                    inclusion::establish_block_ticker(&cfg.ws_rpc_url).await
+                };
 
                 match executor::prepare_fire(
                     &cfg,
@@ -854,7 +906,7 @@ async fn control_loop(
                 {
                     Ok(w) => {
                         advance_nonces(&mut wallets, &w);
-                        if let Err(e) = executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at).await {
+                        if let Err(e) = executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at, ticker_for_fire).await {
                             bus::log(&state.bus, "error", format!("copymint fire sequence error: {e:#}"));
                         }
                     }
@@ -878,6 +930,7 @@ async fn control_loop(
                 }
                 prepared_fire = None;
                 warmed_providers.clear();
+                block_ticker = None; // same conservative "treat like a re-arm" cleanup warmed_providers already gets
                 let was_armed = state.armed.swap(false, Ordering::Relaxed);
                 if was_armed {
                     let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });

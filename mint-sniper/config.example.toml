@@ -11,6 +11,21 @@ http_rpc_urls = [
   "https://mainnet.infura.io/v3/YOUR_KEY",
 ]
 
+# STEP 14a — only sizes the HTTP-fallback poll interval
+# inclusion::wait_for_receipt uses when it can't establish a WS push
+# subscription for post-fire receipt detection. Default (12000) matches
+# mainnet's ~12s blocks; set this to the REAL block time of whatever
+# chain you're targeting, e.g. 100 for Robinhood Chain (confirmed via
+# real consecutive block timestamps, step 13d/14b) — see CLAUDE.md's
+# step 14 section. Does NOT affect trigger_mode = "poll_state" (step
+# 13c), which reacts to every block push unconditionally regardless of
+# this value.
+block_time_ms = 12000
+# How long inclusion::wait_for_receipt waits for a fired tx's receipt
+# (push or HTTP-fallback poll) before reporting a timed-out result
+# instead of hanging indefinitely. Must be >= block_time_ms.
+inclusion_timeout_ms = 30000
+
 # "custom" (arbitrary project mint(), config below) or "seadrop" (fixed
 # ISeaDrop.mintPublic ABI — see src/seadrop.rs, and the seadrop-mode
 # example commented out at the bottom of this file).
@@ -110,6 +125,13 @@ private_key_env = "SNIPER_PK_3"
 # http_rpc_urls = ["https://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY"]
 # Faucet: https://faucet.testnet.chain.robinhood.com
 # Explorer: https://explorer.testnet.chain.robinhood.com
+#
+# STEP 14a/14b — also set block_time_ms (above) to Robinhood Chain's
+# real observed block time, not the mainnet default: measured directly
+# from consecutive block timestamps during step 14b's benchmark, not
+# just the documented ~100ms figure — see CLAUDE.md's step 14 section
+# for the exact measured value.
+# block_time_ms = 100
 
 # --- Copymint (step 6) — watch tracked wallets for SeaDrop mintPublic
 # activity and mint the same collection ourselves. SeaDrop-only, always

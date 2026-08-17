@@ -14,6 +14,32 @@ pub struct Config {
     pub ws_rpc_url: String,
     pub http_rpc_urls: Vec<String>,
 
+    /// STEP 14a — the configured chain's expected block time. Used ONLY
+    /// to size `inclusion::wait_for_receipt`'s HTTP-polling fallback
+    /// interval when the WS push path can't be established — never
+    /// assumed to be mainnet's ~12s, which step 13c/14a both found is
+    /// badly wrong for a ~100ms-block chain like Robinhood. Defaults to
+    /// 12000 (mainnet) for backward compatibility with an existing
+    /// config.toml that predates this field; set this explicitly for any
+    /// non-mainnet chain. Does NOT affect `run_state_poll_watcher` (step
+    /// 13c) at all — that loop reacts to real block-arrival pushes over
+    /// WS unconditionally and was deliberately left untouched by 14a; see
+    /// that function's own doc comment for why throttling it would be
+    /// wrong regardless of this value.
+    #[serde(default = "default_block_time_ms")]
+    pub block_time_ms: u64,
+    /// STEP 14a — hard ceiling on how long `inclusion::wait_for_receipt`
+    /// waits for a fired tx's receipt (push or poll path, either one)
+    /// before reporting a distinct timed-out result instead of hanging
+    /// indefinitely. A tx that's genuinely stuck (underpriced, stuck
+    /// mempool, chain congestion) must eventually surface as "we don't
+    /// know" rather than block that wallet's fire-completion forever.
+    /// Defaults to 30000 (30s) — generous relative to any block time this
+    /// codebase currently targets (mainnet's ~12s to Robinhood's ~100ms),
+    /// while still bounded.
+    #[serde(default = "default_inclusion_timeout_ms")]
+    pub inclusion_timeout_ms: u64,
+
     /// "custom" (default — arbitrary project mint() via mint_fn_signature)
     /// or "seadrop" (fixed ISeaDrop.mintPublic ABI, see src/seadrop.rs).
     #[serde(default = "default_mint_mode")]
@@ -164,6 +190,12 @@ fn default_quantity() -> u64 {
 fn default_copymint_auto_fire_free() -> bool {
     true
 }
+fn default_block_time_ms() -> u64 {
+    12_000
+}
+fn default_inclusion_timeout_ms() -> u64 {
+    30_000
+}
 
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
@@ -204,6 +236,34 @@ impl Config {
             anyhow::bail!(
                 "max_priority_fee_gwei_cap must be non-negative, got {}",
                 self.max_priority_fee_gwei_cap
+            );
+        }
+
+        // STEP 14a — 0 would make the HTTP-fallback poll loop in
+        // inclusion::wait_for_receipt spin with no delay at all, hammering
+        // the RPC; an implausibly large value would make the fallback
+        // path pointlessly slow to notice a fast chain's inclusion. Same
+        // "catch a bad shape at startup/save time" principle as every
+        // other check here.
+        if self.block_time_ms == 0 {
+            anyhow::bail!("block_time_ms must be positive (it sizes the HTTP-fallback inclusion-poll interval)");
+        }
+        if self.block_time_ms > 120_000 {
+            anyhow::bail!(
+                "block_time_ms ({}) is implausibly large — check you didn't paste a \
+                 seconds value into a milliseconds field",
+                self.block_time_ms
+            );
+        }
+        if self.inclusion_timeout_ms == 0 {
+            anyhow::bail!("inclusion_timeout_ms must be positive — 0 would time out before ever checking a receipt");
+        }
+        if self.inclusion_timeout_ms < self.block_time_ms {
+            anyhow::bail!(
+                "inclusion_timeout_ms ({}) is shorter than block_time_ms ({}) — this would \
+                 time out before the fallback poll loop could ever check even once",
+                self.inclusion_timeout_ms,
+                self.block_time_ms
             );
         }
 
@@ -308,6 +368,8 @@ pub(crate) fn test_config() -> Config {
     Config {
             ws_rpc_url: "wss://eth-mainnet.g.alchemy.com/v2/KEY".to_string(),
             http_rpc_urls: vec!["https://eth-mainnet.g.alchemy.com/v2/KEY".to_string()],
+            block_time_ms: default_block_time_ms(),
+            inclusion_timeout_ms: default_inclusion_timeout_ms(),
             mint_mode: default_mint_mode(),
             contract_address: "0x000000000000000000000000000000000000dEaD".to_string(),
             mint_fn_signature: "mint(uint256)".to_string(),
@@ -381,6 +443,45 @@ mod tests {
     fn rejects_negative_max_priority_fee_cap() {
         let mut cfg = test_config();
         cfg.max_priority_fee_gwei_cap = -0.5;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_zero_block_time_ms() {
+        let mut cfg = test_config();
+        cfg.block_time_ms = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_implausibly_large_block_time_ms() {
+        let mut cfg = test_config();
+        cfg.block_time_ms = 121_000; // looks like a pasted-seconds value
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_a_fast_chains_block_time_ms() {
+        // Robinhood Chain's real ~100ms block time (step 13d) must not
+        // trip the "implausibly large" ceiling meant for the OPPOSITE
+        // mistake (seconds pasted into a milliseconds field).
+        let mut cfg = test_config();
+        cfg.block_time_ms = 100;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_inclusion_timeout_ms() {
+        let mut cfg = test_config();
+        cfg.inclusion_timeout_ms = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_inclusion_timeout_shorter_than_block_time() {
+        let mut cfg = test_config();
+        cfg.block_time_ms = 12_000;
+        cfg.inclusion_timeout_ms = 5_000;
         assert!(cfg.validate().is_err());
     }
 

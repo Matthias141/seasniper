@@ -241,18 +241,56 @@ pub async fn prepare_fire(
 /// Robinhood Chain figures (send→ack p50 117ms, mintDuration p50 136ms —
 /// see CLAUDE.md's step 13 section), not a mainnet number with nothing
 /// to compare it to.
+/// STEP 14a — one per-provider broadcast attempt's outcome, once it's
+/// gotten far enough to know send_to_ack_ms (i.e. `send_raw_transaction`
+/// itself succeeded). Kept distinct from a plain `Err` (which means the
+/// broadcast itself was rejected/never went out) so `fire_prepared` can
+/// tell "definitely never happened" apart from "happened, but we
+/// couldn't confirm it in time" — two states with very different
+/// operational meaning that must not collapse into the same generic
+/// failure bucket.
+enum SendAttemptOutcome {
+    // Boxed for the same reason as inclusion::InclusionOutcome's own
+    // Included variant — clippy's large_enum_variant under CI's real
+    // `-D warnings`, confirmed live, not just plain `cargo clippy`.
+    Included {
+        receipt: Box<TransactionReceipt>,
+        send_to_ack_ms: u64,
+        dispatch_to_inclusion_ms: u64,
+        method: &'static str,
+    },
+    TimedOut {
+        send_to_ack_ms: u64,
+        method: &'static str,
+    },
+}
+
 pub async fn fire_prepared(
     cfg: &Config,
     prepared: &[PreparedWallet],
     providers: &[HttpProvider],
     bus: &EventBus,
     trigger_detected_at: std::time::Instant,
+    block_ticker: Option<crate::inclusion::BlockTicker>,
 ) -> Result<()> {
     let _ = bus.send(ServerEvent::TriggerFired { manual: false });
 
     if providers.is_empty() {
         anyhow::bail!("no warmed RPC providers to broadcast to");
     }
+
+    // STEP 14a — sized from config, not hardcoded; see Config::block_time_ms/
+    // inclusion_timeout_ms's own doc comments. `block_ticker` (established
+    // once at Arm time by main.rs's control_loop — see its own doc comment
+    // for why NOT here, at fire time) selects PUSH when `Some`, HTTP-poll
+    // fallback at `poll_interval` when `None`.
+    let poll_interval = std::time::Duration::from_millis(cfg.block_time_ms);
+    let inclusion_timeout = std::time::Duration::from_millis(cfg.inclusion_timeout_ms);
+    // Captured as an owned value (not `cfg` itself) so it can move into
+    // the 'static-bound `tokio::spawn`ed tasks below — `cfg: &Config`
+    // only lives for this function call, `cfg.inclusion_timeout_ms: u64`
+    // is Copy and has no such lifetime constraint.
+    let inclusion_timeout_ms = cfg.inclusion_timeout_ms;
 
     let mut handles = Vec::with_capacity(prepared.len());
 
@@ -263,6 +301,7 @@ pub async fn fire_prepared(
         let prepared_at = pw.prepared_at;
         let providers = providers.to_vec(); // RootProvider is a cheap Arc-clone — same pooled connections
         let bus = bus.clone();
+        let block_ticker = block_ticker.clone();
 
         let jitter_ms: u64 = rand::thread_rng().gen_range(cfg.jitter_ms_min..=cfg.jitter_ms_max);
 
@@ -298,27 +337,51 @@ pub async fn fire_prepared(
             // is added to the actual broadcast/dispatch step itself.
             let sends = providers.iter().enumerate().map(|(i, provider)| {
                 let raw_tx = raw_tx.clone();
+                let block_ticker = block_ticker.clone();
                 async move {
                     // Inner block explicitly typed as anyhow::Result so `?`
-                    // has one concrete error type to convert both
-                    // send_raw_transaction's and get_receipt()'s errors
-                    // into; the index is attached after, on the way out,
-                    // since neither of those error types otherwise unify
-                    // with (usize, anyhow::Error) directly.
+                    // has one concrete error type to convert
+                    // send_raw_transaction's errors into; the index is
+                    // attached after, on the way out, since that error
+                    // type otherwise doesn't unify with
+                    // (usize, anyhow::Error) directly.
                     //
                     // STEP 13e: send_to_ack_ms is captured the instant
                     // send_raw_transaction itself returns — the RPC
                     // accepting the raw bytes and handing back a pending-tx
                     // handle, NOT inclusion — this is the number directly
                     // comparable to MintDash's published "send→ack" figure.
-                    // Captured OUTSIDE the `?` on get_receipt() below so a
-                    // slow/failed receipt wait never loses it.
-                    let result: Result<(TransactionReceipt, u64, u64), anyhow::Error> = async {
-                        let pending = provider.send_raw_transaction(&raw_tx).await?;
+                    //
+                    // STEP 14a: inclusion detection no longer uses
+                    // `PendingTransactionBuilder::get_receipt()` (whose
+                    // internal poll interval, not real inclusion speed, is
+                    // what step 13f found was dominating
+                    // dispatch_to_inclusion_ms) — `inclusion::wait_for_receipt`
+                    // instead, PUSH (block-arrival driven) when
+                    // `block_ticker` is `Some`, HTTP-poll fallback
+                    // otherwise. See inclusion.rs's own doc comment for
+                    // the full design and why it's a separate module from
+                    // watcher.rs's per-block mint-state check (step 13c).
+                    let result: Result<SendAttemptOutcome, anyhow::Error> = async {
+                        let _pending = provider.send_raw_transaction(&raw_tx).await?;
                         let send_to_ack_ms = dispatch_started.elapsed().as_millis() as u64;
-                        let receipt = pending.get_receipt().await?;
-                        let dispatch_to_inclusion_ms = dispatch_started.elapsed().as_millis() as u64;
-                        Ok((receipt, send_to_ack_ms, dispatch_to_inclusion_ms))
+                        match crate::inclusion::wait_for_receipt(
+                            provider,
+                            expected_hash,
+                            block_ticker,
+                            poll_interval,
+                            inclusion_timeout,
+                        )
+                        .await
+                        {
+                            crate::inclusion::InclusionOutcome::Included { receipt, method } => {
+                                let dispatch_to_inclusion_ms = dispatch_started.elapsed().as_millis() as u64;
+                                Ok(SendAttemptOutcome::Included { receipt, send_to_ack_ms, dispatch_to_inclusion_ms, method })
+                            }
+                            crate::inclusion::InclusionOutcome::TimedOut { method } => {
+                                Ok(SendAttemptOutcome::TimedOut { send_to_ack_ms, method })
+                            }
+                        }
                     }
                     .await;
                     result.map_err(|e| (i, e))
@@ -327,7 +390,17 @@ pub async fn fire_prepared(
 
             let results = join_all(sends).await;
 
-            if let Some((receipt, send_to_ack_ms, dispatch_to_inclusion_ms)) = results.iter().find_map(|r| r.as_ref().ok()) {
+            // Priority: any provider that actually got an Included receipt
+            // wins outright, regardless of whether other providers timed
+            // out or failed to broadcast at all.
+            let included = results.iter().find_map(|r| match r.as_ref().ok() {
+                Some(SendAttemptOutcome::Included { receipt, send_to_ack_ms, dispatch_to_inclusion_ms, method }) => {
+                    Some((receipt, *send_to_ack_ms, *dispatch_to_inclusion_ms, *method))
+                }
+                _ => None,
+            });
+
+            if let Some((receipt, send_to_ack_ms, dispatch_to_inclusion_ms, method)) = included {
                 let tx_hash = receipt.transaction_hash;
                 // The RPC's returned hash should always equal the hash
                 // computed at prepare time — raw_tx fully determines it,
@@ -340,15 +413,15 @@ pub async fn fire_prepared(
                 }
 
                 if receipt.status() {
-                    info!(%address, %tx_hash, send_to_ack_ms, dispatch_to_inclusion_ms, "mint confirmed");
+                    info!(%address, %tx_hash, send_to_ack_ms, dispatch_to_inclusion_ms, method, "mint confirmed");
                     let _ = bus.send(ServerEvent::MintResult {
                         address: format!("{address:#x}"),
                         success: true,
                         detail: format!("{tx_hash:#x}"),
                         trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
                         prepare_age_ms,
-                        send_to_ack_ms: Some(*send_to_ack_ms),
-                        dispatch_to_inclusion_ms: Some(*dispatch_to_inclusion_ms),
+                        send_to_ack_ms: Some(send_to_ack_ms),
+                        dispatch_to_inclusion_ms: Some(dispatch_to_inclusion_ms),
                     });
                 } else {
                     // Included, but reverted. Not a broadcast failure —
@@ -366,22 +439,48 @@ pub async fn fire_prepared(
                         receipt.block_number.map_or("?".to_string(), |b| b.to_string()),
                         receipt.gas_used,
                     );
-                    error!(%address, %tx_hash, "mint tx included but reverted");
+                    error!(%address, %tx_hash, method, "mint tx included but reverted");
                     let _ = bus.send(ServerEvent::MintResult {
                         address: format!("{address:#x}"),
                         success: false,
                         detail,
                         trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
                         prepare_age_ms,
-                        send_to_ack_ms: Some(*send_to_ack_ms),
-                        dispatch_to_inclusion_ms: Some(*dispatch_to_inclusion_ms),
+                        send_to_ack_ms: Some(send_to_ack_ms),
+                        dispatch_to_inclusion_ms: Some(dispatch_to_inclusion_ms),
                     });
                 }
+            } else if let Some((send_to_ack_ms, method)) = results.iter().find_map(|r| match r.as_ref().ok() {
+                Some(SendAttemptOutcome::TimedOut { send_to_ack_ms, method }) => Some((*send_to_ack_ms, *method)),
+                _ => None,
+            }) {
+                // STEP 14a — distinct from BOTH success and revert: at
+                // least one provider ack'd the broadcast (this tx really
+                // did go out), but no receipt showed up within
+                // Config::inclusion_timeout_ms via either detection path.
+                // This does NOT mean the tx failed — it may still confirm
+                // later — so it must never be conflated with "all RPC
+                // broadcasts failed" below, which means the tx never left
+                // this process at all.
+                let detail = format!(
+                    "inclusion not confirmed within {inclusion_timeout_ms}ms (detection method={method}) — \
+                     tx {expected_hash:#x} may still be pending; check a block explorer before assuming it failed"
+                );
+                tracing::warn!(%address, tx_hash = %expected_hash, method, timeout_ms = inclusion_timeout_ms, "inclusion detection timed out");
+                let _ = bus.send(ServerEvent::MintResult {
+                    address: format!("{address:#x}"),
+                    success: false,
+                    detail,
+                    trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
+                    prepare_age_ms,
+                    send_to_ack_ms: Some(send_to_ack_ms),
+                    dispatch_to_inclusion_ms: None, // never resolved — that's the whole point of this branch
+                });
             } else {
                 let detail = results
                     .iter()
                     .map(|r| match r {
-                        Ok(_) => unreachable!("handled by the find_map above"),
+                        Ok(_) => unreachable!("handled by the branches above"),
                         Err((i, e)) => format!("rpc[{i}]: {e}"),
                     })
                     .collect::<Vec<_>>()

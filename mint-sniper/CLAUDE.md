@@ -992,6 +992,197 @@ figures (send→ack p50 117ms, mintDuration p50 136ms):**
   conclusion of 13f is "we don't yet know how close we are on
   inclusion speed," not "we're roughly on par" or "we're far behind."
 
+**SUPERSEDED by step 14 (kept here, not deleted, so the before/after
+improvement stays visible).** Step 14 fixed the exact mechanism this
+section flagged as the open question (`get_receipt()`'s poll-interval
+artifact) and re-measured with a real n=15 distribution on both
+Robinhood Chain testnet and a Sepolia baseline. See "Fire-path
+inclusion detection + real benchmark (step 14)" below for the current
+numbers — the 236ms/7551ms single-attempt figures above are step 13d's
+original, now-historical result, left in place as the "before" side of
+that comparison.
+
+## Fire-path inclusion detection + real benchmark (step 14)
+
+Fixes the exact gap step 13f left open (`get_receipt()`'s internal poll
+interval, not real chain speed, dominating `dispatch_to_inclusion_ms`)
+and replaces 13f's single-attempt figures with a real n=15 distribution
+on two chains, benchmarked under the same methodology.
+
+### 14a — push-based inclusion detection
+
+New module `src/inclusion.rs`, deliberately separate from
+`watcher::run_state_poll_watcher` (step 13c) — that loop asks "has this
+drop's mint state flipped active" once per block, BEFORE dispatch;
+`inclusion.rs` asks "has THIS already-broadcast tx hash been included"
+once per block, AFTER dispatch. Different question, different timing,
+different caller — kept in separate files specifically so 13c's
+"don't throttle" reasoning (which is about the FIRST loop) is never
+mistakenly applied to or read as touching the second.
+
+**Two paths:** PUSH (primary) reuses `watcher.rs`'s own
+`subscribe_blocks()` call — one shared WS subscription per
+`fire_prepared` batch (not one per wallet, avoiding N redundant WS
+connections for N wallets), established at **Arm time**, not fire
+time. This placement is load-bearing: `establish_block_ticker` has its
+own 5s connect ceiling, and awaiting that AT FIRE TIME would add up to
+5s of synchronous latency to every single fire — directly defeating
+the entire point of this codebase's prepare/fire split. `main.rs`'s
+`control_loop` establishes it once in the `Arm` handler (same
+lifecycle as `warmed_providers`), and `fire_prepared` only ever
+receives an already-resolved `Option<BlockTicker>`.
+
+POLL (fallback) fires when the WS path can't be established — sized to
+`Config::block_time_ms` (new field, defaults to mainnet's 12000ms,
+must be set per-chain), not a fixed interval that only suited mainnet.
+Both paths share a `Config::inclusion_timeout_ms` ceiling (default
+30000ms); a tx that never gets included reports a `TimedOut` result —
+kept structurally distinct in `executor.rs`'s `SendAttemptOutcome` enum
+from both a confirmed success/revert AND a genuine broadcast failure,
+since "acked but unconfirmed" (may still land) and "never left this
+process" (never will) have very different operational meaning and must
+never collapse into the same generic error bucket.
+
+**Multi-wallet independence:** each wallet's own broadcast+detection
+task runs fully independently (existing per-wallet `tokio::spawn`
+structure, unchanged by 14a) — a slow wallet never gates a fast one's
+`MintResult`.
+
+**Regression check on revert-detection, done honestly.** No automated
+revert-detection test existed anywhere in this repo prior to 14a
+(checked directly, not assumed) — it was only ever verified live,
+during step 5's original Sepolia dry run. Attempted a fresh live revert
+test on the step 14b benchmark token (temporarily lowered its cap below
+the already-minted count) — this failed to exercise the actual code
+path: `eth_estimateGas` correctly predicted the revert and rejected the
+tx before broadcast, so `fire_prepared`'s `receipt.status()` check
+never ran in that attempt (confirmed via `audit.log` showing no
+`mint_result` event, and on-chain balance unchanged). Forcing a
+genuine "estimate succeeds, execution reverts" race needs precise
+timing between two competing transactions and wasn't achieved cleanly
+in this session. The regression argument that stands instead: the
+actual success/revert determination (`if receipt.status() { .. } else
+{ .. }`) is byte-for-byte unchanged by 14a's diff — the only thing that
+changed is which call supplies `receipt` (`inclusion::wait_for_receipt`
+now, `PendingTransactionBuilder::get_receipt()` before), never what's
+done with it afterward. All 30 successful fires across 14b's two
+benchmarks independently exercise and confirm the success half of that
+same unchanged check.
+
+Real request-level tests exist for `inclusion.rs`'s own new logic
+(`establish_block_ticker` fails fast on a bad URL, a `watch::channel`
+tick genuinely unblocks `changed()` across tasks) — 70 tests total,
+`cargo clippy --all-targets -- -D warnings` clean (caught and fixed a
+real `large_enum_variant` finding on both new `Included` variants,
+boxing `TransactionReceipt` — confirmed live under CI's actual flags,
+not the weaker plain `cargo clippy`).
+
+**Expected, not a defect:** live confirmation that the PUSH path itself
+engages (rather than always falling back to POLL) needs an environment
+without this sandbox's WS/TLS limitation (gap #11) — every live run in
+14b confirmed via its own log line
+(`inclusion detection: WS subscription unavailable, falling back to
+HTTP polling`) that POLL was what actually ran here, same inherited
+limitation as `poll_state`/`mempool_watch`/step 13d, not a new gap.
+
+### 14b — real benchmark: methodology, numbers, comparison
+
+**Benchmark tokens, deployed for real, not simulated.** `forge`
+couldn't be installed in this sandbox — `foundryup`'s GitHub release
+fetch returned 403 (this session's GitHub access is scoped to specific
+repos, not general API access; confirmed by testing with the session's
+own token, not assumed). Worked around it rather than skipping the
+deploy requirement: step 5's original `.testnet-work/seadrop/` checkout
+already had `ERC721SeaDrop` fully compiled (`out/ERC721SeaDrop.sol/
+ERC721SeaDrop.json`, real bytecode+ABI from that earlier `forge build`)
+sitting on disk from the original dry run. Installed `solc` via
+`py-solc-x` (pulls from `binaries.soliditylang.org`, not GitHub — a
+different, unblocked host) to confirm the toolchain independently, then
+deployed fresh, dedicated `ERC721SeaDrop` instances via `web3.py` +
+raw signed transactions (same account-management pattern as every
+other live test this session), reusing the already-compiled artifact —
+one per chain, separate from 13d's dry-run collection and from each
+other:
+- Robinhood Chain testnet: `0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9`
+- Sepolia: `0x6F49dDA46826448cdAf17597B117B66E87c1FC29`
+
+Both configured identically: free (`mintPrice = 0`), `restrictFeeRecipients
+= false`, `maxTotalMintableByWallet = 65535` (`uint16`'s max — the
+practical ceiling for "unlimited" here; comfortably above any planned
+attempt count), live for 7 days from deployment.
+
+**Robinhood Chain testnet's real block time, measured directly, not
+assumed from the ~100ms documented figure.** Block timestamps alone
+are only 1-second granular, too coarse on their own — averaged over
+1000 real consecutive blocks (`span_seconds / 1000`) for a stable
+figure: **~227ms**, meaningfully higher than the commonly-cited ~100ms.
+Reported as measured, not silently substituted — `block_time_ms = 227`
+is what the benchmark config actually used.
+
+**Real results, n=15 per chain, sequential fires from one funded
+wallet (same `.testnet-keys/wallet1` throughout), same bot binary,
+same methodology:**
+
+| Metric | Robinhood testnet (n=15) | Sepolia (n=15) |
+|---|---|---|
+| successes | 15/15 | 15/15 |
+| send→ack p50 | 139ms | 60ms |
+| send→ack p90 | 151ms | 62ms |
+| dispatch→inclusion p50 | 978ms | 12,184ms |
+| dispatch→inclusion p90 | 1,329ms | 24,247ms |
+
+Sepolia's dispatch→inclusion clusters almost exactly at one block
+(~12,180ms) for p50 and two blocks for the p90 stragglers (~24,240ms)
+— sanity-consistent with its real ~12s block time and a strong signal
+the pipeline is behaving correctly, not an artifact.
+
+**Compared against MintDash's published Robinhood figures (send→ack
+p50 117ms, mintDuration p50 136ms) AND against Robinhood's own measured
+227ms block-time floor, kept as two separate gaps on purpose — closing
+one doesn't imply anything about the other:**
+
+| | vs. MintDash (117/136ms) | vs. measured chain floor (227ms) |
+|---|---|---|
+| send→ack (139ms) | ~1.2x | n/a (floor doesn't apply to ack) |
+| dispatch→inclusion (978ms) | ~7.2x | ~4.3x |
+
+**14a's fix is a real, large, honestly-measured improvement** — 13f's
+single n=1 attempt was 7,551ms; the n=15 p50 here is 978ms, a ~7.7x
+reduction, entirely from correctly sizing the poll interval to the
+real chain, with zero change to broadcast or signing logic.
+
+**Is this now a fair comparison — same detection philosophy — even
+though absolute numbers still differ? Answered precisely, not rushed:**
+send→ack: **yes**, a fair comparison. Both this bot's number and
+MintDash's are measuring the same concept (RPC round-trip time to
+accept a broadcast), and the remaining ~22ms gap (139ms vs 117ms) is
+plausible and consistent with the RPC-provider-proximity explanation
+from @0xSvinci's thread (an uncolocated public testnet RPC from a cloud
+sandbox vs. MintDash's own colocated node) — this metric alone is
+reasonable evidence supporting a future infra/colocation step's case,
+*for this specific number*.
+
+dispatch→inclusion: **no, not yet a fair comparison**, and this is the
+answer that actually matters for scoping what comes next. The PUSH
+path never engaged in this sandbox (gap #11, expected) — every
+measurement here is still fundamentally POLL-based, just correctly
+sized now instead of badly oversized. MintDash's `mintDuration` almost
+certainly reflects a push/subscription-driven detection philosophy;
+this bot's 978ms number is entangled with its own poll-interval floor
+(227ms) stacked on top of however many real blocks inclusion actually
+takes — and 978ms / 227ms ≈ 4.3 poll cycles suggests real inclusion
+itself may be taking several blocks here, not one, which is a
+DIFFERENT thing from "our detection is slow." **This gap cannot be
+honestly attributed to RPC proximity/colocation** the way the send→ack
+gap can, because the detection METHOD itself, not just its network
+distance, is still different from MintDash's. Recommendation: an
+infra/colocation step's business case is well-supported for the
+send→ack number specifically; the dispatch→inclusion number needs the
+PUSH path actually validated live (in an environment without this
+sandbox's WS/TLS limitation) before it can inform that decision at
+all — proposing colocation to fix a gap that might be substantially a
+detection-method artifact would be solving the wrong problem.
+
 ## Before touching a real mint
 
 1. Confirm the target contract's `mint()` isn't merkle-allowlist gated —
