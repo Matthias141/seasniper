@@ -210,6 +210,14 @@ reached plus everywhere else.
    not `0.0.0.0` — cloudflared needs no inbound port opened on this
    machine at all, it makes an outbound connection to Cloudflare's edge.
 
+   On the actual VPS deploy (step 15/16), `deploy/setup-cloudflared.sh`
+   automates the commands above and installs cloudflared as a
+   persistent systemd service (`cloudflared tunnel run` as a one-off
+   foreground command, shown above, doesn't survive a reboot or a
+   dropped SSH session) — see that script's own header comment before
+   running it, same "operator runs this, not any automated session"
+   rule as `deploy/deploy.sh`.
+
 2. **Update `config.toml`:**
    ```toml
    google_oauth_redirect_url = "https://sniper.your-domain.com/auth/google/callback"

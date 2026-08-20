@@ -47,8 +47,14 @@ case "$MODE" in
       sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR/repo" pull --ff-only origin main
     fi
 
-    if ! command -v cargo &>/dev/null; then
-      echo "cargo not found — install the Rust toolchain first (see DEPLOY.md step 2)" >&2
+    # STEP 16 FINDING — do not use `command -v cargo` here: that checks
+    # THIS script's (root's) PATH, not $SERVICE_USER's, so it would pass
+    # even when mint-sniper genuinely can't see cargo at all (exactly
+    # the bug the first real deploy hit — installed under `ubuntu`'s
+    # 750-permission home, invisible to mint-sniper). Check as the user
+    # that will actually run the build instead.
+    if ! sudo -u "$SERVICE_USER" -H bash -c 'command -v cargo' &>/dev/null; then
+      echo "cargo not found for $SERVICE_USER — install the Rust toolchain FOR that user first (see DEPLOY.md step 2; do not install it as your own login user, see that section's step 16 note on why)" >&2
       exit 1
     fi
     if ! command -v npm &>/dev/null; then
@@ -57,7 +63,12 @@ case "$MODE" in
     fi
 
     echo "==> cargo build --release (this takes a few minutes on a small VPS)"
-    sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR/repo/mint-sniper' && cargo build --release"
+    # `-H` + explicitly sourcing cargo/env: a non-interactive `bash -c`
+    # does not source ~/.bashrc the way an interactive shell would, so
+    # PATH modifications rustup's installer made there would silently
+    # not apply here even with cargo correctly installed for this user —
+    # source it explicitly rather than depending on shell-profile timing.
+    sudo -u "$SERVICE_USER" -H bash -c "source \$HOME/.cargo/env && cd '$INSTALL_DIR/repo/mint-sniper' && cargo build --release"
 
     echo "==> npm ci && npm run build"
     sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR/repo/mint-sniper/ui' && npm ci && npm run build"

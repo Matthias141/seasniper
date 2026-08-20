@@ -113,28 +113,96 @@ labels.
 6. Launch, then note the instance's public IPv4 address (Console →
    Instances → your instance → "Public IPv4 address") and confirm SSH
    access: `ssh -i your-key.pem ubuntu@<public-ip>`.
-7. Point a DNS record at it if using step 10.5's Cloudflare Tunnel path
+7. **Verify the storage step actually took — don't trust the wizard,
+   check.** STEP 16 FINDING: this exact miss happened live on the
+   first real deploy — the wizard defaulted back to 8GB despite step 5
+   above, root filled to 100% partway through the build, and it needed
+   a live resize to recover. Before doing anything else on the box:
+   ```bash
+   df -h /
+   ```
+   Confirm the root filesystem shows ~20GB, not ~8GB. **If it shows
+   ~8GB, fix it now, before section 2** — resizing later after the
+   disk is already full is more disruptive than catching it here:
+   1. AWS Console → EC2 → Volumes → select the instance's root volume
+      → Actions → **Modify volume** → set size to 20 → Modify. Takes
+      effect within a few minutes; no reboot needed.
+   2. Back on the instance, grow the partition and filesystem to fill
+      the resized volume:
+      ```bash
+      sudo growpart /dev/nvme0n1 1   # device name may differ — check `lsblk` first
+      sudo resize2fs /dev/nvme0n1p1  # match the partition growpart just grew
+      ```
+   3. Re-run `df -h /` and confirm it now shows ~20GB before continuing.
+8. Point a DNS record at it if using step 10.5's Cloudflare Tunnel path
    (the tunnel needs no inbound port open — see `ui/README.md`'s
    Cloudflare section — but you'll still want SSH access directly for
    this deploy).
 
 ## 2. One-time OS setup (operator, on the VPS)
 
-```bash
-# Rust toolchain
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-source "$HOME/.cargo/env"
+**STEP 16 FINDING — read before running the old (broken) sequence.**
+The first real deploy installed Rust as the `ubuntu` login user
+(the natural result of running rustup's one-liner as yourself), which
+puts the toolchain in `~ubuntu/.cargo`. `ubuntu`'s home directory has
+default `750` permissions (`drwxr-x---`) — no other user, including
+`mint-sniper` (the account `deploy.sh` actually builds as), can even
+traverse into it. This surfaces as `cargo: command not found` under
+`sudo -u mint-sniper`, which reads exactly like Rust never installed —
+it did, just somewhere `mint-sniper` structurally cannot reach. Do NOT
+try to fix this by loosening `ubuntu`'s home permissions; install the
+toolchain for the right user from the start instead:
 
-# Node.js (for building ui/dist)
+```bash
+# 1. Create the mint-sniper system user NOW, not later — deploy.sh
+#    (section 3) creates it too if it doesn't exist yet, so running
+#    this here is not a duplicate step, it's doing it early on purpose
+#    so the Rust install below lands in the right home directory.
+sudo useradd --system --create-home --home-dir /opt/mint-sniper --shell /usr/sbin/nologin mint-sniper || true
+
+# 2. Rust toolchain — installed FOR mint-sniper, not for your own
+#    login user. `-H` sets HOME to mint-sniper's home for this command,
+#    so rustup lands the toolchain in /opt/mint-sniper/.cargo —
+#    exactly where deploy.sh's later `sudo -u mint-sniper cargo build`
+#    call will look for it, no cross-user permission problem possible.
+sudo -u mint-sniper -H bash -c \
+  "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"
+
+# Node.js (system-wide install via apt — no per-user issue here, unlike
+# Rust above; every user on the box can already see /usr/bin/npm)
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs git build-essential pkg-config libssl-dev
-
-# Tailscale (if using step 10.5's Tailscale-only path) or cloudflared
-# (if using the Cloudflare Tunnel + Access path) — see ui/README.md's
-# "Reaching this from your phone" section for which one and why, and
-# the exact cloudflared commands. Neither is required for the bot to
-# run; both are required for reaching it from your phone.
 ```
+
+**Swapfile — required on `t4g.small`, not optional.** STEP 16 FINDING:
+even with the Rust-install fix above, `cargo build --release` was
+killed outright by the kernel OOM killer (`signal: 9, SIGKILL`) on the
+first real deploy. This codebase's release profile deliberately uses
+LTO + `codegen-units=1` (not something to change just to dodge this —
+it's a real, intentional tradeoff for a sniper bot's binary), and LTO's
+link step spikes memory hard with no headroom left on `t4g.small`'s
+2GB RAM. A 4GB swapfile fixed it immediately — the next build attempt
+compiled clean in under 2 minutes. This is a harder requirement than
+DEPLOY.md's earlier "2GB is less than the ~4GB original class, watch
+memory usage" framing suggested — it's not a soft thing to monitor
+after the fact, the release build does not complete without this:
+
+```bash
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+# Persist across a reboot — without this line the swapfile is gone
+# (and the OOM kill comes back) the next time the instance restarts.
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+free -h   # confirm ~4G shows under the Swap row before moving on
+```
+
+Tailscale (if using step 10.5's Tailscale-only path) or cloudflared (if
+using the Cloudflare Tunnel + Access path — see `deploy/setup-cloudflared.sh`,
+step 16b, and `ui/README.md`'s "Reaching this from your phone" section
+for which one and why). Neither is required for the bot to run; both
+are required for reaching it from your phone.
 
 ## 3. Deploy the code
 

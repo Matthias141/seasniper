@@ -1345,6 +1345,91 @@ entirely on numbers that don't exist yet, per 14b's own explicit
 gating (don't propose self-hosting a node for a gap that might still be
 a detection-method artifact until PUSH is validated live).
 
+## Live first deploy — real findings (step 16)
+
+The operator's first real attempt to actually deploy onto the `t4g.small`
+EC2 instance step 15 recommended hit three real, live-confirmed
+problems, in this order — not hypothetical, not "might happen." Folded
+directly into `DEPLOY.md`'s checklist (not just noted here
+retrospectively) so a future deploy doesn't repeat them; documented
+here too as the reasoning trail.
+
+**1. `mint-sniper` couldn't see the Rust toolchain at all.** Installing
+Rust as the `ubuntu` login user (the natural result of running
+rustup's one-liner as yourself, which is what `DEPLOY.md`'s original
+section 2 said to do) puts the toolchain in `~ubuntu/.cargo` —
+`ubuntu`'s home directory has default `750` permissions
+(`drwxr-x---`), which blocks every other user, including
+`mint-sniper` (the account `deploy.sh` actually builds as), from even
+traversing into it. Surfaces as `cargo: command not found` under
+`sudo -u mint-sniper` — reads exactly like a failed install, not a
+permissions problem, which is why this is worth stating explicitly
+rather than trusting a future operator to diagnose it from the error
+message alone. Fixed in `DEPLOY.md` section 2: create the
+`mint-sniper` system user FIRST (before Rust, not after — deploy.sh's
+own idempotent `useradd` check makes doing this early harmless), then
+install Rust FOR that user (`sudo -u mint-sniper -H bash -c
+'curl ... | sh'`), landing the toolchain in `/opt/mint-sniper/.cargo`
+where `deploy.sh` actually looks for it. Also hardened `deploy.sh`
+itself: its cargo-found check now runs as `$SERVICE_USER` (not root —
+checking root's own PATH would have passed even with this exact bug
+present), and the build invocation explicitly sources
+`$HOME/.cargo/env` rather than relying on a non-interactive `bash -c`
+to have sourced `.bashrc` the way an interactive shell would.
+
+**2. The 20GB storage recommendation was already documented and still
+got missed live.** `DEPLOY.md`'s original section 1 step 5 already
+said to bump the root volume to 20GB — the recommendation existing
+wasn't enough to prevent the wizard defaulting back to 8GB and nobody
+catching it before launch. Root filled to 100% partway through
+re-copying the Rust toolchain while fixing problem #1. Fixed by
+turning the recommendation into a mandatory verification step
+(`df -h /`, confirm ~20GB, immediately after first SSH access, before
+anything else) with a documented live-recovery path (EBS Modify volume
+→ `growpart` → `resize2fs`, no instance restart needed) for exactly
+this miss happening anyway — a recommendation alone was proven
+live not to be sufficient.
+
+**3. `cargo build --release` was OOM-killed even after both fixes
+above.** This codebase's release profile deliberately uses LTO +
+`codegen-units=1` (a real, intentional tradeoff — not something to
+change to dodge this), and LTO's link step spikes memory hard with no
+headroom on `t4g.small`'s 2GB RAM — `signal: 9, SIGKILL` from the
+kernel OOM killer. A 4GB swapfile fixed it immediately (next attempt
+compiled clean in under 2 minutes). This supersedes step 15a's earlier
+"2GB is less than the ~4GB original recommendation, watch actual
+memory usage" framing — that undersold the real risk. It isn't a soft
+thing to monitor after the fact; without swap, the release build does
+not complete at all on this instance size. `DEPLOY.md` section 2 now
+makes a 4GB swapfile (with the `/etc/fstab` persistence line, so it
+survives a reboot) a mandatory, non-optional first-time-setup step on
+`t4g.small` specifically, not an optional performance tweak.
+
+**16b — `deploy/setup-cloudflared.sh`, prepared, not run.** Same
+division of labor as `deploy.sh` and the EC2 provisioning itself: this
+session has no Cloudflare account access, so the script is
+ready-to-hand-off, never executed here. Three explicit modes
+(`install` / `login-and-create` / `service`) matching which steps are
+scriptable (installing the apt package, writing the systemd service)
+versus which genuinely need the operator's own interactive browser
+auth (`cloudflared tunnel login`/`tunnel create` — no flag exists to
+skip this, and the script says so rather than guessing at one). Points
+at `127.0.0.1:4117` — confirmed directly against `main.rs`'s
+`API_BIND_ADDR` before writing the script, not assumed unchanged since
+step 7b. Installs cloudflared as a persistent systemd service (`cloudflared
+service install`) rather than `ui/README.md`'s original foreground
+`cloudflared tunnel run` walkthrough, which doesn't survive a reboot or
+a dropped SSH session — that walkthrough now points at this script for
+the actual VPS deploy. Does NOT create the Cloudflare Access
+application/policy or touch the Cloudflare API token — both stay
+manual dashboard steps under the operator's own account, per step
+10.5c's existing design, unchanged by this step. The script's own
+header comment points back to step 10.5a's WebAuthn-origin decision
+rather than restating it — whatever hostname the operator routes here
+becomes the canonical origin, and any passkeys registered under a
+different origin stop validating the moment that switch happens
+(expected, not a bug).
+
 ## Before touching a real mint
 
 1. Confirm the target contract's `mint()` isn't merkle-allowlist gated —
