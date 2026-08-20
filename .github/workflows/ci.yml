@@ -39,7 +39,40 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
+          # Matters because Cargo.toml isn't at the repo root —
+          # Swatinem/rust-cache's default (".") would look for it in the
+          # wrong place. Confirmed via this step's own "Cache Key"/
+          # "Lockfiles considered" log output pointing at
+          # mint-sniper/Cargo.lock, not assumed from the docs.
+          #
+          # THIS KEY WAS ACCIDENTALLY DELETED by the 9g commit that added
+          # the comment block below it — leaving `with:` followed by only
+          # comments, which GitHub's workflow parser rejects outright
+          # ("Invalid workflow file ... Unexpected value ''"). That broke
+          # EVERY CI run on this branch from 9g's own commit through 10h's
+          # (13 runs, zero jobs ever executed in any of them — the parse
+          # failure happens before any job is dispatched, not inside one).
+          # Restored here; see CLAUDE.md's Known Gaps / process-fix note
+          # for the full incident writeup.
           workspaces: mint-sniper
+          #
+          # `cache-bin: true` (the default, left implicit) is what actually
+          # matters for cargo audit's ~5min-per-run compile-from-source
+          # problem, since rustsec/audit-check's own `cargo install
+          # cargo-audit` writes the resulting binary to the same
+          # ~/.cargo/bin this action caches. Confirmed with real numbers,
+          # not assumed from the config alone: two runs against an
+          # unchanged Cargo.lock (this branch's own CI history, 9g) —
+          # cargo build 64s -> 17s, cargo audit ~175s (full source compile)
+          # -> 4s (cached binary, no compile at all). One earlier pair of
+          # consecutive runs on this branch showed "No cache found" despite
+          # an unchanged Cargo.lock and a prior successful save — possibly
+          # a propagation-delay or scope quirk in GitHub's cache backend,
+          # not this config; not chased further since the very next pair
+          # showed a clean hit with the numbers above. This does NOT speed
+          # up a fresh Claude Code sandbox session's local `cargo build` —
+          # that starts cold every time regardless — this is purely a
+          # CI-run-to-CI-run cache.
 
       - name: cargo build
         run: cargo build --all-targets
@@ -64,36 +97,36 @@ jobs:
           # for exactly this — "The directory of the Cargo.toml /
           # Cargo.lock files to scan," defaulting to `.`.
           working-directory: mint-sniper
-          # EXPLICIT ACCEPTED-RISK EXCEPTION — flagged to a human, not
-          # silently swallowed (see the npm audit step below for the same
-          # policy applied to the UI side). Confirmed live on this exact
-          # Cargo.lock, both against `ruint` 1.16.0, pulled in transitively
-          # via alloy-primitives 0.8.26 (`cargo tree -i ruint`), which this
-          # bot's arithmetic (nonce/gas/value math via alloy's U256) sits on
-          # top of:
-          #   - RUSTSEC-2025-0137: unsoundness in ruint::algorithms::div::
-          #     reciprocal_mg10 (a debug_assert-only bounds check, compiled
-          #     out in release builds). Fixed in ruint >=1.17.1.
-          #   - RUSTSEC-2026-0220: incorrect overflow flags on checked/
-          #     overflowing/saturating/wrapping shl/shr, worst on non-limb-
-          #     aligned widths (e.g. U160) — U256, what this bot actually
-          #     uses for value/gas math, is limb-aligned (4×64-bit) and not
-          #     the case the advisory calls out as worst-affected, though
-          #     the advisory does not scope itself to only non-aligned
-          #     widths. Fixed in ruint >=1.20.0.
-          # `cargo update -p ruint --dry-run` confirms 1.16.0 is already
-          # the newest version alloy-primitives 0.8.26's own Cargo.toml
-          # permits — the only fix is bumping alloy 0.9.2 -> 2.4.1 (current
-          # latest), a major-version jump. This repo's own CLAUDE.md
-          # ("Status" section) explicitly flags alloy's API surface as
-          # shifting across even *minor* versions and warns against
-          # assuming compatibility — a 0.9 -> 2.x jump touching every RPC/
-          # signing call site is a real, separate, non-trivial piece of
-          # work with its own compile/test/dry-run cycle, not something to
-          # fold silently into a CI-plumbing fix. Ignored here by advisory
-          # ID with this reasoning on record; revisit as its own dedicated
-          # task, not deferred indefinitely.
-          ignore: RUSTSEC-2025-0137,RUSTSEC-2026-0220
+          # RUSTSEC-2025-0137 and RUSTSEC-2026-0220 (both in `ruint`,
+          # transitive via alloy-primitives) were suppressed by advisory ID
+          # from here through step 9 — see git history for that commit's
+          # full reasoning — until the alloy 0.9.2 -> 2.4.1 upgrade (step 9)
+          # pulled in alloy-primitives 1.6.1, which permits ruint >=1.20.0
+          # (both advisories' fixed version) instead of pinning it at
+          # 1.16.0. `cargo audit` was clean on this Cargo.lock as of that
+          # upgrade — confirmed directly, not assumed from the version bump
+          # alone. See CLAUDE.md's known-gaps list, formerly gap #12,
+          # resolved as of step 9.
+          #
+          # RUSTSEC-2023-0071 (rsa crate, "Marvin Attack" timing
+          # side-channel in RSA decryption) is a NEW addition here, found
+          # live running `cargo audit` locally while investigating the CI
+          # failure streak this comment sits inside of — not something step
+          # 9 could have caught, since it arrived with step 10c's
+          # `openidconnect` dependency (Google Sign-In), added after step 9.
+          # `rsa` is pulled in as one of `openidconnect`'s *default*
+          # features (confirmed via `cargo tree -e features -i rsa`) — it's
+          # what verifies Google's RS256-signed ID tokens, not an optional
+          # or swappable piece. `cargo audit` reports "No fixed upgrade is
+          # available" for this advisory as of this writing; there is no
+          # newer `rsa` version, no alternate JWT-verification feature flag
+          # on `openidconnect`, and no reasonable non-blocking way to
+          # sidestep it. Suppressed by advisory ID, same pattern as the two
+          # ruint advisories above, pending an upstream fix — revisit this
+          # `ignore:` entry whenever `openidconnect`/`rsa` are next bumped,
+          # the same way the ruint suppression was revisited and removed at
+          # step 9 once its upstream fix actually shipped.
+          ignore: RUSTSEC-2023-0071
 
   ui:
     name: UI (typecheck, build, audit)

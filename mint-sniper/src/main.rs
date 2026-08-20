@@ -11,9 +11,15 @@ mod audit;
 mod auth;
 mod bus;
 mod config;
+mod copymint;
+mod db;
 mod executor;
+mod identity;
+mod inclusion;
+mod opensea;
 mod seadrop;
 mod state;
+mod target;
 mod wallet;
 mod watcher;
 
@@ -33,6 +39,8 @@ const CONFIG_PATH: &str = "config.toml";
 const TOKEN_PATH: &str = ".sniper-token";
 const AUDIT_LOG_PATH: &str = "audit.log";
 const API_BIND_ADDR: &str = "127.0.0.1:4117";
+const IDENTITY_DB_PATH: &str = "identity.db";
+const SESSION_KEY_PATH: &str = ".session-key";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -172,6 +180,54 @@ async fn main() -> Result<()> {
 
     let api_token = auth::load_or_create_token(TOKEN_PATH).context("loading/creating API token")?;
 
+    // Identity DB (step 10) — opened and migrated before the router is
+    // built, same "fail loudly at startup rather than lazily on first
+    // use" principle as config::Config::load above.
+    let identity_db = db::open(IDENTITY_DB_PATH)
+        .await
+        .context("opening identity DB")?;
+    let identity_keys =
+        identity::crypto::load_or_create(SESSION_KEY_PATH).context("loading/creating session key material")?;
+
+    // Google Sign-In (step 10c) is opt-in at the config level: an
+    // existing config.toml with none of the google_oauth_* fields set
+    // still starts up exactly as before, with identity routes returning
+    // a clear "not configured" error rather than the whole bot failing
+    // to boot. Once configured, a broken setup (bad client id, no
+    // network to accounts.google.com) DOES fail startup loudly — a
+    // deliberately-enabled identity feature that silently doesn't work
+    // is worse than a boot failure that says why.
+    let google_oidc = if !cfg.google_oauth_client_id.is_empty() {
+        let secret = cfg
+            .resolve_google_oauth_client_secret()
+            .context("google_oauth_client_id is set but google_oauth_client_secret_env is unset or unresolvable")?;
+        let oidc = identity::oidc::GoogleOidc::discover(
+            cfg.google_oauth_client_id.clone(),
+            secret,
+            cfg.google_oauth_redirect_url.clone(),
+        )
+        .await
+        .context("initializing Google Sign-In")?;
+        info!("Google Sign-In configured and discovery succeeded");
+        Some(Arc::new(oidc))
+    } else {
+        info!("Google Sign-In not configured (google_oauth_client_id unset) — /auth/google/* routes will 503");
+        None
+    };
+
+    // WebAuthn (step 10e) piggybacks on the same google_oauth_redirect_url
+    // for its rp_id/rp_origin — see identity/webauthn.rs's doc comment —
+    // so it's gated on the exact same config presence as Google Sign-In,
+    // not a separate flag.
+    let webauthn_state = if !cfg.google_oauth_client_id.is_empty() {
+        let ws = identity::webauthn::WebauthnState::new(&cfg.google_oauth_redirect_url, "mint-sniper")
+            .context("initializing WebAuthn")?;
+        info!("WebAuthn configured (rp_id derived from google_oauth_redirect_url)");
+        Some(Arc::new(ws))
+    } else {
+        None
+    };
+
     let app_state: SharedState = Arc::new(AppState {
         config: RwLock::new(cfg.clone()),
         wallet_status: RwLock::new(initial_status),
@@ -180,6 +236,12 @@ async fn main() -> Result<()> {
         control_tx: control_tx.clone(),
         config_path: CONFIG_PATH.to_string(),
         api_token,
+        http_client: reqwest::Client::new(),
+        identity_db,
+        identity_cookie_key: identity_keys.cookie_key,
+        identity_totp_cipher: identity_keys.totp_cipher,
+        google_oidc,
+        webauthn: webauthn_state,
     });
 
     // Background: refresh wallet ETH balances every 15s and push updates
@@ -200,6 +262,14 @@ async fn main() -> Result<()> {
     // than through control_loop, same reasoning as balance_poll_loop.
     tokio::spawn(rpc_health_poll_loop(app_state.clone(), cfg.http_rpc_urls.clone()));
 
+    // Background: copy-mint (step 6) — watches tracked_wallets for SeaDrop
+    // mintPublic activity and surfaces/auto-fires opportunities through
+    // the same control_tx every other trigger mode uses. Always spawned;
+    // no-ops (just sleeps) whenever tracked_wallets is empty. See
+    // copymint.rs's doc comment for why this runs independently of the
+    // main trigger_mode watcher's armed state rather than through it.
+    tokio::spawn(copymint::run_copymint_watcher(app_state.clone()));
+
     // Background: owns the watcher lifecycle and executes fires. Wallets
     // (with their private key material) live only here and in the executor
     // call it makes — never cross into the API/UI layer.
@@ -218,12 +288,16 @@ async fn main() -> Result<()> {
     info!(addr = API_BIND_ADDR, "control API listening");
     bus::log(&event_bus, "info", format!("control API listening on {API_BIND_ADDR}"));
 
-    axum::serve(listener, api::router(app_state)).await?;
+    // 127.0.0.1 above is unchanged by step 10.5 — a Cloudflare Tunnel
+    // (cloudflared) reaches IN to this bind address as a local client, it
+    // is not a reason to widen the bind itself. See ui/README.md's
+    // Cloudflare Tunnel + Access section.
+    axum::serve(listener, api::router(app_state, &cfg.google_oauth_redirect_url)).await?;
     Ok(())
 }
 
 async fn balance_poll_loop(state: SharedState, http_url: String, addrs: Vec<Address>) {
-    let provider = ProviderBuilder::new().on_http(http_url.parse().unwrap());
+    let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_url.parse().unwrap());
     loop {
         for addr in &addrs {
             if let Ok(balance) = provider.get_balance(*addr).await {
@@ -256,7 +330,7 @@ async fn rpc_health_poll_loop(state: SharedState, http_rpc_urls: Vec<String>) {
     let providers: Vec<(String, executor::HttpProvider)> = http_rpc_urls
         .into_iter()
         .filter_map(|url| match url.parse() {
-            Ok(parsed) => Some((url, ProviderBuilder::new().on_http(parsed))),
+            Ok(parsed) => Some((url, ProviderBuilder::new().disable_recommended_fillers().connect_http(parsed))),
             Err(e) => {
                 // A malformed URL in config is a config error, not an RPC
                 // health event — nothing to ping, so nothing to report.
@@ -359,6 +433,19 @@ async fn control_loop(
     mint_state_selector: Vec<u8>,
     mut wallets: Vec<wallet::ManagedWallet>,
 ) {
+    // Startup-computed but not fixed thereafter (step 8a) — SeaDrop's
+    // updatePublicDrop can change mintPrice at any time, including
+    // flipping a drop from free to paid, between arm and fire. Re-checked
+    // on every Prepare that isn't timestamp mode's single lead-time call —
+    // see the ControlMsg::Prepare handler below.
+    let mut mint_value = mint_value;
+    // Runtime-mutable as of step 8b — ControlMsg::SetTarget updates these
+    // when the operator swaps the active target via the UI. `contract`
+    // (the SeaDrop singleton address in seadrop mode) deliberately stays
+    // a fixed local, not `mut`: 8b only swaps the nft_contract within the
+    // singleton's mintPublic calls, never the singleton itself.
+    let mut admin_watch_target = admin_watch_target;
+    let mut mint_calldata = mint_calldata;
     // Both watcher fns (run_timestamp_watcher, run_state_poll_watcher) return
     // anyhow::Result<()>, not (); the handle type has to match whichever the
     // `match` below spawns, and it's the same for either arm.
@@ -377,6 +464,20 @@ async fn control_loop(
     // never be paired with a fresh prepare, or vice versa.
     let mut warmed_providers: Vec<executor::HttpProvider> = Vec::new();
     let mut prepared_fire: Option<executor::PreparedFire> = None;
+    // STEP 14a — established at Arm time, same lifecycle as
+    // warmed_providers and for the same reason: establishing a WS
+    // subscription takes up to inclusion::establish_block_ticker's own
+    // 5s connect ceiling, which MUST happen ahead of the trigger, not at
+    // fire time — adding up to 5s of synchronous latency to every single
+    // fire would defeat the entire point of this file's prepare/fire
+    // split. `None` means the WS path is unavailable (expected in this
+    // sandbox specifically, see gap #11/inclusion.rs's own doc comment)
+    // and every fire_prepared call falls back to HTTP polling instead —
+    // that fallback decision is made once here, not re-attempted per
+    // fire. Cleared on Disarm/after-firing alongside warmed_providers so
+    // a stale subscription from a previous arm session is never reused
+    // across a re-arm.
+    let mut block_ticker: Option<inclusion::BlockTicker> = None;
 
     while let Some(msg) = control_rx.recv().await {
         match msg {
@@ -392,6 +493,23 @@ async fn control_loop(
                 // endpoint has had its TCP/TLS handshake done at least once
                 // before we're relying on it, not at broadcast time.
                 warmed_providers = executor::warm_connections(&cfg, &state.bus).await;
+                // STEP 14a — same "pay this cost now, not at fire time"
+                // principle as the line above. See block_ticker's own
+                // declaration comment for why this can't be deferred to
+                // fire_prepared itself.
+                block_ticker = inclusion::establish_block_ticker(&cfg.ws_rpc_url).await;
+                bus::log(
+                    &state.bus,
+                    "info",
+                    format!(
+                        "inclusion detection: {} for this arm session",
+                        if block_ticker.is_some() {
+                            "WS push path established"
+                        } else {
+                            "WS push path unavailable, using HTTP poll fallback"
+                        }
+                    ),
+                );
                 prepared_fire = None;
 
                 state.armed.store(true, Ordering::Relaxed);
@@ -553,6 +671,56 @@ async fn control_loop(
                     continue;
                 }
                 let cfg = state.config.read().await.clone();
+
+                // 8a: re-fetch mintPrice at the same cadence gas already
+                // gets refreshed. Skipped for timestamp mode's single
+                // prepare-at-T-minus-PREPARE_LEAD_SECS call — that window
+                // is short enough that staleness isn't a real concern,
+                // same reasoning 3b already applies there to gas. Every
+                // other mode's arm-to-trigger window is unbounded, so a
+                // price that changed since arming (or since the last
+                // periodic re-prepare) would otherwise go unnoticed until
+                // the contract reverts on a msg.value mismatch at fire
+                // time — step 3c's fix means that reverts report
+                // success: false rather than a false positive, but it's
+                // still a missed mint this re-check prevents. Only
+                // meaningful in seadrop mode — custom mode has no
+                // getPublicDrop equivalent to re-check against.
+                if cfg.mint_mode == "seadrop" && cfg.trigger_mode != "timestamp" {
+                    match seadrop::fetch_public_drop(&cfg.http_rpc_urls[0], contract, admin_watch_target).await {
+                        Ok(drop) => {
+                            let new_value = drop.mint_price_wei * U256::from(cfg.quantity_per_wallet);
+                            if new_value != mint_value {
+                                let old_eth = format_units(mint_value, "ether").unwrap_or_else(|_| mint_value.to_string());
+                                let new_eth = format_units(new_value, "ether").unwrap_or_else(|_| new_value.to_string());
+                                if is_alarming_price_increase(mint_value, new_value) {
+                                    bus::log(
+                                        &state.bus,
+                                        "warn",
+                                        format!(
+                                            "mint price changed {old_eth} -> {new_eth} ETH since last check — re-signing with the new value"
+                                        ),
+                                    );
+                                } else {
+                                    bus::log(
+                                        &state.bus,
+                                        "info",
+                                        format!("mint price changed {old_eth} -> {new_eth} ETH since last check"),
+                                    );
+                                }
+                                mint_value = new_value;
+                            }
+                        }
+                        Err(e) => {
+                            bus::log(
+                                &state.bus,
+                                "warn",
+                                format!("mint price re-check failed ({e:#}) — using last known value"),
+                            );
+                        }
+                    }
+                }
+
                 match executor::prepare_fire(
                     &cfg,
                     &wallets,
@@ -601,12 +769,22 @@ async fn control_loop(
                 }
                 prepared_fire = None;
                 warmed_providers.clear();
+                block_ticker = None; // drops the watch::Sender's clone; the ticker task exits once every receiver is gone
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
                 bus::log(&state.bus, "warn", "disarmed");
             }
 
             ControlMsg::FireNow => {
+                // STEP 13e — the earliest point THIS process can call
+                // "trigger detected": right as control_loop starts acting
+                // on it, whether that's a watcher's auto-trigger (which
+                // reaches here via trigger_rx.changed() -> one mpsc send,
+                // sub-millisecond in practice, not separately instrumented)
+                // or a manual UI "Fire Now" click (where this genuinely IS
+                // the detection instant — there is no earlier "trigger" to
+                // measure from for a manual fire).
+                let trigger_detected_at = std::time::Instant::now();
                 let cfg = state.config.read().await.clone();
                 bus::log(&state.bus, "warn", "FIRING all wallets");
 
@@ -615,7 +793,7 @@ async fn control_loop(
                     // one place next_nonce advances (see prepare_fire's doc
                     // comment for why it doesn't advance on its own).
                     advance_nonces(&mut wallets, &pf.wallets);
-                    executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus).await
+                    executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus, trigger_detected_at, block_ticker.clone()).await
                 } else {
                     // Manual fire (UI "Fire Now") without a prior arm, or a
                     // prepare that failed above — fall back to signing right
@@ -633,6 +811,17 @@ async fn control_loop(
                     } else {
                         warmed_providers.clone()
                     };
+                    // STEP 14a — reuse an already-established arm-time
+                    // ticker if one exists (matches warmed_providers'
+                    // reuse just above); only pay establish_block_ticker's
+                    // own up-to-5s connect cost here, in this
+                    // already-known-slower fallback path, if this fire
+                    // never went through Arm at all.
+                    let ticker_for_fire = if block_ticker.is_some() {
+                        block_ticker.clone()
+                    } else {
+                        inclusion::establish_block_ticker(&cfg.ws_rpc_url).await
+                    };
                     match executor::prepare_fire(
                         &cfg,
                         &wallets,
@@ -646,7 +835,7 @@ async fn control_loop(
                     {
                         Ok(w) => {
                             advance_nonces(&mut wallets, &w);
-                            executor::fire_prepared(&cfg, &w, &providers, &state.bus).await
+                            executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at, ticker_for_fire).await
                         }
                         Err(e) => Err(e),
                     }
@@ -671,8 +860,94 @@ async fn control_loop(
                 }
                 prepared_fire = None;
                 warmed_providers.clear();
+                block_ticker = None;
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
+            }
+
+            ControlMsg::FireCopymint { contract: copy_contract, calldata: copy_calldata, value: copy_value } => {
+                // Deliberately does NOT touch watcher_handle/armed/
+                // warmed_providers/prepared_fire — a copymint fire is
+                // independent of the main trigger_mode's arm/disarm
+                // lifecycle (see copymint.rs's doc comment: this can fire
+                // while the main watcher is armed, disarmed, or doesn't
+                // exist at all for this run). Always JIT-signs, same
+                // fallback path FireNow uses when nothing was pre-signed
+                // — there's no "prepare ahead of time" for copymint since
+                // the target contract isn't known until the moment of
+                // detection.
+                let trigger_detected_at = std::time::Instant::now(); // step 13e — see FireNow's identical note above
+                let cfg = state.config.read().await.clone();
+                bus::log(&state.bus, "warn", format!("FIRING copymint opportunity: contract {copy_contract:#x}"));
+
+                let providers = if warmed_providers.is_empty() {
+                    executor::warm_connections(&cfg, &state.bus).await
+                } else {
+                    warmed_providers.clone()
+                };
+                // STEP 14a — same reuse-if-armed, establish-fresh-if-not
+                // logic as FireNow's fallback path above.
+                let ticker_for_fire = if block_ticker.is_some() {
+                    block_ticker.clone()
+                } else {
+                    inclusion::establish_block_ticker(&cfg.ws_rpc_url).await
+                };
+
+                match executor::prepare_fire(
+                    &cfg,
+                    &wallets,
+                    copy_contract,
+                    &copy_calldata,
+                    copy_value,
+                    &providers,
+                    &state.bus,
+                )
+                .await
+                {
+                    Ok(w) => {
+                        advance_nonces(&mut wallets, &w);
+                        if let Err(e) = executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at, ticker_for_fire).await {
+                            bus::log(&state.bus, "error", format!("copymint fire sequence error: {e:#}"));
+                        }
+                    }
+                    Err(e) => bus::log(&state.bus, "error", format!("copymint prepare failed: {e:#}")),
+                }
+            }
+
+            ControlMsg::SetTarget { nft_contract, mint_calldata: new_calldata, mint_value: new_value } => {
+                // Same cleanup discipline Disarm already has (step 3b) —
+                // a target swap must not leave an in-flight prepared fire
+                // or re-prepare loop signed for the OLD nft_contract's
+                // calldata sitting around to be broadcast by mistake.
+                if let Some(h) = watcher_handle.take() {
+                    h.abort();
+                }
+                if let Some(h) = prepare_timer_handle.take() {
+                    h.abort();
+                }
+                if let Some(h) = reprepare_handle.take() {
+                    h.abort();
+                }
+                prepared_fire = None;
+                warmed_providers.clear();
+                block_ticker = None; // same conservative "treat like a re-arm" cleanup warmed_providers already gets
+                let was_armed = state.armed.swap(false, Ordering::Relaxed);
+                if was_armed {
+                    let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
+                }
+
+                admin_watch_target = nft_contract;
+                mint_calldata = new_calldata;
+                mint_value = new_value;
+
+                bus::log(
+                    &state.bus,
+                    "info",
+                    format!(
+                        "active target set to {nft_contract:#x}{}",
+                        if was_armed { " — disarmed (re-arm to watch the new target)" } else { "" }
+                    ),
+                );
             }
         }
     }
@@ -690,6 +965,20 @@ fn advance_nonces(wallets: &mut [wallet::ManagedWallet], prepared: &[executor::P
             w.next_nonce += 1;
         }
     }
+}
+
+/// step 8a: whether a mintPrice change since the last check is alarming
+/// enough to log at `warn` (vs a quieter `info`) in the
+/// `ControlMsg::Prepare` handler. Threshold is >2x the old value — loud
+/// enough to catch a real, meaningful price change without firing on
+/// gas-price-style noise (there isn't any here; mintPrice only moves when
+/// a project deliberately calls `updatePublicDrop`, so any change at all
+/// is real, but not every real change is alarming). Free -> paid is
+/// already covered by this same rule, not a special case: `old_value * 2
+/// == 0` when `old_value == 0`, so any nonzero `new_value` already
+/// exceeds it.
+fn is_alarming_price_increase(old_value: U256, new_value: U256) -> bool {
+    new_value > old_value.saturating_mul(U256::from(2))
 }
 
 fn encode_mint_calldata(signature: &str, args: &[String]) -> Result<Vec<u8>> {
@@ -718,6 +1007,42 @@ fn encode_selector_only(signature: &str) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn free_to_paid_is_alarming() {
+        // The specific case 8a's task description calls out by name —
+        // covered by the general >2x rule, not a special case: 0 * 2 == 0.
+        assert!(is_alarming_price_increase(U256::ZERO, U256::from(1u64)));
+    }
+
+    #[test]
+    fn just_over_2x_is_alarming() {
+        assert!(is_alarming_price_increase(U256::from(100u64), U256::from(201u64)));
+    }
+
+    #[test]
+    fn exactly_2x_is_not_alarming() {
+        // Boundary: strictly greater than 2x, not >=, so a project simply
+        // doubling their price isn't flagged as loudly as a >2x jump.
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::from(200u64)));
+    }
+
+    #[test]
+    fn small_increase_is_not_alarming() {
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::from(150u64)));
+    }
+
+    #[test]
+    fn decrease_is_never_alarming() {
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::from(1u64)));
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::ZERO));
+    }
+
+    #[test]
+    fn no_change_is_not_alarming() {
+        assert!(!is_alarming_price_increase(U256::ZERO, U256::ZERO));
+        assert!(!is_alarming_price_increase(U256::from(100u64), U256::from(100u64)));
+    }
 
     #[test]
     fn encode_mint_calldata_matches_known_good_calldata() {

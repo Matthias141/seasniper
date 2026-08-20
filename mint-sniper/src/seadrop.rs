@@ -8,9 +8,22 @@
 //!
 //! Deployment (same address on every chain it's deployed to, deterministic
 //! CREATE2 deploy): 0x00005EA00Ac477B1030CE78506496e8C2dE24bf5
-//! Confirmed on Ethereum mainnet and Polygon as of this writing —
-//! verify on the target chain's block explorer before relying on it,
-//! deployments do vary by chain and this list can go stale.
+//! Confirmed on Ethereum mainnet and Polygon as of this writing, and (step
+//! 13a) Robinhood Chain mainnet (4663) AND testnet (46630) — real
+//! `eth_getCode` calls against both, not assumed from
+//! morsyxbt/nft-public-mint's chain-support list alone. Runtime bytecode
+//! is byte-identical to Ethereum mainnet's own deployment except for one
+//! ~20-byte segment containing the literal chain id (an EIP-712 domain
+//! separator immutable, baked in per-chain at deploy time — CREATE2 keeps
+//! the ADDRESS deterministic from init-code+salt alone, but the compiled
+//! runtime code legitimately differs by this one chain-dependent constant;
+//! this is expected and not a sign of a different/tampered deployment).
+//! `SEADROP_1_0_MAINNET`'s name is a holdover from when only Ethereum
+//! mainnet was in scope — despite the name, this same constant is the
+//! correct default on every chain confirmed above, not a mainnet-only
+//! value. Still verify on any NEW target chain's block explorer before
+//! relying on it — deployments do vary by chain and this list can go
+//! stale.
 //!
 //! IMPORTANT SCOPE LIMIT: this only covers `mintPublic` — the no-allowlist,
 //! no-signature public stage. SeaDrop also supports `mintAllowList` (needs
@@ -51,7 +64,7 @@ pub async fn fetch_public_drop(
     seadrop: Address,
     nft_contract: Address,
 ) -> Result<PublicDropInfo> {
-    let provider = ProviderBuilder::new().on_http(http_rpc.parse()?);
+    let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_rpc.parse()?);
 
     let func = Function::parse(
         "getPublicDrop(address) returns (uint80,uint48,uint48,uint16,uint16,bool)",
@@ -62,12 +75,12 @@ pub async fn fetch_public_drop(
     let tx = TransactionRequest::default().to(seadrop).input(calldata.into());
 
     let raw = provider
-        .call(&tx)
+        .call(tx)
         .await
         .context("getPublicDrop call failed — check seadrop address and chain")?;
 
     let decoded = func
-        .abi_decode_output(&raw, true)
+        .abi_decode_output(&raw)
         .context("decoding PublicDrop struct")?;
 
     // Field order matches the struct declaration above, not storage-slot
@@ -118,7 +131,7 @@ pub async fn is_fee_recipient_allowed(
     nft_contract: Address,
     fee_recipient: Address,
 ) -> Result<bool> {
-    let provider = ProviderBuilder::new().on_http(http_rpc.parse()?);
+    let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_rpc.parse()?);
     let func = Function::parse("getFeeRecipientIsAllowed(address,address) returns (bool)")
         .context("parsing getFeeRecipientIsAllowed signature")?;
     let calldata = func.abi_encode_input(&[
@@ -126,8 +139,8 @@ pub async fn is_fee_recipient_allowed(
         DynSolValue::Address(fee_recipient),
     ])?;
     let tx = TransactionRequest::default().to(seadrop).input(calldata.into());
-    let raw = provider.call(&tx).await.context("getFeeRecipientIsAllowed call failed")?;
-    let decoded = func.abi_decode_output(&raw, true)?;
+    let raw = provider.call(tx).await.context("getFeeRecipientIsAllowed call failed")?;
+    let decoded = func.abi_decode_output(&raw)?;
     decoded[0].as_bool().context("decoding bool result")
 }
 

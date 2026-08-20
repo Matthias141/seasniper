@@ -6,3 +6,14 @@ config.toml
 .sniper-token
 .testnet-keys/
 audit.log
+
+# identity (step 10) — same treatment as .sniper-token/config.toml above.
+# identity.db holds hashed/encrypted secrets, not plaintext, but the file
+# itself is still never meant to leave this machine (session rows alone
+# are enough to hijack an admin session if the DB leaked). The -wal/-shm
+# siblings are SQLite's WAL-mode journal files; they can contain the same
+# data as the main file mid-transaction and must never be committed either.
+identity.db
+identity.db-wal
+identity.db-shm
+.session-key

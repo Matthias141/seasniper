@@ -93,6 +93,21 @@
   font-size: var(--text-sm);
 }
 
+.signOutBtn {
+  background: transparent;
+  border: var(--border-hairline);
+  color: var(--color-text-tertiary);
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.1em;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+}
+.signOutBtn:hover {
+  color: var(--color-danger);
+  border-color: var(--color-danger);
+}
+
 @media (prefers-reduced-motion: reduce) {
   .pillDown {
     animation: none;

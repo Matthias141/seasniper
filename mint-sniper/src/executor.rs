@@ -2,9 +2,9 @@ use crate::bus::{self, EventBus, ServerEvent};
 use crate::config::Config;
 use crate::wallet::{wallet_to_eth_wallet, ManagedWallet};
 use alloy::eips::eip2718::Encodable2718;
-use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::network::{EthereumWallet, NetworkTransactionBuilder};
 use alloy::primitives::{Address, TxHash, U256};
-use alloy::providers::{Provider, ProviderBuilder, ReqwestProvider};
+use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -19,7 +19,7 @@ use tracing::{error, info};
 /// broadcast, which is what this file did before, throws away the warmed
 /// TCP/TLS connection and pays for a new handshake at exactly the moment
 /// that handshake is most expensive.
-pub type HttpProvider = ReqwestProvider;
+pub type HttpProvider = RootProvider;
 
 /// One wallet's transaction, signed and serialized ahead of the trigger.
 /// `fire_prepared` does nothing with this but write `raw_tx` to a socket —
@@ -28,6 +28,14 @@ pub struct PreparedWallet {
     pub address: Address,
     pub raw_tx: Vec<u8>,
     pub tx_hash: TxHash,
+    /// STEP 13e — when this wallet's tx was actually signed. `Instant`,
+    /// not a wall-clock timestamp: only ever compared against another
+    /// `Instant` from the same process to compute a duration, never
+    /// serialized or shown as an absolute time, so monotonic-clock
+    /// semantics (immune to a clock adjustment mid-fire) are exactly
+    /// what's wanted here. Chain-agnostic by construction — nothing
+    /// below reads chain id or network name, only wall-clock deltas.
+    pub prepared_at: std::time::Instant,
 }
 
 /// Output of the prepare phase: every wallet's signed tx, plus the warmed
@@ -59,7 +67,7 @@ pub async fn warm_connections(cfg: &Config, bus: &EventBus) -> Vec<HttpProvider>
                 continue;
             }
         };
-        let provider = ProviderBuilder::new().on_http(parsed);
+        let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(parsed);
 
         match provider.get_block_number().await {
             Ok(_) => bus::log(bus, "info", format!("connection warmed: {url}")),
@@ -130,7 +138,7 @@ pub async fn prepare_fire(
         probe_tx = probe_tx.from(from);
     }
     let estimated_gas = reader
-        .estimate_gas(&probe_tx)
+        .estimate_gas(probe_tx)
         .await
         .context("estimating gas")?;
     let gas_limit = estimated_gas + (estimated_gas * cfg.gas_limit_headroom_pct) / 100;
@@ -193,6 +201,7 @@ pub async fn prepare_fire(
 
         let raw_tx = envelope.encoded_2718();
         let tx_hash = *envelope.tx_hash();
+        let prepared_at = std::time::Instant::now();
 
         info!(address = %w.address, %tx_hash, nonce, "wallet prepared (signed, not broadcast)");
         bus::log(
@@ -204,6 +213,7 @@ pub async fn prepare_fire(
         prepared.push(PreparedWallet {
             address: w.address,
             raw_tx,
+            prepared_at,
             tx_hash,
         });
     }
@@ -218,11 +228,50 @@ pub async fn prepare_fire(
 /// The only thing decided at this point is the per-wallet broadcast-timing
 /// jitter, which is about *when* the already-built bytes hit the wire, not
 /// what's in them, so there's no reason to fix it before the trigger.
+///
+/// STEP 13e — `trigger_detected_at` is when the CALLER first knew firing
+/// should happen (a watcher tripping, or a manual/copymint fire request
+/// being received) — see `main.rs`'s `control_loop` for where each of
+/// those is actually captured. Everything here is plain wall-clock
+/// `Instant` math with zero chain-specific logic, so the resulting
+/// `trigger_to_dispatch_ms`/`send_to_ack_ms`/`dispatch_to_inclusion_ms`
+/// on `ServerEvent::MintResult` are directly comparable across mainnet,
+/// Sepolia, and Robinhood Chain runs — that's what makes step 13d's dry
+/// run produce a real number to check against MintDash's own published
+/// Robinhood Chain figures (send→ack p50 117ms, mintDuration p50 136ms —
+/// see CLAUDE.md's step 13 section), not a mainnet number with nothing
+/// to compare it to.
+/// STEP 14a — one per-provider broadcast attempt's outcome, once it's
+/// gotten far enough to know send_to_ack_ms (i.e. `send_raw_transaction`
+/// itself succeeded). Kept distinct from a plain `Err` (which means the
+/// broadcast itself was rejected/never went out) so `fire_prepared` can
+/// tell "definitely never happened" apart from "happened, but we
+/// couldn't confirm it in time" — two states with very different
+/// operational meaning that must not collapse into the same generic
+/// failure bucket.
+enum SendAttemptOutcome {
+    // Boxed for the same reason as inclusion::InclusionOutcome's own
+    // Included variant — clippy's large_enum_variant under CI's real
+    // `-D warnings`, confirmed live, not just plain `cargo clippy`.
+    Included {
+        receipt: Box<TransactionReceipt>,
+        send_to_ack_ms: u64,
+        dispatch_to_inclusion_ms: u64,
+        method: &'static str,
+    },
+    TimedOut {
+        send_to_ack_ms: u64,
+        method: &'static str,
+    },
+}
+
 pub async fn fire_prepared(
     cfg: &Config,
     prepared: &[PreparedWallet],
     providers: &[HttpProvider],
     bus: &EventBus,
+    trigger_detected_at: std::time::Instant,
+    block_ticker: Option<crate::inclusion::BlockTicker>,
 ) -> Result<()> {
     let _ = bus.send(ServerEvent::TriggerFired { manual: false });
 
@@ -230,19 +279,42 @@ pub async fn fire_prepared(
         anyhow::bail!("no warmed RPC providers to broadcast to");
     }
 
+    // STEP 14a — sized from config, not hardcoded; see Config::block_time_ms/
+    // inclusion_timeout_ms's own doc comments. `block_ticker` (established
+    // once at Arm time by main.rs's control_loop — see its own doc comment
+    // for why NOT here, at fire time) selects PUSH when `Some`, HTTP-poll
+    // fallback at `poll_interval` when `None`.
+    let poll_interval = std::time::Duration::from_millis(cfg.block_time_ms);
+    let inclusion_timeout = std::time::Duration::from_millis(cfg.inclusion_timeout_ms);
+    // Captured as an owned value (not `cfg` itself) so it can move into
+    // the 'static-bound `tokio::spawn`ed tasks below — `cfg: &Config`
+    // only lives for this function call, `cfg.inclusion_timeout_ms: u64`
+    // is Copy and has no such lifetime constraint.
+    let inclusion_timeout_ms = cfg.inclusion_timeout_ms;
+
     let mut handles = Vec::with_capacity(prepared.len());
 
     for pw in prepared {
         let raw_tx = pw.raw_tx.clone();
         let address = pw.address;
         let expected_hash = pw.tx_hash;
+        let prepared_at = pw.prepared_at;
         let providers = providers.to_vec(); // RootProvider is a cheap Arc-clone — same pooled connections
         let bus = bus.clone();
+        let block_ticker = block_ticker.clone();
 
         let jitter_ms: u64 = rand::thread_rng().gen_range(cfg.jitter_ms_min..=cfg.jitter_ms_max);
 
         handles.push(tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+
+            // Measured AFTER the jitter sleep, deliberately — jitter is an
+            // intentional anti-clustering delay this codebase chose to
+            // pay, not fire-path overhead to report as latency. This is
+            // the moment these bytes actually start going out the door.
+            let dispatch_started = std::time::Instant::now();
+            let trigger_to_dispatch_ms = dispatch_started.saturating_duration_since(trigger_detected_at).as_millis() as u64;
+            let prepare_age_ms = dispatch_started.saturating_duration_since(prepared_at).as_millis() as u64;
 
             // Race the same raw bytes across every warmed RPC; first to
             // land wins. Unlike the old select_ok-based version, every
@@ -265,20 +337,51 @@ pub async fn fire_prepared(
             // is added to the actual broadcast/dispatch step itself.
             let sends = providers.iter().enumerate().map(|(i, provider)| {
                 let raw_tx = raw_tx.clone();
+                let block_ticker = block_ticker.clone();
                 async move {
                     // Inner block explicitly typed as anyhow::Result so `?`
-                    // has one concrete error type to convert both
-                    // send_raw_transaction's and get_receipt()'s errors
-                    // into; the index is attached after, on the way out,
-                    // since neither of those error types otherwise unify
-                    // with (usize, anyhow::Error) directly.
-                    let result: Result<TransactionReceipt, anyhow::Error> = async {
-                        let receipt = provider
-                            .send_raw_transaction(&raw_tx)
-                            .await?
-                            .get_receipt()
-                            .await?;
-                        Ok(receipt)
+                    // has one concrete error type to convert
+                    // send_raw_transaction's errors into; the index is
+                    // attached after, on the way out, since that error
+                    // type otherwise doesn't unify with
+                    // (usize, anyhow::Error) directly.
+                    //
+                    // STEP 13e: send_to_ack_ms is captured the instant
+                    // send_raw_transaction itself returns — the RPC
+                    // accepting the raw bytes and handing back a pending-tx
+                    // handle, NOT inclusion — this is the number directly
+                    // comparable to MintDash's published "send→ack" figure.
+                    //
+                    // STEP 14a: inclusion detection no longer uses
+                    // `PendingTransactionBuilder::get_receipt()` (whose
+                    // internal poll interval, not real inclusion speed, is
+                    // what step 13f found was dominating
+                    // dispatch_to_inclusion_ms) — `inclusion::wait_for_receipt`
+                    // instead, PUSH (block-arrival driven) when
+                    // `block_ticker` is `Some`, HTTP-poll fallback
+                    // otherwise. See inclusion.rs's own doc comment for
+                    // the full design and why it's a separate module from
+                    // watcher.rs's per-block mint-state check (step 13c).
+                    let result: Result<SendAttemptOutcome, anyhow::Error> = async {
+                        let _pending = provider.send_raw_transaction(&raw_tx).await?;
+                        let send_to_ack_ms = dispatch_started.elapsed().as_millis() as u64;
+                        match crate::inclusion::wait_for_receipt(
+                            provider,
+                            expected_hash,
+                            block_ticker,
+                            poll_interval,
+                            inclusion_timeout,
+                        )
+                        .await
+                        {
+                            crate::inclusion::InclusionOutcome::Included { receipt, method } => {
+                                let dispatch_to_inclusion_ms = dispatch_started.elapsed().as_millis() as u64;
+                                Ok(SendAttemptOutcome::Included { receipt, send_to_ack_ms, dispatch_to_inclusion_ms, method })
+                            }
+                            crate::inclusion::InclusionOutcome::TimedOut { method } => {
+                                Ok(SendAttemptOutcome::TimedOut { send_to_ack_ms, method })
+                            }
+                        }
                     }
                     .await;
                     result.map_err(|e| (i, e))
@@ -287,7 +390,17 @@ pub async fn fire_prepared(
 
             let results = join_all(sends).await;
 
-            if let Some(receipt) = results.iter().find_map(|r| r.as_ref().ok()) {
+            // Priority: any provider that actually got an Included receipt
+            // wins outright, regardless of whether other providers timed
+            // out or failed to broadcast at all.
+            let included = results.iter().find_map(|r| match r.as_ref().ok() {
+                Some(SendAttemptOutcome::Included { receipt, send_to_ack_ms, dispatch_to_inclusion_ms, method }) => {
+                    Some((receipt, *send_to_ack_ms, *dispatch_to_inclusion_ms, *method))
+                }
+                _ => None,
+            });
+
+            if let Some((receipt, send_to_ack_ms, dispatch_to_inclusion_ms, method)) = included {
                 let tx_hash = receipt.transaction_hash;
                 // The RPC's returned hash should always equal the hash
                 // computed at prepare time — raw_tx fully determines it,
@@ -300,11 +413,15 @@ pub async fn fire_prepared(
                 }
 
                 if receipt.status() {
-                    info!(%address, %tx_hash, "mint confirmed");
+                    info!(%address, %tx_hash, send_to_ack_ms, dispatch_to_inclusion_ms, method, "mint confirmed");
                     let _ = bus.send(ServerEvent::MintResult {
                         address: format!("{address:#x}"),
                         success: true,
                         detail: format!("{tx_hash:#x}"),
+                        trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
+                        prepare_age_ms,
+                        send_to_ack_ms: Some(send_to_ack_ms),
+                        dispatch_to_inclusion_ms: Some(dispatch_to_inclusion_ms),
                     });
                 } else {
                     // Included, but reverted. Not a broadcast failure —
@@ -314,33 +431,73 @@ pub async fn fire_prepared(
                     // reason decoding here (would need an extra eth_call
                     // trace replay); block number + gas used is enough to
                     // confirm "this really happened" without a whole
-                    // subsystem for why.
+                    // subsystem for why. Timing is still real and still
+                    // reported — a revert still measures real send→ack and
+                    // dispatch→inclusion numbers, same as a success.
                     let detail = format!(
                         "reverted on-chain — tx {tx_hash:#x}, block {}, gas used {}",
                         receipt.block_number.map_or("?".to_string(), |b| b.to_string()),
                         receipt.gas_used,
                     );
-                    error!(%address, %tx_hash, "mint tx included but reverted");
+                    error!(%address, %tx_hash, method, "mint tx included but reverted");
                     let _ = bus.send(ServerEvent::MintResult {
                         address: format!("{address:#x}"),
                         success: false,
                         detail,
+                        trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
+                        prepare_age_ms,
+                        send_to_ack_ms: Some(send_to_ack_ms),
+                        dispatch_to_inclusion_ms: Some(dispatch_to_inclusion_ms),
                     });
                 }
+            } else if let Some((send_to_ack_ms, method)) = results.iter().find_map(|r| match r.as_ref().ok() {
+                Some(SendAttemptOutcome::TimedOut { send_to_ack_ms, method }) => Some((*send_to_ack_ms, *method)),
+                _ => None,
+            }) {
+                // STEP 14a — distinct from BOTH success and revert: at
+                // least one provider ack'd the broadcast (this tx really
+                // did go out), but no receipt showed up within
+                // Config::inclusion_timeout_ms via either detection path.
+                // This does NOT mean the tx failed — it may still confirm
+                // later — so it must never be conflated with "all RPC
+                // broadcasts failed" below, which means the tx never left
+                // this process at all.
+                let detail = format!(
+                    "inclusion not confirmed within {inclusion_timeout_ms}ms (detection method={method}) — \
+                     tx {expected_hash:#x} may still be pending; check a block explorer before assuming it failed"
+                );
+                tracing::warn!(%address, tx_hash = %expected_hash, method, timeout_ms = inclusion_timeout_ms, "inclusion detection timed out");
+                let _ = bus.send(ServerEvent::MintResult {
+                    address: format!("{address:#x}"),
+                    success: false,
+                    detail,
+                    trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
+                    prepare_age_ms,
+                    send_to_ack_ms: Some(send_to_ack_ms),
+                    dispatch_to_inclusion_ms: None, // never resolved — that's the whole point of this branch
+                });
             } else {
                 let detail = results
                     .iter()
                     .map(|r| match r {
-                        Ok(_) => unreachable!("handled by the find_map above"),
+                        Ok(_) => unreachable!("handled by the branches above"),
                         Err((i, e)) => format!("rpc[{i}]: {e}"),
                     })
                     .collect::<Vec<_>>()
                     .join(" | ");
                 error!(%address, error = %detail, "all RPC broadcasts failed for this wallet");
+                // No ack/inclusion time exists when every RPC rejected the
+                // broadcast outright — but trigger_to_dispatch_ms is still
+                // real and worth keeping, since it's independent of what
+                // happened after dispatch.
                 let _ = bus.send(ServerEvent::MintResult {
                     address: format!("{address:#x}"),
                     success: false,
                     detail,
+                    trigger_to_dispatch_ms: Some(trigger_to_dispatch_ms),
+                    prepare_age_ms,
+                    send_to_ack_ms: None,
+                    dispatch_to_inclusion_ms: None,
                 });
             }
         }));

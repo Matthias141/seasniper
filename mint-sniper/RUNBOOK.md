@@ -7,7 +7,9 @@ the numbered steps in order; each is written to be done, not pondered.
 
 Cross-reference: `CLAUDE.md`'s "Known gaps" section for what's unverified,
 `ui/README.md`'s "Security model" section for exactly what the API token
-does and doesn't protect against.
+does and doesn't protect against, `DEPLOY.md` (step 15) for the first-time
+VPS setup checklist — this file is for when something's already running
+and something's gone wrong, not for standing it up in the first place.
 
 ---
 
@@ -199,3 +201,139 @@ threat model.
 7. **If the leak vector was a browser/extension**, the token rotation in
    steps 2-4 is the fix — reinstall or remove the compromised extension
    before trusting that browser with the new token.
+
+---
+
+## 5. Lost a WebAuthn device (step 10e)
+
+Trigger: a laptop or phone holding one of your two registered passkeys
+is lost, stolen, wiped, or its authenticator storage is reset.
+
+**The normal case — you still have your OTHER registered device.** This
+is fully self-service through the UI, no DB access needed:
+
+1. Sign in on the surviving device (Google → TOTP → WebAuthn assertion
+   from that device).
+2. Open the device list (`GET /auth/webauthn/devices`) and identify the
+   lost device's row.
+3. Revoke it (`POST /auth/webauthn/devices/<id>/revoke`). This deletes
+   the credential row outright — there is no "undo," the same as any
+   other credential revocation.
+4. If you want a replacement device registered, do that now — revoking
+   first frees a slot under the 2-device cap (`start_registration`
+   rejects a 3rd registration attempt with a clear error rather than
+   silently overwriting or silently allowing it; see `identity/
+   webauthn.rs`'s `ADMIN_CREDENTIAL_CAP`).
+
+**The hard case — you lost BOTH registered devices at once (or the 2nd
+was already lost and never revoked).** There is currently no self-service
+path for this: per step 10f's model, even VIEWING wallet status requires
+a session that has completed Google + TOTP + a WebAuthn assertion from a
+still-registered device — with zero valid devices left, no session can
+ever reach that state, and there is no "email yourself a recovery link"
+flow (no SMTP is configured anywhere in this project, and step 10 is
+explicitly scoped to one operator, not a multi-user system with an admin
+who could intervene on your behalf).
+
+The actual recovery path is direct access to the machine running the
+bot — which you have, since this is a self-hosted single-operator tool,
+not a SaaS you're locked out of. You are clearing your OWN device
+registrations because you still control the server; this is not an
+identity-verification problem the way a "forgot my Google password" flow
+is.
+
+1. **Stop the bot** (`Ctrl-C` the `cargo run` process). `identity.db` is
+   SQLite in WAL mode; editing it while the process holds it open risks
+   a corrupt read on the next boot.
+2. **Open `identity.db` with any SQLite client** (`sqlite3 identity.db`
+   if you have the CLI installed; this project's own binary vendors
+   SQLite internally via `sqlite-bundled` but does not expose a query
+   shell of its own, so bring your own — DB Browser for SQLite works too
+   if you'd rather not use a terminal).
+3. **Clear your WebAuthn credentials** so the 2-device cap no longer
+   blocks re-registration:
+   ```sql
+   DELETE FROM webauthn_credentials WHERE user_id = (SELECT id FROM users WHERE email = 'you@example.com');
+   ```
+4. **If you ALSO lost access to your TOTP app** (not just the WebAuthn
+   devices — these are separate factors and losing one doesn't imply
+   losing the other), clear that too so 10d's setup flow can be re-run
+   from scratch instead of rejecting a "wrong" code forever:
+   ```sql
+   DELETE FROM totp_secrets WHERE user_id = (SELECT id FROM users WHERE email = 'you@example.com');
+   ```
+5. **Restart the bot**, sign in with Google (still works — that identity
+   was never touched), then redo whichever of 10d (TOTP) / 10e (WebAuthn)
+   setup you cleared above.
+6. **Treat this as a real incident, not routine maintenance.** Anyone
+   who could run steps 1-4 above already had the level of access needed
+   to fully compromise this bot regardless of step 10's identity layer
+   (they're on the machine holding the wallet private keys) — but if
+   this recovery was needed because a device was STOLEN rather than
+   merely lost/wiped by you, also work through Section 1 (suspected
+   private key compromise) and Section 4 (API token compromised) above,
+   since a stolen laptop/phone may carry more than just a passkey.
+
+---
+
+## 6. Cloudflare Access policy compromised (step 10.5c)
+
+Trigger: the Access application's allow-list was misconfigured (too
+broad an email/group), a team member's Google account on the allow-list
+was itself compromised, or you simply need to revoke public reachability
+entirely — e.g. before extended travel, or the moment you notice
+unexpected activity in Cloudflare's Access audit log.
+
+**Read this first — what Access actually gates.** Per `ui/README.md`'s
+10.5c section: Access blocks unauthenticated traffic at Cloudflare's
+edge, before it ever reaches this machine. It is NOT step 10's
+authorization boundary — someone who passes a compromised/over-broad
+Access policy still hits Google Sign-In + TOTP + WebAuthn + step-up auth
+exactly as before. **This means a compromised Access policy is a
+reduced-attack-surface incident, not an "attacker can arm/fire" incident
+by itself** — check step 10's own audit trail (below) before assuming
+the worst, but still treat it seriously: it's the layer that was
+supposed to keep credential-stuffing/scanning traffic away from this
+process at all, and an attacker who gets THROUGH Access still gets to
+try their luck against step 10's real auth, which they otherwise
+wouldn't have been able to reach.
+
+1. **Immediately tighten or disable the Access application** — Cloudflare
+   dashboard → Zero Trust → Access → Applications → the tunnel's
+   application → either edit the policy down to just your own account,
+   or toggle the application off entirely. This takes effect immediately
+   at Cloudflare's edge; no restart of this bot is needed.
+2. **Check Cloudflare's Access audit log** (Zero Trust → Logs → Access)
+   for who actually authenticated through the compromised policy and
+   when — this tells you whether anyone besides you got past Access at
+   all, which scopes how seriously to treat the rest of this list.
+3. **Cross-reference against step 10's own record of what happened past
+   Access**, since Access's log only proves someone reached the login
+   wall, not what they did after: check `audit.log` (step 7g,
+   DB-attribution pending step 11e) for any arm/fire/config-change/
+   target-set event in the same window Access's log flagged, and check
+   `identity.db`'s `sessions` table for any session created in that
+   window you don't recognize
+   (`SELECT * FROM sessions WHERE created_at > <window_start>;`).
+4. **If step 3 shows a session or action you don't recognize**, this
+   escalates to a real step 10 identity incident, not just an Access
+   misconfiguration — work through Section 5 above (clearing WebAuthn/
+   TOTP) for the affected user, and Section 1/4 if wallet-adjacent
+   actions are involved.
+5. **If step 3 comes back clean** (Access was reachable by more people
+   than intended, but nobody who reached it got past step 10's own
+   login), fixing the Access policy in step 1 is the complete remediation
+   — no identity.db changes needed, since step 10's own boundary held.
+6. **Rotate the underlying credential if the compromise was a Google
+   account on the allow-list being taken over** (not just a policy
+   configured too broadly) — remove that account from the Access
+   group/policy AND, if that account also has a step 10 `users` row,
+   treat it as Section 5's "lost device" hard case for that user, since
+   whoever controls their Google account can now also pass step 10c's
+   own Google Sign-In step.
+7. **Once step 11 lands**, re-scope the Access group down to exactly the
+   operators who still hold an active invite — an operator whose access
+   was revoked at the step 10/11 identity layer but left in the
+   Cloudflare Access group can still reach the login wall (harmless on
+   its own, per this section's opening note, but pointless exposure);
+   keep the two lists in sync as part of any operator offboarding.

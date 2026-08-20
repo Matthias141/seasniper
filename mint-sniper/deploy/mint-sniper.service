@@ -1,0 +1,49 @@
+[Unit]
+Description=mint-sniper bot + control API
+# Only meaningful if this box also runs cloudflared (step 10.5b) or
+# tailscaled — starting mint-sniper before the tunnel is up just means
+# the control deck is briefly unreachable, not a functional problem
+# (the bot binds 127.0.0.1 regardless), but ordering it after avoids a
+# confusing "can't reach it" moment right after boot.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated, unprivileged system user — created by deploy.sh, never root.
+# This process holds private keys in memory; it should own as little of
+# the machine as possible.
+User=mint-sniper
+Group=mint-sniper
+WorkingDirectory=/opt/mint-sniper
+# Everything the binary reads relative to CWD (config.toml, .sniper-token,
+# identity.db, ui/dist — see api.rs's ServeDir fallback, step 15b) resolves
+# from here. Never change this without also moving those files.
+ExecStart=/opt/mint-sniper/mint-sniper
+
+# STEP 15b — secrets (wallet private keys, GOOGLE_OAUTH_CLIENT_SECRET_ENV's
+# target if identity is configured) live in this EnvironmentFile, never
+# inline in this unit — unit files under /etc/systemd/system are typically
+# world-readable (0644); an EnvironmentFile can and must be locked down to
+# 0600, owned by the mint-sniper user, same "secrets never touch a
+# loosely-permissioned file" standard this repo already holds config.toml/
+# .sniper-token/identity.db to. See mint-sniper.env.example and DEPLOY.md.
+EnvironmentFile=/opt/mint-sniper/mint-sniper.env
+
+# Real crash → restart; a deliberate stop (deploy, `systemctl stop`) does
+# not loop. 5s backoff is enough to not hot-loop against a persistently
+# broken config (e.g. an RPC URL typo) while still recovering quickly from
+# a transient fault (RPC endpoint blip, OOM kill).
+Restart=on-failure
+RestartSec=5
+
+# No new privileges, no writable system dirs beyond WorkingDirectory —
+# defense in depth on top of the dedicated user above. Does NOT use
+# ProtectSystem=strict/ReadOnlyPaths, since the binary needs to write
+# config.toml (PUT /api/config), .sniper-token, identity.db, and
+# audit.log inside WorkingDirectory itself.
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

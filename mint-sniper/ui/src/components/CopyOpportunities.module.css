@@ -1,0 +1,120 @@
+.panel {
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.heading {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.16em;
+  color: var(--color-text-tertiary);
+  margin-bottom: var(--space-2);
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.placeholder {
+  color: var(--color-text-tertiary);
+  font-size: var(--text-sm);
+  padding: var(--space-2);
+}
+
+.card {
+  border-radius: var(--radius-md);
+  padding: var(--space-2) var(--space-3);
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: var(--space-1) var(--space-3);
+  align-items: center;
+  border: 1px solid transparent;
+}
+
+/* Free opportunities read as "safe / already handled" — success green,
+   quiet. Paid opportunities read as "needs you" — accent amber, louder,
+   with an explicit action. Visually distinct on purpose, not just a text
+   label — see step 6d's requirement to make a fire/no-fire decision at
+   a glance. */
+.free {
+  background: color-mix(in srgb, var(--color-success) 10%, var(--color-surface-1));
+  border-color: color-mix(in srgb, var(--color-success) 35%, transparent);
+}
+
+.paid {
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-surface-1));
+  border-color: color-mix(in srgb, var(--color-accent) 45%, transparent);
+}
+
+.paidOverCeiling {
+  background: color-mix(in srgb, var(--color-danger) 10%, var(--color-surface-1));
+  border-color: color-mix(in srgb, var(--color-danger) 40%, transparent);
+}
+
+.badge {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  width: fit-content;
+}
+
+.free .badge {
+  background: var(--color-success);
+  color: var(--color-surface-0);
+}
+
+.paid .badge,
+.paidOverCeiling .badge {
+  background: var(--color-accent);
+  color: var(--color-surface-0);
+}
+
+.paidOverCeiling .badge {
+  background: var(--color-danger);
+}
+
+.contract {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+
+.meta {
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+}
+
+.fireBtn {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.08em;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-accent);
+  background: transparent;
+  color: var(--color-accent);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.fireBtn:hover:not(:disabled) {
+  background: var(--color-accent);
+  color: var(--color-surface-0);
+}
+
+.fireBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.fireBtn.fired {
+  border-color: var(--color-success);
+  color: var(--color-success);
+}

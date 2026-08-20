@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-alloy = { version = "0.9", features = ["full", "node-bindings"] }
+alloy = { version = "2", features = ["full", "node-bindings"] }
 tokio = { version = "1", features = ["full"] }
-serde = { version = "=1.0.210", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 anyhow = "1"
@@ -17,6 +17,64 @@ futures = "0.3"
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 url = "2"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
+
+# --- identity (step 10) ---
+# See CLAUDE.md's "Identity (step 10)" section for the full stack writeup
+# and why each of these was picked over alternatives (crates.io/docs.rs
+# checked live, not assumed from training data — same discipline as the
+# alloy 2.4.1 upgrade in step 9).
+#
+# Google OIDC/OAuth2, full ID token validation against live JWKS.
+# default-features (reqwest + rustls-tls, via oauth2) match this project's
+# own reqwest/rustls usage above.
+openidconnect = "4"
+# RFC 6238 TOTP. otpauth = otpauth:// URI support, qr = server-side QR PNG
+# generation (qrcodegen-image), gen_secret = random secret generation.
+totp-rs = { version = "6", features = ["otpauth", "qr", "gen_secret"] }
+# WebAuthn relying party. danger-allow-state-serialisation is required to
+# persist in-progress registration/authentication ceremony state (the
+# challenge) across the two HTTP round-trips a ceremony spans — despite
+# the name, this is the documented, intended way to do exactly that; it's
+# not a security downgrade on its own (see identity/webauthn.rs).
+webauthn-rs = { version = "0.5", features = ["danger-allow-state-serialisation"] }
+# axum-extra 0.9.x, NOT the newer 0.12.x line: 0.12 requires axum ^0.8.9,
+# incompatible with this project's pinned axum = "0.7". 0.9.6 requires
+# axum ^0.7.8 and has the same cookie-private (PrivateCookieJar) feature.
+# An axum 0.7->0.8 bump is its own separately-scoped upgrade, not
+# something to smuggle into identity work — same reasoning as step 9's
+# alloy upgrade being its own dedicated step.
+axum-extra = { version = "0.9", default-features = false, features = ["cookie-private"] }
+# SQLite via sqlx, async, fits the existing tokio/axum stack. sqlite-bundled
+# vendors libsqlite3 (no system sqlite3 needed). tls-none = explicit:
+# SQLite itself has no network/TLS need, and sqlx's feature graph wants a
+# TLS choice made rather than left implicit. "macros" is enabled solely
+# because the sqlx::migrate! macro lives in the sqlx-macros crate, which
+# "macros" is what pulls in — this does NOT mean query!/query_as! (the
+# compile-time-checked query variants) are used anywhere in this codebase;
+# those would require a live DB or committed .sqlx metadata at build time,
+# which this project's CI (step 7c) isn't set up for, so plain runtime
+# sqlx::query/query_as are used at every call site instead. A real
+# tradeoff (losing compile-time SQL verification), not an oversight.
+sqlx = { version = "0.9", default-features = false, features = ["sqlite-bundled", "runtime-tokio", "migrate", "macros", "tls-none"] }
+# TOTP secrets and WebAuthn credential-adjacent fields at rest, encrypted
+# with the same key-file pattern auth.rs already uses for the bearer token.
+# Pinned to 0.10, not the newer 0.11 line: 0.11 reworked its Nonce/Key
+# types onto the newer `hybrid-array` crate (a real, documented API
+# change, not a guess) — 0.10.x's typenum/generic-array-based API is the
+# one actually used in identity/crypto.rs, checked live against docs.rs.
+aes-gcm = "0.10"
+# User IDs / session IDs, and webauthn-rs's own user-handle type.
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+# Only for .oneshot() in auth.rs's require_token_or_session router tests
+# (step 10g) — already in the dependency graph transitively via alloy at
+# this exact version, so this doesn't add a new dependency version to
+# resolve, just makes ServiceExt reachable from this crate's own tests.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = true

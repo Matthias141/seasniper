@@ -35,6 +35,26 @@ pub enum ServerEvent {
         address: String,
         success: bool,
         detail: String,
+        /// STEP 13e — real fire-path timing, chain-agnostic (plain
+        /// `Instant` deltas, no chain-specific logic anywhere in how
+        /// these are computed — see `executor::fire_prepared`'s doc
+        /// comment). All `None` only for the pre-13e-shaped tests /
+        /// call sites; a real fire always sets `trigger_to_dispatch_ms`
+        /// at minimum, and `send_to_ack_ms`/`dispatch_to_inclusion_ms`
+        /// too once broadcast is actually acked/included. Named to
+        /// match MintDash's own published Robinhood Chain terms
+        /// (send→ack, mintDuration) for a direct, honest comparison —
+        /// see CLAUDE.md's step 13 section.
+        trigger_to_dispatch_ms: Option<u64>,
+        send_to_ack_ms: Option<u64>,
+        dispatch_to_inclusion_ms: Option<u64>,
+        /// How long this wallet's tx sat pre-signed before dispatch — the
+        /// "prepare complete (signed)" stage. Near-zero in the FireNow
+        /// no-prior-prepare fallback (signs right before dispatch); can be
+        /// seconds-to-tens-of-seconds in normal armed operation, up to
+        /// `POLL_STATE_REPREPARE_INTERVAL_SECS` in poll_state mode. Always
+        /// set — every fired wallet has a real `prepared_at`.
+        prepare_age_ms: u64,
     },
     /// Emitted by `api::put_config` after a validated config write. Kept as
     /// its own typed variant, not folded into `Log`, specifically so
@@ -42,6 +62,26 @@ pub enum ServerEvent {
     /// persisting every routine `Log` message (RPC errors, info noise) —
     /// see `audit.rs`'s doc comment.
     ConfigChanged,
+    /// Emitted by copymint.rs's watcher whenever a tracked wallet's mint
+    /// is detected AND independently verified live via getPublicDrop (see
+    /// copymint.rs's doc comment for why that verification is not
+    /// optional — it's what stands in for the human review every other
+    /// trigger mode gets from being manually configured). Sent for BOTH
+    /// free and paid opportunities, whether or not this one goes on to
+    /// auto-fire — the UI needs to show what happened either way.
+    /// `fireable` is independently re-derived by api.rs's manual-fire
+    /// route at fire time too, never trusted back from a client echo of
+    /// this event — see that route's doc comment.
+    CopyOpportunity {
+        tracked_wallet: String,
+        nft_contract: String,
+        fee_recipient: String,
+        mint_price_wei: String,
+        total_value_wei: String,
+        quantity: u64,
+        is_free: bool,
+        fireable: bool,
+    },
 }
 
 pub type EventBus = broadcast::Sender<ServerEvent>;

@@ -11,12 +11,27 @@ http_rpc_urls = [
   "https://mainnet.infura.io/v3/YOUR_KEY",
 ]
 
+# STEP 14a — only sizes the HTTP-fallback poll interval
+# inclusion::wait_for_receipt uses when it can't establish a WS push
+# subscription for post-fire receipt detection. Default (12000) matches
+# mainnet's ~12s blocks; set this to the REAL block time of whatever
+# chain you're targeting, e.g. 100 for Robinhood Chain (confirmed via
+# real consecutive block timestamps, step 13d/14b) — see CLAUDE.md's
+# step 14 section. Does NOT affect trigger_mode = "poll_state" (step
+# 13c), which reacts to every block push unconditionally regardless of
+# this value.
+block_time_ms = 12000
+# How long inclusion::wait_for_receipt waits for a fired tx's receipt
+# (push or HTTP-fallback poll) before reporting a timed-out result
+# instead of hanging indefinitely. Must be >= block_time_ms.
+inclusion_timeout_ms = 30000
+
 # "custom" (arbitrary project mint(), config below) or "seadrop" (fixed
 # ISeaDrop.mintPublic ABI — see src/seadrop.rs, and the seadrop-mode
 # example commented out at the bottom of this file).
 mint_mode = "custom"
 
-contract_address = "0x0000000000000000000000000000000000dEaD"
+contract_address = "0x000000000000000000000000000000000000dEaD"
 
 # ABI fragment for the mint call you'll actually send. Adjust selector + args
 # per-project — this is the single most common reason a sniper silently fails.
@@ -90,4 +105,68 @@ private_key_env = "SNIPER_PK_3"
 # getPublicDrop(nftContract) at boot and arms for that exact second.
 # contract_address / mint_fn_signature / mint_state_fn_signature are unused
 # in this mode (mint target is the SeaDrop singleton, ABI is fixed).
+
+# --- Example: targeting Robinhood Chain instead of Ethereum mainnet (step
+# 13) — no config schema is chain-specific, this is purely a different
+# ws_rpc_url/http_rpc_urls. chain_id is read live from the RPC at prepare
+# time (executor.rs), never hardcoded, so nothing else below needs to
+# change to switch networks. seadrop_address's mainnet/Polygon default
+# (see above) is also confirmed correct on Robinhood Chain — SEE 13a in
+# CLAUDE.md's "Robinhood Chain support" section before relying on this
+# for a real mint, not just this comment.
+#
+# Mainnet (chain id 4663):
+# ws_rpc_url = "wss://robinhood-mainnet.g.alchemy.com/v2/YOUR_KEY"
+# http_rpc_urls = ["https://robinhood-mainnet.g.alchemy.com/v2/YOUR_KEY"]
+#
+# Testnet (chain id 46630) — for dry runs, see RUNBOOK.md/CLAUDE.md's
+# step 13d dry-run notes before a real mint:
+# ws_rpc_url = "wss://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY"
+# http_rpc_urls = ["https://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY"]
+# Faucet: https://faucet.testnet.chain.robinhood.com
+# Explorer: https://explorer.testnet.chain.robinhood.com
+#
+# STEP 14a/14b — also set block_time_ms (above) to Robinhood Chain's
+# real observed block time, not the mainnet default: measured directly
+# from consecutive block timestamps during step 14b's benchmark, not
+# just the documented ~100ms figure — see CLAUDE.md's step 14 section
+# for the exact measured value.
+# block_time_ms = 100
+
+# --- Copymint (step 6) — watch tracked wallets for SeaDrop mintPublic
+# activity and mint the same collection ourselves. SeaDrop-only, always
+# runs in the background independent of trigger_mode/armed state above —
+# see src/copymint.rs's doc comment for the full design and its safety
+# model. Empty by default: copymint does nothing until tracked_wallets is
+# populated. NOT live-fire-verified from this authoring environment (see
+# CLAUDE.md's "copymint" section and known gap #11) — validate on testnet
+# before trusting this for a real drop.
+tracked_wallets = []              # e.g. ["0xSomeWalletYouWantToCopy", ...]
+
+# Free copymint opportunities (mint_price_wei == 0, verified fresh via
+# getPublicDrop, never guessed) can auto-fire out of the box — downside
+# is bounded to gas, same ceiling as max_priority_fee_gwei_cap above.
+copymint_auto_fire_free = true
+
+# Paid copymint opportunities NEVER auto-fire regardless of this value —
+# see copymint.rs's should_auto_fire, which doesn't even take this field
+# as a parameter. This only controls whether the UI offers a one-click
+# manual fire button for a specific paid opportunity.
+copymint_auto_fire_paid = false
+
+# Hard ceiling (wei, TOTAL value = price * quantity_per_wallet, not
+# per-token) above which a paid copymint opportunity is never offered as
+# fireable — checked independently of copymint_auto_fire_paid, both when
+# the opportunity is first surfaced and again, fresh, at manual-fire time.
+# 0 = nothing paid is fireable until you raise this deliberately.
+max_copymint_price_wei = 0
+
+# --- identity (step 10c) — Google Sign-In. Leave all three empty/unset
+# to leave identity disabled entirely (existing bearer-token-only
+# behavior, unchanged) — the app boots and runs exactly as before.
+# All three must be set together or not at all (Config::validate rejects
+# a partial set). See CLAUDE.md's "Identity (step 10)" section.
+google_oauth_client_id = ""             # e.g. "123-abc.apps.googleusercontent.com" — NOT a secret, from Google Cloud Console
+google_oauth_client_secret_env = ""     # env var NAME (not the value) holding the OAuth Client Secret, e.g. "GOOGLE_OAUTH_CLIENT_SECRET"
+google_oauth_redirect_url = ""          # must exactly match a Redirect URI registered on the OAuth client, e.g. "https://sniper.your-tailnet.ts.net:4117/auth/google/callback"
 
