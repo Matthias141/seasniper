@@ -1407,6 +1407,49 @@ survives a reboot) a mandatory, non-optional first-time-setup step on
 
 ## The bot's own WS connection failed with "Must be authenticated!" (step 17)
 
+**CORRECTION, added after further live debugging the same night — read
+this before anything else in this section.** The actual, confirmed root
+cause of that night's live crash loop was **not** the alloy `WsConnect`
+behavior described below. It was a plain, mundane config mistake: an
+unedited placeholder value left in `http_rpc_urls`
+(`"https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"` — the literal
+`YOUR_KEY` string from `config.example.toml`, never swapped in when
+`ws_rpc_url` was correctly updated for Robinhood Chain). Alchemy quite
+reasonably rejected that literal, unedited key, and its rejection
+produces the exact same `error code -32600: Must be authenticated!` text
+that the alloy userinfo-extraction bug below would *also* produce — two
+unrelated causes, one identical-looking symptom. That's the actual reason
+this took two full investigation rounds of alloy source-diving plus live
+debugging on the real VPS to resolve, instead of being caught in minutes:
+the wrong root cause was chased first, based on a plausible-sounding but
+ultimately wrong theory, because it was investigated before the simpler
+possibility was ruled out.
+
+**Process lesson for future sessions, stated explicitly so this isn't
+relearned live at 2am again:** when an error message is generic enough to
+plausibly come from more than one unrelated cause — as
+"-32600 Must be authenticated!" was here, matching both a stale/wrong RPC
+URL value and a URL-parsing/auth-header bug — check the simplest,
+most-recently-touched possibility FIRST (a config field that was hand-
+edited earlier in the same session, in this case) before escalating to a
+deeper code investigation. Reading `config.toml` end to end for anything
+that still says `YOUR_KEY`, `CHANGE_ME`, or any other example/placeholder
+text — a 30-second check — would have found this immediately. It was
+found live on the VPS only after the investigation below had already run
+its course.
+
+**The alloy `WsConnect` finding below is still real and still correctly
+fixed — it just isn't what broke this specific deploy.** It's a genuine,
+source-confirmed behavior of `alloy-transport-ws` that this codebase
+never wants triggered, so `Config::validate()`'s rejection of embedded
+URL credentials and the redacted-URL error wrapping on all four
+`connect_ws` call sites (both described below) are staying in the
+codebase as legitimate hardening — a latent bug worth having closed,
+independent of whether it caused this particular incident. Likewise the
+`bus::log`-invisible-to-`journalctl` fix in the step 17 follow-up further
+below is a real, independently-confirmed observability gap, unaffected by
+this correction.
+
 **Symptom, live-confirmed on the real deployed VPS:** the bot crash-looped
 at boot with `server returned an error response: error code -32600: Must
 be authenticated!` from Alchemy, on the exact same `wss://` URL and key
@@ -1414,10 +1457,17 @@ that both a plain HTTP curl AND a bare Node.js `ws` client (sending
 `eth_chainId`) succeeded against. This ruled out the credential/Alchemy
 app itself — something specific to how *this codebase* opens the
 connection differed from a bare WS client in a way Alchemy's endpoint
-read as an auth attempt gone wrong.
+read as an auth attempt gone wrong. (As the correction above explains,
+this framing — comparing the bot's WS connection to a bare client's WS
+connection — was itself pointed in the wrong direction: the actual
+failing request that night was an HTTP call using the stale
+`http_rpc_urls` placeholder, not the WS connection at all. Left as
+originally written below for the historical record of what was
+investigated and why, not as a statement of what actually happened.)
 
-**Root cause, confirmed by reading alloy 2.4.1's actual source (not
-assumed from memory), both a code fact and a config/docs gap:**
+**Alloy-side finding, confirmed by reading alloy 2.4.1's actual source
+(not assumed from memory) — a real, worth-fixing behavior, NOT this
+incident's cause (see correction above):**
 `alloy-transport-ws`'s `WsConnect::new(url)` parses the given URL and, if
 it contains userinfo (`wss://user:pass@host/...` or `wss://user@host/...`),
 auto-extracts it via `Authorization::extract_from_url` and injects an HTTP
@@ -1442,10 +1492,15 @@ out — connection setup issues nothing beyond a standard WS upgrade (plus
 the conditional Authorization header above) before normal JSON-RPC
 traffic begins.
 
-**This session could not confirm the operator's real `config.toml` was
-actually corrupted this way** — no access to that file exists from this
-sandbox, and the fix stands regardless of whether that was the literal
-trigger this specific night. What shipped:
+**At the time this was written, this session could not confirm the
+operator's real `config.toml` was actually corrupted this way — it
+subsequently was not** (see the correction at the top of this section:
+the real cause was a stale placeholder in `http_rpc_urls`, found later by
+live debugging on the actual VPS). The fix below stands anyway, as
+legitimate hardening against a real behavior confirmed directly in
+alloy's source — it closes a latent bug this codebase never wants
+triggered, independent of whether it caused this specific incident. What
+shipped:
 
 1. **`Config::validate()`** (`src/config.rs`) now rejects any
    `ws_rpc_url`/`http_rpc_urls` entry containing embedded userinfo
@@ -1476,8 +1531,16 @@ trigger this specific night. What shipped:
    hitting the failure, not after.
 
 **Follow-up, same night: the fix deployed correctly but the operator saw
-the exact same unwrapped error anyway.** This is the actual answer to
-"which boot-path call site was missed" — none was. An exhaustive re-grep
+the exact same unwrapped error anyway.** (In hindsight, this was
+inevitable and unrelated to any gap in the WS fix itself — per the
+correction at the top of this section, the WS code was never what was
+failing that night, so no amount of hardening it further was going to
+change the error the operator saw. But the investigation this follow-up
+round did — confirming no 5th WS call site exists, and finding the
+separate `bus::log`-invisible-to-`journalctl` gap below — is real and
+independently worth having, regardless of the wrong initial premise.)
+This round's original framing was "which boot-path call site was
+missed" — the honest answer turned out to be none. An exhaustive re-grep
 (`grep -rn "WsConnect::new\|connect_ws\|extract_from_url" src/`, and
 separately confirmed no bare `tokio_tungstenite`/raw WS client exists
 anywhere outside these four — `api.rs`'s and `state.rs`'s `WebSocket`
@@ -1525,35 +1588,36 @@ time for `= WsConnect::new(` call sites and fails if the count or the set
 of files changes, so a fifth call site added later can't silently ship
 without the same redacted-URL-context + tracing + bus::log treatment.
 
-**Operator verification (this session cannot reach the live VPS to
-confirm directly, same boundary as every other live-deploy step):**
+**Historical operator-verification steps below, left as originally
+written for the record of what was actually asked and tried, superseded
+by the correction at the top of this section.** The real fix for that
+night's incident was simply editing `http_rpc_urls` to replace the
+literal `YOUR_KEY` placeholder with the operator's real Alchemy key,
+found and applied directly on the VPS through live debugging, not through
+anything shipped in a commit — there was no code or config-shape bug to
+patch for the actual cause, since a correctly-filled-in placeholder needs
+no validation to catch (an *unedited* placeholder is, definitionally,
+syntactically valid config the way a real key is too — `Config::validate`
+has no way to distinguish "a URL with a plausible-looking key" from "a
+URL with the literal example key still in it"). The commands below were
+this session's best-effort verification guidance at the time, written
+before the real cause was known:
 ```
 cd /opt/mint-sniper/repo && sudo -u mint-sniper git pull --ff-only origin main
 sudo -u mint-sniper -H bash -c "source \$HOME/.cargo/env && cd /opt/mint-sniper/repo/mint-sniper && cargo build --release"
 sudo systemctl restart mint-sniper
 sudo systemctl status mint-sniper --no-pager   # expect: active (running), not a crash loop
-sudo journalctl -u mint-sniper -n 50 --no-pager  # NOW actually shows watcher/copymint errors — before this
-                                                  # follow-up, bus::log-only paths were invisible here regardless
-                                                  # of 17b's fix. Look for: the config load failing outright with
-                                                  # "RPC url contains embedded credentials" (confirms 17a's
-                                                  # hypothesis was the trigger — fix ws_rpc_url and restart), OR a
-                                                  # "watcher exited with an error: ... opening the WebSocket RPC
-                                                  # connection to wss://<host>/*** ..." / "copymint watcher error:
-                                                  # ..." line with the real underlying reason, OR nothing at all
-                                                  # (service came up clean).
+sudo journalctl -u mint-sniper -n 50 --no-pager  # the step 17 follow-up's tracing::error! fix (below) means this
+                                                  # now actually shows watcher/copymint errors, where before it
+                                                  # would have shown nothing from those two paths regardless
 ```
-If `journalctl` now shows the new validate() rejection instead of a crash
-loop, that confirms 17a's hypothesis was the actual trigger — fix
-`config.toml`'s `ws_rpc_url` to remove anything before the host and
-restart again. If it instead shows a "watcher exited with an error"/
-"copymint watcher error" line (now visible for the first time — this
-follow-up's own fix), that reason, not 17a's userinfo theory, is the real
-cause; treat that text as authoritative over anything guessed here. If
-the service comes up clean with no error at all, the fix already resolved
-it silently (nothing further needed). Either way,
-confirm live RPC connectivity itself via the bot's own `/api/status`
-endpoint or a log line showing a successful block subscription — not just
-"the process didn't crash."
+**The lesson that actually resolved this** — stated in the correction at
+the top of this section, repeated here since it's the part worth a future
+operator or session actually internalizing: before chasing a WS-connect
+code theory for an ambiguous auth-flavored RPC error, read `config.toml`
+end to end for any field that still says `YOUR_KEY` or other
+`config.example.toml` placeholder text. It is the fastest possible check
+and would have found this in well under a minute.
 
 **16b — `deploy/setup-cloudflared.sh`, prepared, not run.** Same
 division of labor as `deploy.sh` and the EC2 provisioning itself: this
