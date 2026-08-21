@@ -1601,6 +1601,94 @@ config swap, the balance gate, or anything upstream of reading the
 result back. All of that is now independently confirmed working
 correctly by the very journalctl evidence that surfaced this bug.
 
+**A genuinely new, unresolved finding surfaced by that same single
+successful fire — flagged, investigated as far as this session can,
+NOT explained away.** Tonight's one confirmed-good PUSH-path fire (3
+wallets, `method="push"` on every result — not a polling-interval
+confound, the first time that's ever been true in this project's
+history) measured `dispatch_to_inclusion_ms` of **2722 / 2876 / 3023**
+— roughly **12x** step 14b's real, measured Robinhood Chain testnet
+block time (~227ms, from 1,000 consecutive block timestamps). Sepolia's
+14b numbers validated the pipeline by clustering almost exactly at one
+block; these numbers are nowhere near that. This can no longer be
+dismissed as a detection-method artifact the way every prior benchmark
+had to be — it's a real PUSH-path number, and it's the first one that
+ever existed.
+
+**Public documentation research (WebSearch, `docs.robinhood.com/chain`,
+current as of this writing) directly informs, and substantially
+reframes, this investigation:**
+- Robinhood Chain's sequencer uses **first-come-first-served ordering
+  — "higher gas fees do not confer priority."** This makes the
+  gas-pricing hypothesis (a too-low `priority_fee_multiplier`/
+  `max_priority_fee_gwei_cap` for testnet conditions) **unlikely to be
+  the actual cause**, unlike on a standard EVM chain where it would be
+  the obvious first suspect. Worth checking anyway (see tooling below),
+  but the documented model itself argues against it.
+- There is a **separate, low-latency sequencer feed**
+  (`wss://feed.testnet.chain.robinhood.com`) distinct from what a
+  standard RPC provider (Alchemy, in this bot's case) exposes,
+  explicitly documented for full nodes wanting the fastest possible
+  view of new blocks. This makes a **different** hypothesis newly
+  plausible: real on-chain inclusion may have been fast, while THIS
+  bot's subscribed RPC node was itself slow to learn about / propagate
+  that new block to its `subscribe_blocks()` subscriber — meaning
+  `dispatch_to_inclusion_ms` would be measuring RPC-node lag, not
+  genuine sequencer delay. This is a real, RPC-quality-dependent
+  explanation, but a fundamentally different one from send→ack's "how
+  fast did we hear a broadcast was accepted" latency — it does NOT
+  automatically inherit send→ack's "proximity explains it" conclusion,
+  and must not be bucketed with it without actual evidence either way.
+
+**A real, concrete gap found while trying to investigate this at all:
+the bot never logged the actual gas price used, anywhere.**
+`executor.rs::prepare_fire` computes `base_fee`/`wallet_priority_fee`/
+`max_fee_per_gas` but never logged any of them — not to `tracing`, not
+to `audit.log` — so there was no way to check item 1 above (real gas
+conditions vs. what was configured) after the fact at all. Fixed: the
+existing `"wallet prepared"` `info!` log line (already `tracing`-based,
+durable in `journalctl`) now carries `base_fee_wei`,
+`wallet_priority_fee_wei`, and `max_fee_per_gas_wei`.
+
+**New tooling prepared, not run — this session still cannot reach the
+real chain or a real fire's tx hash:**
+`deploy/lib/diagnose_inclusion_delay.py` takes a confirmed tx hash and
+its logged `dispatch_to_inclusion_ms`, fetches the real receipt +
+surrounding block timestamps, and computes how many REAL blocks
+actually separated dispatch from inclusion — the one measurement that
+can actually distinguish "real sequencer delay" from "our RPC node's
+own propagation lag," which no amount of reasoning from this sandbox
+can substitute for. ≤2 blocks elapsed → node/subscription lag, not real
+delay; more than that → genuine on-chain delay, and per the FCFS
+finding above, NOT expected to respond to raising the gas-price config
+knobs. `run-benchmark.sh`'s own summary output now points at this tool
+automatically for any outlier fire. Tested
+(`deploy/tests/test-diagnose-inclusion-delay.py`, 9 assertions) against
+fixture blocks modeling both this investigation's actual numbers (a
+~2722ms duration against a 227ms block time, correctly classified as
+real delay) and the fast-inclusion/slow-detection counter-scenario —
+all against an injectable RPC dependency, no real network needed for
+the test itself.
+
+**What this session can honestly report, and what it cannot:** the
+public-docs research rules gas pricing IN as checkable but OUT as the
+likely primary cause, and identifies RPC-node propagation lag as a
+newly plausible, well-motivated alternative — both real findings. But
+**no full n=15 run exists yet**, and this single sample (n=1, all three
+values from the SAME arm, not independent draws across arms) cannot be
+treated as a distribution — the task's own item 3 is exactly right
+that one slow sample must not define the whole result, and the
+inverse is equally true: it must not be dismissed as a one-off without
+the real n=15 distribution to check that against either. **Final
+p50/p90 for both metrics, the real verdict on whether this ~12x gap
+persists across a full run, and the actual per-metric colocation
+conclusion all remain genuinely unwritten** — they belong in a future
+15f update once the operator has actually run a complete, uncrashed
+n=15 benchmark and, ideally, the diagnostic tool above against at
+least one of its outliers. Reporting a verdict without that data would
+be exactly the kind of unearned confidence this project's own
+"verify, don't guess" standard has consistently rejected elsewhere.
+
 **Still gated on the operator actually running these** — the real
 numbers, the final "is gap #11 closed" confirmation, and the
 per-metric colocation verdict all belong in a 15f update to this

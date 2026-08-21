@@ -431,6 +431,16 @@ echo "    marking step 14b's HTTP-poll-only numbers as superseded (not"
 echo "    deleted), same convention as every other superseded figure in"
 echo "    this project."
 echo
+echo "==> If any individual dispatch_to_inclusion_ms is a clear outlier"
+echo "    (many multiples of step 14b's measured ~227ms block time),"
+echo "    investigate before trusting it at face value — it can mean real"
+echo "    on-chain delay, or this bot's own RPC subscription lagging"
+echo "    behind real inclusion, and those need very different responses."
+echo "    Grab that fire's tx hash from the matching audit.log entry's"
+echo "    \"detail\" field (the literal tx hash on a successful mint), then run:"
+echo "      python3 \"$SCRIPT_DIR/lib/diagnose_inclusion_delay.py\" \\"
+echo "        \$TESTNET_HTTP_RPC_URL <tx_hash> <dispatch_to_inclusion_ms>"
+echo
 echo "==> steps 5-7 (restore original config.toml, restart, verify) run next"
 echo "    automatically via this script's cleanup trap — see output below."
 

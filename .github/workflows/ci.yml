@@ -213,6 +213,13 @@ jobs:
       - name: deploy/tests/test-find-mint-result.sh
         run: mint-sniper/deploy/tests/test-find-mint-result.sh
 
+      # STEP 15 FOLLOW-UP — investigation tooling for the real,
+      # unexplained dispatch_to_inclusion_ms finding (a confirmed
+      # PUSH-path fire measuring ~12x step 14b's 227ms testnet block
+      # time). See deploy/lib/diagnose_inclusion_delay.py's header.
+      - name: deploy/tests/test-diagnose-inclusion-delay.py
+        run: python3 mint-sniper/deploy/tests/test-diagnose-inclusion-delay.py
+
   secrets:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
