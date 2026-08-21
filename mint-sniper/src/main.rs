@@ -507,18 +507,28 @@ async fn control_loop(
                 // declaration comment for why this can't be deferred to
                 // fire_prepared itself.
                 block_ticker = inclusion::establish_block_ticker(&cfg.ws_rpc_url).await;
-                bus::log(
-                    &state.bus,
-                    "info",
-                    format!(
-                        "inclusion detection: {} for this arm session",
-                        if block_ticker.is_some() {
-                            "WS push path established"
-                        } else {
-                            "WS push path unavailable, using HTTP poll fallback"
-                        }
-                    ),
+                // STEP 15d — this is the one line 14a's own doc comment
+                // points to as proof PUSH engaged rather than falling back
+                // to POLL, but per step 17's finding, `bus::log` alone
+                // never reaches `journalctl` (UI-only), and audit.rs's
+                // writer explicitly skips `ServerEvent::Log` too (see its
+                // own comment: "not what RUNBOOK.md's checklists need a
+                // durable record of"). That left this specific line
+                // reachable ONLY by watching the live UI at the exact
+                // moment of Arm — unusable for after-the-fact verification
+                // on a headless VPS. Also emit via `tracing::info!` so
+                // `journalctl -u mint-sniper` shows it durably, same
+                // pattern as step 17's fix.
+                let inclusion_detection_msg = format!(
+                    "inclusion detection: {} for this arm session",
+                    if block_ticker.is_some() {
+                        "WS push path established"
+                    } else {
+                        "WS push path unavailable, using HTTP poll fallback"
+                    }
                 );
+                tracing::info!("{inclusion_detection_msg}");
+                bus::log(&state.bus, "info", inclusion_detection_msg);
                 prepared_fire = None;
 
                 state.armed.store(true, Ordering::Relaxed);

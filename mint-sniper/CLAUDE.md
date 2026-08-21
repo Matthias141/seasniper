@@ -1193,9 +1193,12 @@ Step 15 is split explicitly around what this session can and can't do:
 15a/15b are research and preparation, completed now; 15c-15e need a real
 VPS the operator provisions — no VPS account or credentials exist in
 this session, same reason step 10.5's Cloudflare API token had to come
-from the operator directly. **15c-15e have not started as of this
-writing** — this section will be updated once the operator confirms the
-VPS is live.
+from the operator directly. **The VPS is now live (step 16/17). 15c-15e
+are prepared as ready-to-run scripts (`deploy/benchmark-token.sh`,
+`deploy/run-benchmark.sh`) and `DEPLOY.md` §9 instructions — not yet
+executed, since this session still can't reach that VPS directly.** See
+the "15c-15e" subsection below for what's ready and what genuinely
+still needs the operator to run it.
 
 ### 15a — VPS provider + region recommendation
 
@@ -1328,22 +1331,68 @@ complexity judgment itself.
   re-verification by actually cutting a tag — out of scope for this
   step.
 
-### 15c-15e — gated behind real VPS provisioning
+### 15c-15e — prepared and ready to run; not yet executed
 
-Not started. Once the operator confirms a VPS is live and the bot is
-deployed on it (`DEPLOY.md`), this section will be replaced with: real
-confirmation that `subscribe_blocks`/`subscribe_full_pending_transactions`/
-14a's PUSH path connect cleanly outside this sandbox's TLS limitation
-(closing gap #11 for real, with actual evidence — a connected
-subscription, a real detected trigger — not "should work now"); a
-re-run of 14b's benchmark methodology with PUSH actually engaged; and a
-final, per-metric colocation recommendation — send→ack's ~22ms gap
-already has a plausible proximity explanation from 14b that this step
-should either confirm or correct with real numbers from an
-actually-well-placed host; dispatch→inclusion's verdict depends
-entirely on numbers that don't exist yet, per 14b's own explicit
-gating (don't propose self-hosting a node for a gap that might still be
-a detection-method artifact until PUSH is validated live).
+The operator's VPS is now confirmed live (step 16/17's real first
+deploy) — the environment this whole gap #11 closure has been waiting
+for since step 5 finally exists. This session still can't reach it
+directly (same boundary as every prior live-deploy step), so 15c-15e
+are prepared as ready-to-run scripts + `DEPLOY.md` instructions
+(§9), not executed here:
+
+- **`deploy/benchmark-token.sh`** — `check <addr>` calls
+  `getPublicDrop` directly and compares `endTime` to now to confirm
+  step 14b's original benchmark token
+  (`0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9`) is still live;
+  `redeploy` deploys a fresh, identically-configured one via Foundry
+  (`forge create` + `cast send updatePublicDrop`) if it's expired —
+  likely, given it was only ever deployed "live for 7 days." Notes
+  explicitly that this session never got Foundry installed in its own
+  sandbox (`foundryup`'s GitHub fetch 403'd against this session's
+  scoped network access) but that this was a sandbox-specific block,
+  not a Foundry one — a real VPS with normal internet access should
+  install it the standard documented way.
+- **A real gap found and fixed while preparing 15d, not hypothetical:**
+  the exact log line 14a's own doc comment names as proof PUSH engaged
+  (`inclusion detection: WS push path established` /
+  `... unavailable, using HTTP poll fallback`) was only ever reachable
+  by watching the live browser UI at the precise moment of Arm —
+  `bus::log` never reaches `journalctl` (step 17's finding) AND
+  `audit.rs`'s writer explicitly skips `ServerEvent::Log` too (its own
+  comment: "not what RUNBOOK.md's checklists need a durable record
+  of"). That made 15d's own ask — "check the event feed/audit log for
+  whichever log line distinguishes push vs. poll mode" — genuinely
+  impossible to satisfy after the fact on a headless VPS with the
+  tooling as it stood. Fixed by adding a `tracing::info!` call
+  alongside the existing `bus::log` call for this specific line (same
+  pattern as step 17's fix), so `journalctl -u mint-sniper` now shows
+  it durably. `DEPLOY.md` §9's 15d instructions are built around this
+  fix, not the old UI-only visibility.
+- **`deploy/run-benchmark.sh`** — automates the full n=15+ loop
+  (`/api/arm` → wait for the resulting `mint_result` audit.log entry →
+  repeat), replacing the manual per-fire commands step 17's live
+  debugging session had to resort to. Prints p50/p90 for both
+  `send_to_ack_ms` and `dispatch_to_inclusion_ms` (same two metrics
+  14b measured), plus a push-vs-poll count cross-checking 15d across
+  the whole run. Relies on `mint_mode = "seadrop"` forcing
+  `trigger_mode = "timestamp"` with the drop's real, already-past
+  `startTime` at boot (confirmed directly against `main.rs` — not
+  assumed) so each `/api/arm` alone triggers a fire within about a
+  second, no separate manual trigger call needed. Explicitly flags,
+  rather than silently working around, the two things that need the
+  operator's own judgment: confirming a testnet-ETH faucet transfer
+  actually landed before spending 15+ real mints against that balance,
+  and that a step-up-TOTP-gated instance (identity/step 10c enabled)
+  can't have this loop automated at all — a human would need to supply
+  a fresh code before every single arm, which the script does not
+  attempt to fake.
+
+**Still gated on the operator actually running these** — the real
+numbers, the final "is gap #11 closed" confirmation, and the
+per-metric colocation verdict all belong in a 15f update to this
+section once that happens, not before. Until then: PUSH-based numbers
+do not exist yet, and 14b's POLL-based numbers stand as the last real
+measurement, not superseded by anything written in this session.
 
 ## Live first deploy — real findings (step 16)
 
