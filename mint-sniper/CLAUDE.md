@@ -1531,6 +1531,76 @@ existing `test-benchmark-token.sh`, so this whole class of bug — and
 this specific one, if it ever regresses — fails a real, per-push CI
 check instead of reaching a live VPS silently again.
 
+**Follow-up: fire 1/15 of an actual n=15 run crashed on result
+parsing — with the mint pipeline itself confirmed genuinely correct.**
+Real signal, not a regression: `journalctl` showed all 3 configured
+wallets firing, all 3 confirming via the real WS PUSH path
+(`method="push"` on every result), with real `send_to_ack_ms`/
+`dispatch_to_inclusion_ms` values logged for each — the swap, restart,
+balance gate, and actual mint pipeline from the fix above all worked.
+The script crashed reading its OWN result back out of `audit.log`:
+```
+jq: error (at <stdin>:1): Cannot index string with string "success"
+```
+**Root cause, confirmed directly from `audit.rs`'s source, not
+guessed:** `AuditRecord` serializes its `detail` field with
+`#[serde(flatten)]`:
+```rust
+struct AuditRecord<'a> {
+    ts: u64,
+    event: &'a str,
+    #[serde(flatten)]
+    detail: serde_json::Value,
+}
+```
+`flatten` means the `MintResult` object's own keys —
+`success`/`send_to_ack_ms`/`dispatch_to_inclusion_ms`, AND a
+*separate*, differently-shaped `detail` field that's actually a plain
+STRING (a human-readable message like `"confirmed"`) — all land
+directly on the TOP-LEVEL audit record. There is no nested
+`"detail": {...}` wrapper the way the Rust field name suggests. A real
+line looks like:
+```json
+{"ts":1755800001,"event":"mint_result","address":"0x...","success":true,"detail":"confirmed","trigger_to_dispatch_ms":4,"send_to_ack_ms":139,"dispatch_to_inclusion_ms":978,"prepare_age_ms":30}
+```
+`run-benchmark.sh`'s `.detail.success` was therefore indexing that
+top-level `detail` STRING with `"success"` — exactly the observed
+error, reproduced locally by feeding a record reconstructed straight
+from this struct through the identical `jq -r '.detail.success'`
+expression, byte for byte.
+
+**Fixed:** the field-extraction logic was pulled out of
+`run-benchmark.sh` into `deploy/lib/find_mint_result.sh` — same
+"independently testable, no drift between what's tested and what
+actually runs" reasoning as the swap/balance-gate scripts before it —
+and now reads the flattened top-level fields directly, projecting the
+matched record down to `{success, send_to_ack_ms,
+dispatch_to_inclusion_ms}` so the rest of the pipeline (the results
+file, the Python p50/p90 summary) never has to know about the
+`detail`-naming collision at all. The embedded Python summary parser
+had the exact same bug (`json.loads(line)["detail"]`) — fixed the same
+way, reading the record directly.
+
+**Verified two ways, not just fixed and trusted:** (1) reproduced the
+exact crash locally by running `.detail.success` against a record
+reconstructed directly from `audit.rs`'s own serialization code — not
+a paraphrase of the live report; (2) added
+`deploy/tests/test-find-mint-result.sh` (9 assertions: a real-shaped
+success record, a reverted/failed record, a `TimedOut` record with
+`dispatch_to_inclusion_ms: null`, no-match-yet, and multiple wallets
+firing per arm) and confirmed it actually catches the bug by
+temporarily reintroducing the old `.detail.X` nesting assumption into
+`find_mint_result.sh` — the test suite crashed with the identical `jq`
+error the operator saw live — then restored the fix and confirmed
+clean. Wired into CI's `deploy-scripts` job alongside the others.
+
+**Root cause classification:** purely a script-side result-parsing
+bug — a mismatch between what `#[serde(flatten)]` actually produces
+and what the shell script assumed, not a bug in the mint pipeline, the
+config swap, the balance gate, or anything upstream of reading the
+result back. All of that is now independently confirmed working
+correctly by the very journalctl evidence that surfaced this bug.
+
 **Still gated on the operator actually running these** — the real
 numbers, the final "is gap #11 closed" confirmation, and the
 per-metric colocation verdict all belong in a 15f update to this
