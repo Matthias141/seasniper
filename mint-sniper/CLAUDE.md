@@ -1395,10 +1395,10 @@ human-readable bracket — a real captured line looked like
 assumed. Feeding that whole string into bash's `(( ))` arithmetic threw
 a syntax error and crashed the `check` subcommand outright. The
 underlying RPC call and value were confirmed correct both before and
-after the fix (the operator manually verified the same benchmark token,
-`0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9`, was still live with
-~2.8 days remaining) — this was purely a text-parsing bug, never a
-wrong call or a wrong token. Fixed by extracting just the leading digit
+after the fix (the operator manually verified the step 14b benchmark
+address (same one line 1106/1346 above already reference) was still
+live with ~2.8 days remaining) — this was purely a text-parsing bug,
+never a wrong call or a wrong contract. Fixed by extracting just the leading digit
 run with `grep -oE '[0-9]+' | head -1` instead of `tr -d '[:space:]'`
 alone, deliberately NOT switching to `cast call --json` + `jq`: `jq` is
 not installed by default on a stock Ubuntu VPS either (confirmed the
