@@ -1193,9 +1193,12 @@ Step 15 is split explicitly around what this session can and can't do:
 15a/15b are research and preparation, completed now; 15c-15e need a real
 VPS the operator provisions — no VPS account or credentials exist in
 this session, same reason step 10.5's Cloudflare API token had to come
-from the operator directly. **15c-15e have not started as of this
-writing** — this section will be updated once the operator confirms the
-VPS is live.
+from the operator directly. **The VPS is now live (step 16/17). 15c-15e
+are prepared as ready-to-run scripts (`deploy/benchmark-token.sh`,
+`deploy/run-benchmark.sh`) and `DEPLOY.md` §9 instructions — not yet
+executed, since this session still can't reach that VPS directly.** See
+the "15c-15e" subsection below for what's ready and what genuinely
+still needs the operator to run it.
 
 ### 15a — VPS provider + region recommendation
 
@@ -1328,22 +1331,68 @@ complexity judgment itself.
   re-verification by actually cutting a tag — out of scope for this
   step.
 
-### 15c-15e — gated behind real VPS provisioning
+### 15c-15e — prepared and ready to run; not yet executed
 
-Not started. Once the operator confirms a VPS is live and the bot is
-deployed on it (`DEPLOY.md`), this section will be replaced with: real
-confirmation that `subscribe_blocks`/`subscribe_full_pending_transactions`/
-14a's PUSH path connect cleanly outside this sandbox's TLS limitation
-(closing gap #11 for real, with actual evidence — a connected
-subscription, a real detected trigger — not "should work now"); a
-re-run of 14b's benchmark methodology with PUSH actually engaged; and a
-final, per-metric colocation recommendation — send→ack's ~22ms gap
-already has a plausible proximity explanation from 14b that this step
-should either confirm or correct with real numbers from an
-actually-well-placed host; dispatch→inclusion's verdict depends
-entirely on numbers that don't exist yet, per 14b's own explicit
-gating (don't propose self-hosting a node for a gap that might still be
-a detection-method artifact until PUSH is validated live).
+The operator's VPS is now confirmed live (step 16/17's real first
+deploy) — the environment this whole gap #11 closure has been waiting
+for since step 5 finally exists. This session still can't reach it
+directly (same boundary as every prior live-deploy step), so 15c-15e
+are prepared as ready-to-run scripts + `DEPLOY.md` instructions
+(§9), not executed here:
+
+- **`deploy/benchmark-token.sh`** — `check <addr>` calls
+  `getPublicDrop` directly and compares `endTime` to now to confirm
+  step 14b's original benchmark token
+  (`0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9`) is still live;
+  `redeploy` deploys a fresh, identically-configured one via Foundry
+  (`forge create` + `cast send updatePublicDrop`) if it's expired —
+  likely, given it was only ever deployed "live for 7 days." Notes
+  explicitly that this session never got Foundry installed in its own
+  sandbox (`foundryup`'s GitHub fetch 403'd against this session's
+  scoped network access) but that this was a sandbox-specific block,
+  not a Foundry one — a real VPS with normal internet access should
+  install it the standard documented way.
+- **A real gap found and fixed while preparing 15d, not hypothetical:**
+  the exact log line 14a's own doc comment names as proof PUSH engaged
+  (`inclusion detection: WS push path established` /
+  `... unavailable, using HTTP poll fallback`) was only ever reachable
+  by watching the live browser UI at the precise moment of Arm —
+  `bus::log` never reaches `journalctl` (step 17's finding) AND
+  `audit.rs`'s writer explicitly skips `ServerEvent::Log` too (its own
+  comment: "not what RUNBOOK.md's checklists need a durable record
+  of"). That made 15d's own ask — "check the event feed/audit log for
+  whichever log line distinguishes push vs. poll mode" — genuinely
+  impossible to satisfy after the fact on a headless VPS with the
+  tooling as it stood. Fixed by adding a `tracing::info!` call
+  alongside the existing `bus::log` call for this specific line (same
+  pattern as step 17's fix), so `journalctl -u mint-sniper` now shows
+  it durably. `DEPLOY.md` §9's 15d instructions are built around this
+  fix, not the old UI-only visibility.
+- **`deploy/run-benchmark.sh`** — automates the full n=15+ loop
+  (`/api/arm` → wait for the resulting `mint_result` audit.log entry →
+  repeat), replacing the manual per-fire commands step 17's live
+  debugging session had to resort to. Prints p50/p90 for both
+  `send_to_ack_ms` and `dispatch_to_inclusion_ms` (same two metrics
+  14b measured), plus a push-vs-poll count cross-checking 15d across
+  the whole run. Relies on `mint_mode = "seadrop"` forcing
+  `trigger_mode = "timestamp"` with the drop's real, already-past
+  `startTime` at boot (confirmed directly against `main.rs` — not
+  assumed) so each `/api/arm` alone triggers a fire within about a
+  second, no separate manual trigger call needed. Explicitly flags,
+  rather than silently working around, the two things that need the
+  operator's own judgment: confirming a testnet-ETH faucet transfer
+  actually landed before spending 15+ real mints against that balance,
+  and that a step-up-TOTP-gated instance (identity/step 10c enabled)
+  can't have this loop automated at all — a human would need to supply
+  a fresh code before every single arm, which the script does not
+  attempt to fake.
+
+**Still gated on the operator actually running these** — the real
+numbers, the final "is gap #11 closed" confirmation, and the
+per-metric colocation verdict all belong in a 15f update to this
+section once that happens, not before. Until then: PUSH-based numbers
+do not exist yet, and 14b's POLL-based numbers stand as the last real
+measurement, not superseded by anything written in this session.
 
 ## Live first deploy — real findings (step 16)
 
@@ -1404,6 +1453,220 @@ not complete at all on this instance size. `DEPLOY.md` section 2 now
 makes a 4GB swapfile (with the `/etc/fstab` persistence line, so it
 survives a reboot) a mandatory, non-optional first-time-setup step on
 `t4g.small` specifically, not an optional performance tweak.
+
+## The bot's own WS connection failed with "Must be authenticated!" (step 17)
+
+**CORRECTION, added after further live debugging the same night — read
+this before anything else in this section.** The actual, confirmed root
+cause of that night's live crash loop was **not** the alloy `WsConnect`
+behavior described below. It was a plain, mundane config mistake: an
+unedited placeholder value left in `http_rpc_urls`
+(`"https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"` — the literal
+`YOUR_KEY` string from `config.example.toml`, never swapped in when
+`ws_rpc_url` was correctly updated for Robinhood Chain). Alchemy quite
+reasonably rejected that literal, unedited key, and its rejection
+produces the exact same `error code -32600: Must be authenticated!` text
+that the alloy userinfo-extraction bug below would *also* produce — two
+unrelated causes, one identical-looking symptom. That's the actual reason
+this took two full investigation rounds of alloy source-diving plus live
+debugging on the real VPS to resolve, instead of being caught in minutes:
+the wrong root cause was chased first, based on a plausible-sounding but
+ultimately wrong theory, because it was investigated before the simpler
+possibility was ruled out.
+
+**Process lesson for future sessions, stated explicitly so this isn't
+relearned live at 2am again:** when an error message is generic enough to
+plausibly come from more than one unrelated cause — as
+"-32600 Must be authenticated!" was here, matching both a stale/wrong RPC
+URL value and a URL-parsing/auth-header bug — check the simplest,
+most-recently-touched possibility FIRST (a config field that was hand-
+edited earlier in the same session, in this case) before escalating to a
+deeper code investigation. Reading `config.toml` end to end for anything
+that still says `YOUR_KEY`, `CHANGE_ME`, or any other example/placeholder
+text — a 30-second check — would have found this immediately. It was
+found live on the VPS only after the investigation below had already run
+its course.
+
+**The alloy `WsConnect` finding below is still real and still correctly
+fixed — it just isn't what broke this specific deploy.** It's a genuine,
+source-confirmed behavior of `alloy-transport-ws` that this codebase
+never wants triggered, so `Config::validate()`'s rejection of embedded
+URL credentials and the redacted-URL error wrapping on all four
+`connect_ws` call sites (both described below) are staying in the
+codebase as legitimate hardening — a latent bug worth having closed,
+independent of whether it caused this particular incident. Likewise the
+`bus::log`-invisible-to-`journalctl` fix in the step 17 follow-up further
+below is a real, independently-confirmed observability gap, unaffected by
+this correction.
+
+**Symptom, live-confirmed on the real deployed VPS:** the bot crash-looped
+at boot with `server returned an error response: error code -32600: Must
+be authenticated!` from Alchemy, on the exact same `wss://` URL and key
+that both a plain HTTP curl AND a bare Node.js `ws` client (sending
+`eth_chainId`) succeeded against. This ruled out the credential/Alchemy
+app itself — something specific to how *this codebase* opens the
+connection differed from a bare WS client in a way Alchemy's endpoint
+read as an auth attempt gone wrong. (As the correction above explains,
+this framing — comparing the bot's WS connection to a bare client's WS
+connection — was itself pointed in the wrong direction: the actual
+failing request that night was an HTTP call using the stale
+`http_rpc_urls` placeholder, not the WS connection at all. Left as
+originally written below for the historical record of what was
+investigated and why, not as a statement of what actually happened.)
+
+**Alloy-side finding, confirmed by reading alloy 2.4.1's actual source
+(not assumed from memory) — a real, worth-fixing behavior, NOT this
+incident's cause (see correction above):**
+`alloy-transport-ws`'s `WsConnect::new(url)` parses the given URL and, if
+it contains userinfo (`wss://user:pass@host/...` or `wss://user@host/...`),
+auto-extracts it via `Authorization::extract_from_url` and injects an HTTP
+`Authorization` header into the WebSocket upgrade handshake
+(`alloy-transport-ws-2.4.1/src/native.rs`'s `IntoClientRequest` impl,
+backed by `alloy-transport-2.4.1/src/common.rs`'s
+`Authorization::extract_from_url`). A bare `ws` client never does this —
+it sends whatever URL you give it as a plain WS upgrade with no
+credential-flavored header at all. Alchemy's auth model for this codebase
+is a path-embedded API key (`/v2/<KEY>`), never URL userinfo — so this
+auto-extraction is never wanted behavior here, and a `ws_rpc_url` with any
+stray `@`/`:` before the host (this exact `config.toml` had already
+produced two other copy-paste corruptions earlier that same deploy night
+— a missing closing quote, a truncated key) would silently make alloy
+send a bogus Basic-auth header Alchemy was never expecting, while a bare
+client sending the identical-looking URL correctly sends none. The three
+alternative 17a hypotheses (an alloy-internal auto `eth_chainId`/subscribe
+call at connect time despite `disable_recommended_fillers()`; some other
+non-standard header/handshake step) were checked against alloy's actual
+`ClientBuilder::ws`/`connect_ws`/`PubSubConnect::connect` source and ruled
+out — connection setup issues nothing beyond a standard WS upgrade (plus
+the conditional Authorization header above) before normal JSON-RPC
+traffic begins.
+
+**At the time this was written, this session could not confirm the
+operator's real `config.toml` was actually corrupted this way — it
+subsequently was not** (see the correction at the top of this section:
+the real cause was a stale placeholder in `http_rpc_urls`, found later by
+live debugging on the actual VPS). The fix below stands anyway, as
+legitimate hardening against a real behavior confirmed directly in
+alloy's source — it closes a latent bug this codebase never wants
+triggered, independent of whether it caused this specific incident. What
+shipped:
+
+1. **`Config::validate()`** (`src/config.rs`) now rejects any
+   `ws_rpc_url`/`http_rpc_urls` entry containing embedded userinfo
+   credentials outright, at config load/save time — not silently letting
+   it through to surface as an opaque connect-time auth failure hours
+   later. Same "catch a bad shape at startup/save time" principle as
+   every other check in that function.
+2. **Error context, all four `connect_ws` call sites**
+   (`copymint.rs::watch_once`, `inclusion.rs::establish_block_ticker`,
+   `watcher.rs::run_state_poll_watcher`, `watcher.rs::run_mempool_watcher`)
+   now wrap the connect failure with which code path was connecting AND a
+   *redacted* form of the RPC URL (scheme+host only, via the new
+   `config::redact_rpc_url` — never the raw URL, since the path segment
+   IS the API key and this project's secrets-never-touch-a-log rule
+   applies here same as everywhere else). `establish_block_ticker`
+   specifically used to swallow the connect error entirely (by design —
+   HTTP-polling fallback is the correct response to WS being unavailable)
+   but gave the operator zero information about *why* it failed; it now
+   logs the real reason via `warn!` before falling back, same "surface
+   the real reason, don't swallow it" standard as step 3b's revert-reason
+   fix. A future occurrence of this — or any other WS connect failure —
+   is now diagnosable from the systemd journal alone: which watcher, which
+   host, and the real underlying error text, no live Node.js test harness
+   needed to even start isolating it.
+3. **`config.example.toml`** now has an explicit warning above
+   `ws_rpc_url` explaining the path-vs-userinfo distinction and why it
+   matters, so a future operator copying this file has the context before
+   hitting the failure, not after.
+
+**Follow-up, same night: the fix deployed correctly but the operator saw
+the exact same unwrapped error anyway.** (In hindsight, this was
+inevitable and unrelated to any gap in the WS fix itself — per the
+correction at the top of this section, the WS code was never what was
+failing that night, so no amount of hardening it further was going to
+change the error the operator saw. But the investigation this follow-up
+round did — confirming no 5th WS call site exists, and finding the
+separate `bus::log`-invisible-to-`journalctl` gap below — is real and
+independently worth having, regardless of the wrong initial premise.)
+This round's original framing was "which boot-path call site was
+missed" — the honest answer turned out to be none. An exhaustive re-grep
+(`grep -rn "WsConnect::new\|connect_ws\|extract_from_url" src/`, and
+separately confirmed no bare `tokio_tungstenite`/raw WS client exists
+anywhere outside these four — `api.rs`'s and `state.rs`'s `WebSocket`
+hits are axum's own *inbound* `/ws/events` upgrade for the browser UI,
+unrelated to any outbound Alchemy connection) turned up the same four call
+sites and nothing else. `main.rs`'s own synchronous startup path (before
+any watcher spawns) makes zero WS calls at all — only `http_rpc_urls`
+ones (`seadrop::fetch_public_drop`, `wallet::load_wallets`,
+`connect_http`) — and `alloy-rpc-client-2.4.1/src/builtin.rs` (checked
+directly) confirms the `Http(url)` transport variant never calls
+`Authorization::extract_from_url` at all — only the `Ws` variant does. So
+17a's finding is WS-only, confirmed, not something to also guard against
+on the HTTP side.
+
+**The real gap: `bus::log` (`bus.rs::log`) only pushes onto the internal
+event bus the browser UI's `/ws/events` stream consumes — it never calls
+a `tracing` macro, so it never reaches stdout, and therefore never reaches
+`journalctl`.** Two of the three failure paths that route through it were
+logging ONLY that way:
+- `copymint.rs::run_copymint_watcher`'s own error handler for
+  `watch_once`'s failures.
+- `main.rs::spawn_supervised_watcher` — the wrapper both
+  `run_state_poll_watcher` and `run_mempool_watcher` failures flow
+  through, which logs and disarms on error.
+
+17b's redacted-URL context was correctly attached to the underlying
+`anyhow::Error` in both cases — it was genuinely present in the
+`{e:#}` formatted into the `bus::log` call — but since that call never
+reaches the journal, `journalctl -u mint-sniper` would show *nothing at
+all* from these two paths, old error text or new, watcher.rs's third path
+(`inclusion.rs::establish_block_ticker`'s `warn!`) was never affected —
+it already called `tracing::warn!` directly, not `bus::log` — which is
+why it's the one to imitate, not the exception. Fixed by adding a
+`tracing::error!` call alongside the existing `bus::log` call in both of
+the other two spots, so the exact same message reaches both the UI and
+the journal. **Neither a code bug in the WS-connect logic itself (17a/17b
+already had that right) nor a config gap — an observability gap in this
+codebase's own two error-reporting call sites**, invisible until an
+operator actually relied on `journalctl` alone per 17c's own instructions
+and found nothing there.
+
+Also added `main.rs::tests::every_ws_connect_call_site_is_accounted_for`
+— a regression guard, not just a one-time check: it greps `src/` at test
+time for `= WsConnect::new(` call sites and fails if the count or the set
+of files changes, so a fifth call site added later can't silently ship
+without the same redacted-URL-context + tracing + bus::log treatment.
+
+**Historical operator-verification steps below, left as originally
+written for the record of what was actually asked and tried, superseded
+by the correction at the top of this section.** The real fix for that
+night's incident was simply editing `http_rpc_urls` to replace the
+literal `YOUR_KEY` placeholder with the operator's real Alchemy key,
+found and applied directly on the VPS through live debugging, not through
+anything shipped in a commit — there was no code or config-shape bug to
+patch for the actual cause, since a correctly-filled-in placeholder needs
+no validation to catch (an *unedited* placeholder is, definitionally,
+syntactically valid config the way a real key is too — `Config::validate`
+has no way to distinguish "a URL with a plausible-looking key" from "a
+URL with the literal example key still in it"). The commands below were
+this session's best-effort verification guidance at the time, written
+before the real cause was known:
+```
+cd /opt/mint-sniper/repo && sudo -u mint-sniper git pull --ff-only origin main
+sudo -u mint-sniper -H bash -c "source \$HOME/.cargo/env && cd /opt/mint-sniper/repo/mint-sniper && cargo build --release"
+sudo systemctl restart mint-sniper
+sudo systemctl status mint-sniper --no-pager   # expect: active (running), not a crash loop
+sudo journalctl -u mint-sniper -n 50 --no-pager  # the step 17 follow-up's tracing::error! fix (below) means this
+                                                  # now actually shows watcher/copymint errors, where before it
+                                                  # would have shown nothing from those two paths regardless
+```
+**The lesson that actually resolved this** — stated in the correction at
+the top of this section, repeated here since it's the part worth a future
+operator or session actually internalizing: before chasing a WS-connect
+code theory for an ambiguous auth-flavored RPC error, read `config.toml`
+end to end for any field that still says `YOUR_KEY` or other
+`config.example.toml` placeholder text. It is the fastest possible check
+and would have found this in well under a minute.
 
 **16b — `deploy/setup-cloudflared.sh`, prepared, not run.** Same
 division of labor as `deploy.sh` and the EC2 provisioning itself: this

@@ -83,7 +83,7 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::TransactionTrait;
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// mintPublic(address,address,address,uint256) — same signature
 /// `seadrop.rs`'s `encode_mint_public` builds calldata for.
@@ -198,6 +198,17 @@ pub async fn run_copymint_watcher(state: SharedState) {
         };
 
         if let Err(e) = watch_once(&state, &tracked, seadrop_address).await {
+            // STEP 17 FOLLOW-UP — `bus::log` ONLY pushes onto the internal
+            // event bus consumed by the UI's `/ws/events` stream (see
+            // bus.rs::log — it never calls a tracing macro). That made
+            // 17b's redacted-URL context wrapping on `watch_once`'s
+            // `connect_ws` call invisible to `journalctl`/systemd — the
+            // exact diagnostic path 17c told the operator to check —
+            // even though the wrapping was correctly applied and correctly
+            // reaching the UI. Also emit via `tracing::error!` so this is
+            // visible from the journal alone, same as every other watcher
+            // error path in this codebase.
+            error!("copymint watcher error: {e:#} — reconnecting in 10s");
             bus::log(
                 &state.bus,
                 "error",
@@ -216,7 +227,12 @@ async fn watch_once(state: &SharedState, tracked: &[Address], seadrop_address: A
         .disable_recommended_fillers()
         .connect_ws(ws)
         .await
-        .context("copymint: opening the WebSocket RPC connection")?;
+        .with_context(|| {
+            format!(
+                "copymint: opening the WebSocket RPC connection to {}",
+                crate::config::redact_rpc_url(&cfg.ws_rpc_url)
+            )
+        })?;
 
     let sub = provider.subscribe_full_pending_transactions().await.context(
         "copymint: subscribing to full pending transactions — needs a WebSocket RPC on a node \

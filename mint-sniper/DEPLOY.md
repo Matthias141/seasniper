@@ -282,6 +282,89 @@ sudo systemctl restart mint-sniper
 `audit.log` all live directly in `/opt/mint-sniper/` (the systemd
 unit's `WorkingDirectory`), untouched by a redeploy.
 
+## 9. Step 15c-15e — the real PUSH benchmark, once this VPS is live
+
+This is the actual point of getting a real VPS running — closing gap
+#11 for real (this bot's WS transport has never once connected outside
+a coding sandbox whose own TLS-interception proxy blocks it) and
+getting a genuinely PUSH-based `dispatch_to_inclusion_ms` number
+instead of step 14b's honestly-labeled-but-still-POLL-based one. All
+three scripts below are prepared and ready to run; none of them have
+been run by any coding session, since none of them can reach this VPS.
+
+**15c — confirm or redeploy the benchmark token:**
+```bash
+export RPC_URL=https://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY   # your own testnet key
+./deploy/benchmark-token.sh check 0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9   # step 14b's original
+```
+If that reports EXPIRED (likely, by the time a real VPS exists — it
+was deployed "live for 7 days" back in step 14b):
+```bash
+export DEPLOYER_PK=0x...   # a Robinhood Chain TESTNET-funded key — see the
+                            # script's own header comment before running
+./deploy/benchmark-token.sh redeploy
+```
+Note the new `nft_contract` address it prints — you'll need it for
+`config.toml` below. Foundry (`forge`/`cast`) needs installing first if
+it isn't already — the script's header comment covers this: this
+session could never get Foundry working in its own coding sandbox
+(GitHub release fetch 403'd due to this session's own scoped network
+access), but that was a sandbox-specific limitation, not a Foundry one
+— a real VPS with normal internet access should install it the
+standard way (`curl -L https://foundry.paradigm.xyz | bash && foundryup`)
+with no special workaround needed.
+
+**Update `config.toml`** with the confirmed-live (or freshly redeployed)
+token, then restart:
+```toml
+mint_mode = "seadrop"
+nft_contract = "<address from above>"
+fee_recipient = "0x0000a26b00c1F0DF003000390027140000fAa719"
+quantity_per_wallet = 1
+block_time_ms = 227   # step 14b's real measured Robinhood testnet figure
+```
+Keep exactly ONE `[[wallets]]` entry for this — the benchmark script's
+methodology assumes sequential single-wallet fires, same as step 14b.
+```bash
+sudo systemctl restart mint-sniper
+```
+
+**15d — confirm PUSH actually engages (not silently falling back to
+POLL, which is what every single benchmark before this one has been
+stuck doing per gap #11):**
+```bash
+sudo journalctl -u mint-sniper -f
+# in another terminal, arm once:
+curl -sS -X POST -H "Authorization: Bearer $(cat /opt/mint-sniper/.sniper-token)" http://127.0.0.1:4117/api/arm
+```
+Look for the line `inclusion detection: WS push path established for
+this arm session` in the journal output. If it instead says `WS push
+path unavailable, using HTTP poll fallback`, gap #11 is NOT closed on
+this box — check `ws_rpc_url` is reachable from here directly
+(`curl` won't test WS, but a bad/unreachable URL, an expired key, or a
+firewall egress rule blocking outbound 443 to Alchemy would all produce
+this) before running the full benchmark. This log line was previously
+only visible in the live browser UI at the exact moment of arming —
+neither `journalctl` nor `audit.log` carried it (`bus::log`'s events
+don't reach either — see CLAUDE.md's step 17 finding on this same
+gap). Fixed alongside this step so it's checkable after the fact, same
+as everything else on this VPS.
+
+**15e — run the actual benchmark:**
+```bash
+cd /opt/mint-sniper
+sudo -u mint-sniper /opt/mint-sniper/repo/mint-sniper/deploy/run-benchmark.sh 15
+```
+Read the script's own header comment for prerequisites BEFORE running
+— it will not check for you whether your testnet ETH faucet transfer
+actually landed, and it cannot automate a step-up TOTP loop if identity
+(step 10c) is enabled on this instance. Prints a p50/p90 summary for
+both `send_to_ack_ms` and `dispatch_to_inclusion_ms` at the end, plus a
+push-vs-poll count cross-checking 15d across the whole run.
+
+**15f — update CLAUDE.md** with the real numbers this produces,
+following step 15e's own printed reminder at the end of its output.
+
 ## What this checklist does NOT cover
 
 DNS/Cloudflare Access policy setup (see `ui/README.md` §10.5c),
