@@ -81,7 +81,24 @@ case "$MODE" in
       "$NFT_CONTRACT" --rpc-url "$RPC_URL")
     echo "$RESULT"
 
-    END_TIME=$(echo "$RESULT" | sed -n '3p' | tr -d '[:space:]')
+    # STEP 15c FOLLOW-UP — a real bug found live on the VPS: cast's
+    # DEFAULT text output annotates any integer it judges "large" with a
+    # human-readable bracket, e.g. a real endTime line looked like
+    # `1787557476 [1.787e9]`, not the bare `1787557476` this script
+    # originally assumed. Feeding that whole string into bash's (( ))
+    # arithmetic below fails outright on the bracket — confirmed the
+    # underlying RPC call and value were correct both times, this was
+    # purely a parsing bug. Fixed by extracting just the leading digit
+    # run with grep, deliberately NOT reaching for `cast call --json` +
+    # jq instead: jq is not installed by default on a stock Ubuntu VPS
+    # (confirmed live — nothing installed it the night this bug was
+    # found), and grep/sed/tr ship with bash everywhere, so this has one
+    # fewer dependency to go missing on a fresh box. `grep -oE '[0-9]+'`
+    # is intentionally NOT anchored with `^` — it matches the first
+    # digit run wherever it starts, so it doesn't care whether cast adds
+    # leading whitespace, and it degrades gracefully (still correct) if
+    # a future cast version ever drops the bracket annotation entirely.
+    END_TIME=$(echo "$RESULT" | sed -n '3p' | grep -oE '[0-9]+' | head -1)
     NOW=$(date +%s)
 
     if [[ -z "$END_TIME" || "$END_TIME" == "0" ]]; then

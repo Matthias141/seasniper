@@ -1387,6 +1387,50 @@ are prepared as ready-to-run scripts + `DEPLOY.md` instructions
   a fresh code before every single arm, which the script does not
   attempt to fake.
 
+**Follow-up, first real live run of `benchmark-token.sh check`: a real
+parsing bug, found on the VPS, not hypothetical.** `cast call`'s
+DEFAULT text output annotates any integer it judges "large" with a
+human-readable bracket — a real captured line looked like
+`1787557476 [1.787e9]`, not the bare `1787557476` the script originally
+assumed. Feeding that whole string into bash's `(( ))` arithmetic threw
+a syntax error and crashed the `check` subcommand outright. The
+underlying RPC call and value were confirmed correct both before and
+after the fix (the operator manually verified the step 14b benchmark
+address (same one line 1106/1346 above already reference) was still
+live with ~2.8 days remaining) — this was purely a text-parsing bug,
+never a wrong call or a wrong contract. Fixed by extracting just the leading digit
+run with `grep -oE '[0-9]+' | head -1` instead of `tr -d '[:space:]'`
+alone, deliberately NOT switching to `cast call --json` + `jq`: `jq` is
+not installed by default on a stock Ubuntu VPS either (confirmed the
+same night — nothing had installed it), so reaching for it here would
+trade one undocumented tool assumption for another; `grep`/`sed` ship
+with bash everywhere. Audited `run-benchmark.sh` for the identical
+pattern and found none — it never calls `cast` at all; its only
+external numeric parsing is `jq -r` over `audit.log`, which is plain
+`serde_json` output from this codebase's own `audit.rs`, never cast's
+human-readable annotation. Its `jq`/`curl`/`python3` prerequisite check
+now names the `apt-get install` fix directly instead of just stating
+the tool is missing, same tooling-assumption lesson applied where it's
+actually relevant there.
+
+**Also found while responding to this: no shell-script test harness
+existed anywhere in this repo** — confirmed by reading
+`.github/workflows/ci.yml` directly, not assumed; its three jobs
+(Rust, UI, Secret scan) never touch `deploy/*.sh` at all. Added
+`deploy/tests/test-benchmark-token.sh` — plain bash, no new framework
+dependency, stubs `cast` with the exact bracket-annotated output shape
+this bug produced and asserts the `check` subcommand handles a
+still-live drop, an expired drop, and a no-drop-configured contract
+without crashing. Verified this test actually catches the original bug
+(not just the fix): temporarily reverted the parsing line back to the
+buggy `tr -d '[:space:]'` version, confirmed the test suite failed with
+the exact same arithmetic syntax error the operator saw live, then
+restored the fix and confirmed it passes clean. Wired into CI as a new
+`deploy-scripts` job (`.github/workflows/ci.yml`) so this specific
+regression, and this whole class of "external command output fed
+straight into bash arithmetic" bug in this file, can't reach a live VPS
+silently again.
+
 **Still gated on the operator actually running these** — the real
 numbers, the final "is gap #11 closed" confirmation, and the
 per-metric colocation verdict all belong in a 15f update to this
