@@ -169,6 +169,24 @@ jobs:
         # equivalent excuse to soften that half of the check.
         run: npm audit --omit=dev --audit-level=moderate
 
+  deploy-scripts:
+    name: Deploy scripts (shell tests)
+    runs-on: ubuntu-latest
+    # STEP 15c FOLLOW-UP — no shell-script test harness existed anywhere
+    # in this repo before this job; the other two jobs only ever touch
+    # Rust/UI code, confirmed by reading this file, not assumed. Added
+    # after a real bug (benchmark-token.sh crashing on cast's
+    # bracket-annotated integer output) reached the live VPS uncaught —
+    # see deploy/tests/test-benchmark-token.sh's own header for the full
+    # incident. Plain bash, no new dependency (ubuntu-latest ships bash,
+    # sed, grep by default) — deliberately not reaching for bats or any
+    # other framework for what's currently a single test file.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deploy/tests/test-benchmark-token.sh
+        run: mint-sniper/deploy/tests/test-benchmark-token.sh
+
   secrets:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest

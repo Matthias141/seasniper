@@ -68,9 +68,21 @@ BOT_URL="${BOT_URL:-http://127.0.0.1:4117}"
 INTER_FIRE_DELAY_SECS="${INTER_FIRE_DELAY_SECS:-3}"
 FIRE_TIMEOUT_SECS="${FIRE_TIMEOUT_SECS:-40}"  # generous over inclusion_timeout_ms's 30000ms default
 
+# STEP 15c FOLLOW-UP — audited this script for the same class of bug
+# benchmark-token.sh hit live (cast's bracket-annotated integers breaking
+# naive bash arithmetic): confirmed this script never calls `cast` at
+# all — its only numeric parsing is (a) bash arithmetic on values it
+# generates itself (date +%s, $N, the two *_SECS config vars, none of
+# them external RPC output) and (b) `jq -r` reads from audit.log, which
+# is plain serde_json output from the bot's own audit.rs — never
+# cast's human-readable annotation, so no equivalent bug exists here.
+# Confirmed `jq` is NOT preinstalled on a stock Ubuntu VPS either
+# (found live, same night as the cast bug) — the check below already
+# catches its absence, but now says how to fix it instead of just
+# stating the problem.
 for tool in curl jq python3; do
   if ! command -v "$tool" &>/dev/null; then
-    echo "$tool is required and not on PATH" >&2
+    echo "$tool is required and not on PATH — install it first (e.g. 'sudo apt-get install -y $tool' on Ubuntu)" >&2
     exit 1
   fi
 done
