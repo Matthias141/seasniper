@@ -391,6 +391,24 @@ means the restore was not verified — the script's own output will have
 said so loudly (look for `!!!` in what it printed). Do not assume the
 bot is safely back on mainnet until you've checked this.
 
+**Before 15f — if any `dispatch_to_inclusion_ms` is a clear outlier**
+(many multiples of the ~227ms testnet block time), don't take it at
+face value. A confirmed PUSH-path fire (`method="push"`) can still be
+measuring THIS bot's own RPC node being slow to learn about a new
+block, not genuine sequencer delay — these need very different
+responses, and only real on-chain data can tell them apart. Grab that
+fire's tx hash from its `audit.log` entry's `detail` field (the literal
+tx hash on a successful mint) and run:
+```bash
+python3 /opt/mint-sniper/repo/mint-sniper/deploy/lib/diagnose_inclusion_delay.py \
+  "$TESTNET_HTTP_RPC_URL" <tx_hash> <dispatch_to_inclusion_ms>
+```
+It reports how many REAL blocks separated dispatch from inclusion —
+≤2 means node/subscription lag, not real delay. See CLAUDE.md's step
+15 section for why gas pricing is an unlikely explanation on this
+specific chain (documented FCFS sequencing — fee level doesn't affect
+order) even though it's the intuitive first guess on most EVM chains.
+
 **15f — update CLAUDE.md** with the real numbers this produces,
 following step 15e's own printed reminder at the end of its output.
 

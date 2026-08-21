@@ -203,7 +203,20 @@ pub async fn prepare_fire(
         let tx_hash = *envelope.tx_hash();
         let prepared_at = std::time::Instant::now();
 
-        info!(address = %w.address, %tx_hash, nonce, "wallet prepared (signed, not broadcast)");
+        // STEP 15 FOLLOW-UP — actual gas price used was previously
+        // computed but never logged anywhere inspectable after the fact
+        // (not tracing, not audit.log), which meant a live investigation
+        // into whether slow dispatch_to_inclusion_ms was gas-price-
+        // related had no data to check it against. Now on this line,
+        // reaching journalctl (tracing::info! is durable there, unlike
+        // bus::log — see step 17's finding on that same gap).
+        info!(
+            address = %w.address, %tx_hash, nonce,
+            base_fee_wei = base_fee,
+            wallet_priority_fee_wei = wallet_priority_fee,
+            max_fee_per_gas_wei = max_fee_per_gas,
+            "wallet prepared (signed, not broadcast)"
+        );
         bus::log(
             bus,
             "info",
