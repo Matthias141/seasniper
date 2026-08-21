@@ -80,6 +80,11 @@ pub type BlockTicker = watch::Receiver<u64>;
 /// rather than fail cleanly the way this sandbox's own TLS-interception
 /// limitation does (see this module's doc comment) — real protection
 /// for a real class of failure, not defensive-for-its-own-sake.
+/// `ws_url` must be an *eth* WebSocket RPC (`subscribe_blocks` / newHeads).
+/// Alchemy (or any third-party) PUSH on this socket means the receipt was
+/// seen by this RPC, not that the sequencer has included the tx. Do not
+/// pass the Robinhood Nitro feed (`wss://feed.*.chain.robinhood.com`) —
+/// that is not an eth WS.
 pub async fn establish_block_ticker(ws_url: &str) -> Option<BlockTicker> {
     let ws_url = ws_url.to_string();
     // STEP 17b — this path's whole design is "fail quietly, HTTP polling
