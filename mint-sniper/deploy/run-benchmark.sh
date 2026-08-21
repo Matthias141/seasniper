@@ -323,13 +323,18 @@ for i in $(seq 1 "$N"); do
   # Poll audit.log for a mint_result event timestamped at/after this
   # arm — audit.log is append-only JSON lines (audit.rs::append), so a
   # simple tail+jq filter on ts is sufficient without tracking byte
-  # offsets.
+  # offsets. STEP 15e FOLLOW-UP — the actual field extraction lives in
+  # deploy/lib/find_mint_result.sh now, not inline here: see that
+  # file's header for the real bug this fixes (AuditRecord's
+  # #[serde(flatten)] means success/send_to_ack_ms/
+  # dispatch_to_inclusion_ms are top-level fields in audit.log, not
+  # nested under a "detail" object) and why it's a separate file
+  # (independently testable, no drift risk between what's tested and
+  # what actually runs).
   DEADLINE=$(( $(date +%s) + FIRE_TIMEOUT_SECS ))
   FOUND=""
   while (( $(date +%s) < DEADLINE )); do
-    FOUND=$(jq -c --argjson since "$ARM_TS" \
-      'select(.event == "mint_result" and .ts >= $since)' \
-      "$AUDIT_LOG" 2>/dev/null | tail -1 || true)
+    FOUND=$("$SCRIPT_DIR/lib/find_mint_result.sh" "$AUDIT_LOG" "$ARM_TS")
     if [[ -n "$FOUND" ]]; then
       break
     fi
@@ -343,9 +348,9 @@ for i in $(seq 1 "$N"); do
   fi
 
   echo "$FOUND" >> "$RESULTS_FILE"
-  SUCCESS=$(echo "$FOUND" | jq -r '.detail.success')
-  SEND_ACK=$(echo "$FOUND" | jq -r '.detail.send_to_ack_ms')
-  DISPATCH_INCL=$(echo "$FOUND" | jq -r '.detail.dispatch_to_inclusion_ms')
+  SUCCESS=$(echo "$FOUND" | jq -r '.success')
+  SEND_ACK=$(echo "$FOUND" | jq -r '.send_to_ack_ms')
+  DISPATCH_INCL=$(echo "$FOUND" | jq -r '.dispatch_to_inclusion_ms')
   echo "   success=$SUCCESS send_to_ack_ms=$SEND_ACK dispatch_to_inclusion_ms=$DISPATCH_INCL"
 
   sleep "$INTER_FIRE_DELAY_SECS"
@@ -384,7 +389,12 @@ with open(path) as f:
         if not line:
             continue
         total += 1
-        rec = json.loads(line)["detail"]
+        # STEP 15e FOLLOW-UP — same bug as the jq extraction above:
+        # AuditRecord flattens `detail` onto the top-level record
+        # (audit.rs's `#[serde(flatten)] detail: serde_json::Value`),
+        # so success/send_to_ack_ms/dispatch_to_inclusion_ms are
+        # top-level keys, not nested under a "detail" object.
+        rec = json.loads(line)
         if rec.get("success"):
             successes += 1
         sa = rec.get("send_to_ack_ms")

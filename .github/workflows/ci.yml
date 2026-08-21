@@ -205,6 +205,14 @@ jobs:
       - name: deploy/tests/test-config-backup-restore.sh
         run: mint-sniper/deploy/tests/test-config-backup-restore.sh
 
+      # STEP 15e FOLLOW-UP #2 — a real crash found live on fire 1/15 of
+      # an actual n=15 run (the mint pipeline itself was confirmed
+      # correct via journalctl — this was purely a result-parsing bug
+      # in run-benchmark.sh). See deploy/lib/find_mint_result.sh's
+      # header for the full root cause.
+      - name: deploy/tests/test-find-mint-result.sh
+        run: mint-sniper/deploy/tests/test-find-mint-result.sh
+
   secrets:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
