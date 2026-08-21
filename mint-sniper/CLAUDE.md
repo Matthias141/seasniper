@@ -1475,6 +1475,56 @@ trigger this specific night. What shipped:
    matters, so a future operator copying this file has the context before
    hitting the failure, not after.
 
+**Follow-up, same night: the fix deployed correctly but the operator saw
+the exact same unwrapped error anyway.** This is the actual answer to
+"which boot-path call site was missed" — none was. An exhaustive re-grep
+(`grep -rn "WsConnect::new\|connect_ws\|extract_from_url" src/`, and
+separately confirmed no bare `tokio_tungstenite`/raw WS client exists
+anywhere outside these four — `api.rs`'s and `state.rs`'s `WebSocket`
+hits are axum's own *inbound* `/ws/events` upgrade for the browser UI,
+unrelated to any outbound Alchemy connection) turned up the same four call
+sites and nothing else. `main.rs`'s own synchronous startup path (before
+any watcher spawns) makes zero WS calls at all — only `http_rpc_urls`
+ones (`seadrop::fetch_public_drop`, `wallet::load_wallets`,
+`connect_http`) — and `alloy-rpc-client-2.4.1/src/builtin.rs` (checked
+directly) confirms the `Http(url)` transport variant never calls
+`Authorization::extract_from_url` at all — only the `Ws` variant does. So
+17a's finding is WS-only, confirmed, not something to also guard against
+on the HTTP side.
+
+**The real gap: `bus::log` (`bus.rs::log`) only pushes onto the internal
+event bus the browser UI's `/ws/events` stream consumes — it never calls
+a `tracing` macro, so it never reaches stdout, and therefore never reaches
+`journalctl`.** Two of the three failure paths that route through it were
+logging ONLY that way:
+- `copymint.rs::run_copymint_watcher`'s own error handler for
+  `watch_once`'s failures.
+- `main.rs::spawn_supervised_watcher` — the wrapper both
+  `run_state_poll_watcher` and `run_mempool_watcher` failures flow
+  through, which logs and disarms on error.
+
+17b's redacted-URL context was correctly attached to the underlying
+`anyhow::Error` in both cases — it was genuinely present in the
+`{e:#}` formatted into the `bus::log` call — but since that call never
+reaches the journal, `journalctl -u mint-sniper` would show *nothing at
+all* from these two paths, old error text or new, watcher.rs's third path
+(`inclusion.rs::establish_block_ticker`'s `warn!`) was never affected —
+it already called `tracing::warn!` directly, not `bus::log` — which is
+why it's the one to imitate, not the exception. Fixed by adding a
+`tracing::error!` call alongside the existing `bus::log` call in both of
+the other two spots, so the exact same message reaches both the UI and
+the journal. **Neither a code bug in the WS-connect logic itself (17a/17b
+already had that right) nor a config gap — an observability gap in this
+codebase's own two error-reporting call sites**, invisible until an
+operator actually relied on `journalctl` alone per 17c's own instructions
+and found nothing there.
+
+Also added `main.rs::tests::every_ws_connect_call_site_is_accounted_for`
+— a regression guard, not just a one-time check: it greps `src/` at test
+time for `= WsConnect::new(` call sites and fails if the count or the set
+of files changes, so a fifth call site added later can't silently ship
+without the same redacted-URL-context + tracing + bus::log treatment.
+
 **Operator verification (this session cannot reach the live VPS to
 confirm directly, same boundary as every other live-deploy step):**
 ```
@@ -1482,16 +1532,25 @@ cd /opt/mint-sniper/repo && sudo -u mint-sniper git pull --ff-only origin main
 sudo -u mint-sniper -H bash -c "source \$HOME/.cargo/env && cd /opt/mint-sniper/repo/mint-sniper && cargo build --release"
 sudo systemctl restart mint-sniper
 sudo systemctl status mint-sniper --no-pager   # expect: active (running), not a crash loop
-sudo journalctl -u mint-sniper -n 50 --no-pager  # look for a successful WS connect log line, or (if config.toml's
-                                                  # ws_rpc_url actually had embedded credentials) the new, explicit
-                                                  # "RPC url contains embedded credentials" validate() error instead
-                                                  # of the old opaque auth failure
+sudo journalctl -u mint-sniper -n 50 --no-pager  # NOW actually shows watcher/copymint errors — before this
+                                                  # follow-up, bus::log-only paths were invisible here regardless
+                                                  # of 17b's fix. Look for: the config load failing outright with
+                                                  # "RPC url contains embedded credentials" (confirms 17a's
+                                                  # hypothesis was the trigger — fix ws_rpc_url and restart), OR a
+                                                  # "watcher exited with an error: ... opening the WebSocket RPC
+                                                  # connection to wss://<host>/*** ..." / "copymint watcher error:
+                                                  # ..." line with the real underlying reason, OR nothing at all
+                                                  # (service came up clean).
 ```
 If `journalctl` now shows the new validate() rejection instead of a crash
 loop, that confirms 17a's hypothesis was the actual trigger — fix
 `config.toml`'s `ws_rpc_url` to remove anything before the host and
-restart again. If the service comes up clean with no error at all, the
-fix already resolved it silently (nothing further needed). Either way,
+restart again. If it instead shows a "watcher exited with an error"/
+"copymint watcher error" line (now visible for the first time — this
+follow-up's own fix), that reason, not 17a's userinfo theory, is the real
+cause; treat that text as authoritative over anything guessed here. If
+the service comes up clean with no error at all, the fix already resolved
+it silently (nothing further needed). Either way,
 confirm live RPC connectivity itself via the bot's own `/api/status`
 endpoint or a log line showing a successful block subscription — not just
 "the process didn't crash."

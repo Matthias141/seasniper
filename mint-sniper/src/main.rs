@@ -385,6 +385,15 @@ where
     tokio::spawn(async move {
         let result = watcher_fut.await;
         if let Err(e) = &result {
+            // STEP 17 FOLLOW-UP — `bus::log` is UI-only (see bus.rs::log —
+            // it never touches tracing/stdout), so this call alone never
+            // reached journalctl. That's how 17b's redacted-URL context on
+            // run_state_poll_watcher/run_mempool_watcher's connect_ws
+            // failures went missing from the operator's systemd-journal
+            // diagnosis on the very next occurrence — the wrapping was
+            // correct, but this, the ONLY place that error text was
+            // emitted from, was invisible outside the browser UI.
+            tracing::error!("watcher exited with an error: {e:#} — disarming");
             bus::log(&event_bus, "error", format!("watcher exited with an error: {e:#} — disarming"));
             let _ = control_tx.send(ControlMsg::Disarm).await;
         }
@@ -1090,5 +1099,75 @@ mod tests {
         // independently the same way as the selectors above.
         let sel = encode_selector_only("mintActive()").unwrap();
         assert_eq!(sel, vec![0x25, 0xfd, 0x90, 0xf3]);
+    }
+
+    /// STEP 17 FOLLOW-UP — a regression guard, not just a one-time manual
+    /// check. `grep -rn "WsConnect::new" src/` was run directly against
+    /// this exact source tree (not from memory) after the step 17 fix and
+    /// found exactly these four call sites, each already wrapped in
+    /// step 17b/17-follow-up's redacted-URL error context AND emitting via
+    /// both `tracing::error!`/`warn!` (journalctl-visible) and `bus::log`
+    /// (UI-visible) on failure — see this session's CLAUDE.md step 17
+    /// section for why both were needed, not just one. If this test ever
+    /// fails, a new WS connection call site was added somewhere in `src/`
+    /// that this audit didn't cover — find it with the same grep and give
+    /// it the same three things (redacted-URL context, tracing emission,
+    /// bus::log emission) before updating this list.
+    #[test]
+    fn every_ws_connect_call_site_is_accounted_for() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let expected_files = [
+            "copymint.rs",
+            "inclusion.rs",
+            // watcher.rs has two independent call sites
+            // (run_state_poll_watcher, run_mempool_watcher) — both counted.
+            "watcher.rs",
+        ];
+        const EXPECTED_TOTAL_CALL_SITES: usize = 4;
+
+        // Needle requires assignment context (`= WsConnect::new(`), which
+        // every real call site has (`let ws` followed by that pattern)
+        // but a doc-comment mention like config.rs's backtick-quoted
+        // reference to the type does not.
+        let needle = ["= ", "WsConnect", "::new("].concat();
+
+        let mut found_files: Vec<String> = Vec::new();
+        let mut total = 0usize;
+        for entry in std::fs::read_dir(&src_dir).expect("reading src/ dir") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+            // Skip this test's own file — main.rs is confirmed (by the
+            // same manual grep this test encodes) to have no real call
+            // site, but DOES discuss the exact needle text in this test's
+            // own doc comment, which would otherwise self-match.
+            if file_name == "main.rs" {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&path).expect("reading source file");
+            let count = contents.matches(needle.as_str()).count();
+            if count > 0 {
+                total += count;
+                found_files.push(file_name);
+            }
+        }
+        found_files.sort();
+
+        let mut expected_sorted: Vec<String> = expected_files.iter().map(|s| s.to_string()).collect();
+        expected_sorted.sort();
+
+        assert_eq!(
+            found_files, expected_sorted,
+            "the set of files opening a WS connection changed — audit the new/removed \
+             file(s) against CLAUDE.md's step 17 section before updating this list"
+        );
+        assert_eq!(
+            total, EXPECTED_TOTAL_CALL_SITES,
+            "the total count of WsConnect::new(...) call sites changed (found {total}, \
+             expected {EXPECTED_TOTAL_CALL_SITES}) — a call site was added or removed \
+             within an already-known file; audit it the same way"
+        );
     }
 }
