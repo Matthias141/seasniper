@@ -2,6 +2,14 @@
 
 # Copy to config.toml. NEVER commit config.toml — it holds private keys.
 
+# STEP 17 — the key goes in the URL PATH (as shown), never before the
+# host as `wss://user:pass@host/...` or `wss://user@host/...` userinfo.
+# alloy's WS client auto-detects URL userinfo and silently turns it into
+# an HTTP Authorization header on connect — a provider like Alchemy
+# doesn't expect that and will reject it with an opaque, auth-flavored
+# error (a live deploy lost over an hour to this exact confusion before
+# it was traced to a corrupted config value). Config::validate() now
+# rejects this shape outright, but keep the key in the path regardless.
 ws_rpc_url = "wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
 # Multiple HTTP RPCs raced in parallel on broadcast — redundancy against a single
 # provider lagging at the exact moment mint flips.

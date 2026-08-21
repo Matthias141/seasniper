@@ -1405,6 +1405,97 @@ makes a 4GB swapfile (with the `/etc/fstab` persistence line, so it
 survives a reboot) a mandatory, non-optional first-time-setup step on
 `t4g.small` specifically, not an optional performance tweak.
 
+## The bot's own WS connection failed with "Must be authenticated!" (step 17)
+
+**Symptom, live-confirmed on the real deployed VPS:** the bot crash-looped
+at boot with `server returned an error response: error code -32600: Must
+be authenticated!` from Alchemy, on the exact same `wss://` URL and key
+that both a plain HTTP curl AND a bare Node.js `ws` client (sending
+`eth_chainId`) succeeded against. This ruled out the credential/Alchemy
+app itself — something specific to how *this codebase* opens the
+connection differed from a bare WS client in a way Alchemy's endpoint
+read as an auth attempt gone wrong.
+
+**Root cause, confirmed by reading alloy 2.4.1's actual source (not
+assumed from memory), both a code fact and a config/docs gap:**
+`alloy-transport-ws`'s `WsConnect::new(url)` parses the given URL and, if
+it contains userinfo (`wss://user:pass@host/...` or `wss://user@host/...`),
+auto-extracts it via `Authorization::extract_from_url` and injects an HTTP
+`Authorization` header into the WebSocket upgrade handshake
+(`alloy-transport-ws-2.4.1/src/native.rs`'s `IntoClientRequest` impl,
+backed by `alloy-transport-2.4.1/src/common.rs`'s
+`Authorization::extract_from_url`). A bare `ws` client never does this —
+it sends whatever URL you give it as a plain WS upgrade with no
+credential-flavored header at all. Alchemy's auth model for this codebase
+is a path-embedded API key (`/v2/<KEY>`), never URL userinfo — so this
+auto-extraction is never wanted behavior here, and a `ws_rpc_url` with any
+stray `@`/`:` before the host (this exact `config.toml` had already
+produced two other copy-paste corruptions earlier that same deploy night
+— a missing closing quote, a truncated key) would silently make alloy
+send a bogus Basic-auth header Alchemy was never expecting, while a bare
+client sending the identical-looking URL correctly sends none. The three
+alternative 17a hypotheses (an alloy-internal auto `eth_chainId`/subscribe
+call at connect time despite `disable_recommended_fillers()`; some other
+non-standard header/handshake step) were checked against alloy's actual
+`ClientBuilder::ws`/`connect_ws`/`PubSubConnect::connect` source and ruled
+out — connection setup issues nothing beyond a standard WS upgrade (plus
+the conditional Authorization header above) before normal JSON-RPC
+traffic begins.
+
+**This session could not confirm the operator's real `config.toml` was
+actually corrupted this way** — no access to that file exists from this
+sandbox, and the fix stands regardless of whether that was the literal
+trigger this specific night. What shipped:
+
+1. **`Config::validate()`** (`src/config.rs`) now rejects any
+   `ws_rpc_url`/`http_rpc_urls` entry containing embedded userinfo
+   credentials outright, at config load/save time — not silently letting
+   it through to surface as an opaque connect-time auth failure hours
+   later. Same "catch a bad shape at startup/save time" principle as
+   every other check in that function.
+2. **Error context, all four `connect_ws` call sites**
+   (`copymint.rs::watch_once`, `inclusion.rs::establish_block_ticker`,
+   `watcher.rs::run_state_poll_watcher`, `watcher.rs::run_mempool_watcher`)
+   now wrap the connect failure with which code path was connecting AND a
+   *redacted* form of the RPC URL (scheme+host only, via the new
+   `config::redact_rpc_url` — never the raw URL, since the path segment
+   IS the API key and this project's secrets-never-touch-a-log rule
+   applies here same as everywhere else). `establish_block_ticker`
+   specifically used to swallow the connect error entirely (by design —
+   HTTP-polling fallback is the correct response to WS being unavailable)
+   but gave the operator zero information about *why* it failed; it now
+   logs the real reason via `warn!` before falling back, same "surface
+   the real reason, don't swallow it" standard as step 3b's revert-reason
+   fix. A future occurrence of this — or any other WS connect failure —
+   is now diagnosable from the systemd journal alone: which watcher, which
+   host, and the real underlying error text, no live Node.js test harness
+   needed to even start isolating it.
+3. **`config.example.toml`** now has an explicit warning above
+   `ws_rpc_url` explaining the path-vs-userinfo distinction and why it
+   matters, so a future operator copying this file has the context before
+   hitting the failure, not after.
+
+**Operator verification (this session cannot reach the live VPS to
+confirm directly, same boundary as every other live-deploy step):**
+```
+cd /opt/mint-sniper/repo && sudo -u mint-sniper git pull --ff-only origin main
+sudo -u mint-sniper -H bash -c "source \$HOME/.cargo/env && cd /opt/mint-sniper/repo/mint-sniper && cargo build --release"
+sudo systemctl restart mint-sniper
+sudo systemctl status mint-sniper --no-pager   # expect: active (running), not a crash loop
+sudo journalctl -u mint-sniper -n 50 --no-pager  # look for a successful WS connect log line, or (if config.toml's
+                                                  # ws_rpc_url actually had embedded credentials) the new, explicit
+                                                  # "RPC url contains embedded credentials" validate() error instead
+                                                  # of the old opaque auth failure
+```
+If `journalctl` now shows the new validate() rejection instead of a crash
+loop, that confirms 17a's hypothesis was the actual trigger — fix
+`config.toml`'s `ws_rpc_url` to remove anything before the host and
+restart again. If the service comes up clean with no error at all, the
+fix already resolved it silently (nothing further needed). Either way,
+confirm live RPC connectivity itself via the bot's own `/api/status`
+endpoint or a log line showing a successful block subscription — not just
+"the process didn't crash."
+
 **16b — `deploy/setup-cloudflared.sh`, prepared, not run.** Same
 division of labor as `deploy.sh` and the EC2 provisioning itself: this
 session has no Cloudflare account access, so the script is

@@ -197,6 +197,28 @@ fn default_inclusion_timeout_ms() -> u64 {
     30_000
 }
 
+/// STEP 17b — safe-for-logging form of an RPC URL. `ws_rpc_url`/
+/// `http_rpc_urls` embed the provider's API key as a path segment (see
+/// `redact_rpc_url`'s callers' doc comments and `Config::validate`'s
+/// userinfo check above) — that key must never reach the systemd journal
+/// or any other log sink verbatim (this project's standing "secrets never
+/// touch a log" rule). This keeps only the scheme and host, which is
+/// exactly what's needed to tell WS connection attempts apart in a log
+/// (e.g. distinguishing a mainnet vs. testnet endpoint, or catching a
+/// typo'd host) without ever printing the key.
+pub(crate) fn redact_rpc_url(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(parsed) => match parsed.host_str() {
+            Some(host) => match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}/***", parsed.scheme()),
+                None => format!("{}://{host}/***", parsed.scheme()),
+            },
+            None => "<RPC url with no host>".to_string(),
+        },
+        Err(_) => "<unparseable RPC url>".to_string(),
+    }
+}
+
 impl Config {
     pub fn load(path: &str) -> Result<Self> {
         let raw = fs::read_to_string(path)
@@ -219,7 +241,38 @@ impl Config {
     /// treatment.
     pub fn validate(&self) -> Result<()> {
         for url in std::iter::once(&self.ws_rpc_url).chain(self.http_rpc_urls.iter()) {
-            url::Url::parse(url).with_context(|| format!("invalid RPC url: {url}"))?;
+            let parsed = url::Url::parse(url).with_context(|| format!("invalid RPC url: {url}"))?;
+
+            // STEP 17 FINDING — alloy's `WsConnect::new()` silently parses
+            // the URL for embedded userinfo credentials
+            // (`wss://user:pass@host/...` or `wss://user@host/...`) and,
+            // if present, auto-injects an HTTP `Authorization` header into
+            // the WebSocket upgrade handshake (alloy-transport-ws's
+            // `IntoClientRequest` impl, via `Authorization::extract_from_url`
+            // in alloy-transport). A bare WS client (e.g. Node's `ws`)
+            // never does this. Every RPC provider this codebase actually
+            // targets (Alchemy, and the pattern documented in
+            // config.example.toml generally) embeds its auth key as a URL
+            // PATH segment, never as URL userinfo — so this codebase never
+            // legitimately needs that syntax, and a URL that accidentally
+            // contains a stray `@`/`:` before the host (e.g. a corrupted
+            // copy-paste) would silently trigger alloy to send a bogus
+            // Basic-auth header the provider never expects, which is
+            // exactly the shape of failure (an alloy-specific,
+            // auth-flavored WS rejection that a bare WS client sending the
+            // identical URL does not hit) that motivated this check.
+            // Caught here — at load/save time — instead of surfacing only
+            // as an opaque "Must be authenticated!" at connect time,
+            // hours or days later.
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                anyhow::bail!(
+                    "RPC url contains embedded credentials (a username/password before the \
+                     host) — this codebase's RPC providers authenticate via a path-embedded \
+                     key, never via URL userinfo, and alloy's WS client silently turns \
+                     userinfo into an Authorization header the provider will likely reject \
+                     with an auth error. Remove the `user:pass@` / `user@` prefix from: {url}"
+                );
+            }
         }
 
         if self.wallets.is_empty() {
@@ -423,6 +476,43 @@ mod tests {
         let mut cfg = test_config();
         cfg.http_rpc_urls = vec!["also not a url".to_string()];
         assert!(cfg.validate().is_err());
+    }
+
+    // STEP 17 — the actual bug this session spent tonight isolating:
+    // alloy's WS client silently turns URL userinfo into an Authorization
+    // header a provider like Alchemy never expects. Catch it at
+    // validate() time, not as an opaque connect-time auth error.
+    #[test]
+    fn rejects_ws_rpc_url_with_embedded_userpass_credentials() {
+        let mut cfg = test_config();
+        cfg.ws_rpc_url = "wss://user:pass@eth-mainnet.g.alchemy.com/v2/KEY".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_ws_rpc_url_with_embedded_username_only() {
+        let mut cfg = test_config();
+        cfg.ws_rpc_url = "wss://KEY@eth-mainnet.g.alchemy.com/v2/".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_http_rpc_url_with_embedded_credentials() {
+        let mut cfg = test_config();
+        cfg.http_rpc_urls = vec!["https://user:pass@eth-mainnet.g.alchemy.com/v2/KEY".to_string()];
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn redact_rpc_url_strips_the_path_embedded_key() {
+        let redacted = redact_rpc_url("wss://eth-mainnet.g.alchemy.com/v2/super-secret-key");
+        assert_eq!(redacted, "wss://eth-mainnet.g.alchemy.com/***");
+        assert!(!redacted.contains("super-secret-key"));
+    }
+
+    #[test]
+    fn redact_rpc_url_handles_an_unparseable_url_without_panicking() {
+        assert_eq!(redact_rpc_url("not a url at all"), "<unparseable RPC url>");
     }
 
     #[test]

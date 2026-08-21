@@ -216,7 +216,12 @@ async fn watch_once(state: &SharedState, tracked: &[Address], seadrop_address: A
         .disable_recommended_fillers()
         .connect_ws(ws)
         .await
-        .context("copymint: opening the WebSocket RPC connection")?;
+        .with_context(|| {
+            format!(
+                "copymint: opening the WebSocket RPC connection to {}",
+                crate::config::redact_rpc_url(&cfg.ws_rpc_url)
+            )
+        })?;
 
     let sub = provider.subscribe_full_pending_transactions().await.context(
         "copymint: subscribing to full pending transactions — needs a WebSocket RPC on a node \

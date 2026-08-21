@@ -53,6 +53,7 @@ use crate::executor::HttpProvider;
 use alloy::primitives::TxHash;
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::TransactionReceipt;
+use anyhow::Context;
 use std::time::Duration;
 use tokio::sync::watch;
 use tracing::warn;
@@ -81,24 +82,44 @@ pub type BlockTicker = watch::Receiver<u64>;
 /// for a real class of failure, not defensive-for-its-own-sake.
 pub async fn establish_block_ticker(ws_url: &str) -> Option<BlockTicker> {
     let ws_url = ws_url.to_string();
-    let connect = async move {
-        let ws = WsConnect::new(ws_url);
+    // STEP 17b — this path's whole design is "fail quietly, HTTP polling
+    // is the intended response" (see this fn's doc comment), so unlike
+    // the other three `connect_ws` call sites this one still collapses
+    // to `None` rather than propagating an `Err`. But collapsing used to
+    // throw the underlying reason away entirely — the operator saw only
+    // "WS subscription unavailable," never *why* (auth error vs. DNS
+    // failure vs. TLS failure vs. connection refused all looked
+    // identical). Capture it via anyhow::Context and log it before
+    // discarding, same "surface the real reason, don't swallow it"
+    // standard as step 3b's revert-reason fix.
+    let redacted = crate::config::redact_rpc_url(&ws_url);
+    let connect = async {
+        let ws = WsConnect::new(ws_url.clone());
         let provider = ProviderBuilder::new()
             .disable_recommended_fillers()
             .connect_ws(ws)
             .await
-            .ok()?;
-        provider.subscribe_blocks().await.ok()
+            .with_context(|| {
+                format!("inclusion: opening the WebSocket RPC connection to {redacted}")
+            })?;
+        provider
+            .subscribe_blocks()
+            .await
+            .context("inclusion: subscribing to new block headers")
     };
 
     let sub = match tokio::time::timeout(Duration::from_secs(5), connect).await {
-        Ok(Some(sub)) => sub,
-        Ok(None) => {
-            warn!("inclusion detection: WS subscription unavailable, falling back to HTTP polling");
+        Ok(Ok(sub)) => sub,
+        Ok(Err(e)) => {
+            warn!(
+                "inclusion detection: WS subscription unavailable ({e:#}), falling back to HTTP polling"
+            );
             return None;
         }
         Err(_) => {
-            warn!("inclusion detection: WS connect timed out after 5s, falling back to HTTP polling");
+            warn!(
+                "inclusion detection: WS connect to {redacted} timed out after 5s, falling back to HTTP polling"
+            );
             return None;
         }
     };

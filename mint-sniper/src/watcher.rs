@@ -44,12 +44,17 @@ pub async fn run_state_poll_watcher(
     trigger_tx: watch::Sender<bool>,
     event_bus: EventBus,
 ) -> Result<()> {
-    let ws = WsConnect::new(ws_url);
+    let ws = WsConnect::new(ws_url.clone());
     let provider = ProviderBuilder::new()
         .disable_recommended_fillers()
         .connect_ws(ws)
         .await
-        .context("poll_state: opening the WebSocket RPC connection")?;
+        .with_context(|| {
+            format!(
+                "poll_state: opening the WebSocket RPC connection to {}",
+                crate::config::redact_rpc_url(&ws_url)
+            )
+        })?;
 
     let mut stream = provider
         .subscribe_blocks()
@@ -129,12 +134,17 @@ pub async fn run_mempool_watcher(
     trigger_tx: watch::Sender<bool>,
     event_bus: EventBus,
 ) -> Result<()> {
-    let ws = WsConnect::new(ws_url);
+    let ws = WsConnect::new(ws_url.clone());
     let provider = ProviderBuilder::new()
         .disable_recommended_fillers()
         .connect_ws(ws)
         .await
-        .context("mempool_watch: opening the WebSocket RPC connection")?;
+        .with_context(|| {
+            format!(
+                "mempool_watch: opening the WebSocket RPC connection to {}",
+                crate::config::redact_rpc_url(&ws_url)
+            )
+        })?;
 
     let sub = provider.subscribe_full_pending_transactions().await.context(
         "mempool_watch: subscribing to full pending transactions — needs a WebSocket RPC on a \
