@@ -187,6 +187,24 @@ jobs:
       - name: deploy/tests/test-benchmark-token.sh
         run: mint-sniper/deploy/tests/test-benchmark-token.sh
 
+      # STEP 15e FOLLOW-UP — three more tests added alongside the
+      # config-swap/restore automation added to run-benchmark.sh. The
+      # root-required, systemd-restarting orchestration in that script
+      # itself genuinely can't run in CI (no real bot, no systemd unit
+      # to restart) — these test the parts that CAN run anywhere: the
+      # extracted, pure-logic pieces (deploy/lib/*.py) and the bash
+      # backup/restore idioms, in isolation, against scratch
+      # files/mocked JSON. See DEPLOY.md §9 for the operator-run
+      # verification steps covering what these can't reach.
+      - name: deploy/tests/test-swap-config-to-testnet.py
+        run: python3 mint-sniper/deploy/tests/test-swap-config-to-testnet.py
+
+      - name: deploy/tests/test-check-wallet-balances.py
+        run: python3 mint-sniper/deploy/tests/test-check-wallet-balances.py
+
+      - name: deploy/tests/test-config-backup-restore.sh
+        run: mint-sniper/deploy/tests/test-config-backup-restore.sh
+
   secrets:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest

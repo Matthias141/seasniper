@@ -1,6 +1,8 @@
 /target
 /ui/node_modules
 /ui/dist
+__pycache__/
+*.pyc
 config.toml
 .env
 .sniper-token

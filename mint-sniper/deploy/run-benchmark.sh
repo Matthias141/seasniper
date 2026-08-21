@@ -2,44 +2,68 @@
 # STEP 15e — fires the bot n=15+ times against the step 15c benchmark
 # token and prints a clean p50/p90 summary, same methodology as step
 # 14b (send->ack and dispatch->inclusion, both from real mint_result
-# events, not simulated) — but automated end to end instead of the
-# manual per-fire commands step 17's live debugging session had to fall
-# back on. Same handoff pattern as every deploy/*.sh script: the
-# OPERATOR runs this on the real VPS, this session never does.
+# events, not simulated). Same handoff pattern as every deploy/*.sh
+# script: the OPERATOR runs this on the real VPS, this session never
+# does.
+#
+# STEP 15e FOLLOW-UP — confirmed live on the real VPS: the original
+# version of this script assumed config.toml was ALREADY pointed at
+# Robinhood Chain testnet before running, but nothing actually swapped
+# it there — it fired straight against whatever network config.toml
+# already had (mainnet, on the operator's real box), and the pre-flight
+# balance check reported 0.000000000000000000 on every wallet (real
+# testnet-funded wallets, wrong network) without stopping. This version
+# does the swap itself: backs up config.toml, points it at testnet +
+# the benchmark contract, restarts the service, waits for it to come
+# back healthy, fires, THEN restores the original config.toml, restarts
+# again, and verifies the restore byte-for-byte before reporting
+# success. This whole cycle is wrapped in a trap so an interrupted or
+# crashed run still restores config.toml — never leaves the bot pointed
+# at testnet, or at a testnet contract with real mainnet wallets still
+# configured. See CLAUDE.md's step 15e section for the fuller writeup
+# of the live incident this responds to.
+#
+# THIS SCRIPT MUST RUN AS ROOT (sudo ./run-benchmark.sh) — it restarts
+# a systemd service twice, which needs root regardless of who invokes
+# it, and it edits config.toml under the mint-sniper system user's
+# ownership (same pattern as deploy.sh: root overall, chown back to
+# mint-sniper after any file write).
 #
 # PREREQUISITES — read before running, some need your own judgment,
 # flagged explicitly:
 #
-#   1. config.toml on this VPS must already point at the confirmed-live
-#      benchmark token from step 15c:
-#        mint_mode = "seadrop"
-#        nft_contract = "<address from step 15c>"
-#        fee_recipient = "0x0000a26b00c1F0DF003000390027140000fAa719"
-#        quantity_per_wallet = 1
-#        ws_rpc_url / http_rpc_urls pointed at Robinhood Chain TESTNET
-#        block_time_ms = 227   (step 14b's measured figure — re-measure
-#                                 if you suspect it's drifted)
-#      Exactly ONE [[wallets]] entry — matches step 14b's own
-#      methodology (sequential single-wallet fires, comparable numbers).
-#      Multiple wallets would fire in parallel per arm and muddy the
-#      per-attempt timing this script reports.
+#   1. Environment variables (no defaults with placeholder keys — this
+#      script refuses to run without them, on purpose):
+#        TESTNET_WS_RPC_URL   - e.g. wss://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY
+#        TESTNET_HTTP_RPC_URL - e.g. https://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY
+#      Optional:
+#        BENCHMARK_CHECK_ADDR - defaults to step 14b's original token
+#                                (0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9);
+#                                override if you've redeployed via
+#                                benchmark-token.sh redeploy
+#        MIN_BALANCE_ETH      - default 0.01, the per-wallet threshold
+#                                the pre-flight balance gate enforces
+#                                (mint price is 0 on the benchmark drop
+#                                — this only needs to cover gas for
+#                                15+ fires, 0.01 is a deliberately
+#                                generous default, not a tight one)
+#        SERVICE_NAME          - default "mint-sniper"
+#        SERVICE_USER           - default "mint-sniper"
 #
-#   2. That one configured wallet needs REAL Robinhood Chain TESTNET ETH
+#   2. Exactly ONE [[wallets]] entry in config.toml going in — matches
+#      step 14b's own methodology (sequential single-wallet fires,
+#      comparable numbers). This script warns but does not refuse to
+#      continue if that's not the case (see the wallet-count check
+#      below) — your own judgment call if intentional.
+#
+#   3. That one configured wallet needs REAL Robinhood Chain TESTNET ETH
 #      — get it from https://faucet.testnet.chain.robinhood.com. THIS
-#      SCRIPT DOES NOT CHECK THIS FOR YOU AT ALL (the pre-flight below
-#      only checks wallet COUNT, not balance) — confirming the faucet
-#      transfer actually landed (rather than just "the faucet page said
-#      success") is your own judgment call before spending 15+ real
-#      testnet mints on a wallet that might run dry partway through. A
-#      dry wallet fails loudly per-attempt (an obvious "insufficient
-#      funds" in the fire's own error), not silently, but check first
-#      rather than discovering it mid-run.
-#
-#   3. The bot service must already be running with this config loaded
-#      (`sudo systemctl restart mint-sniper` after any config.toml edit
-#      — config.toml is only read at boot, per Config::load's own
-#      design, same as every other step in this project that's touched
-#      it).
+#      SCRIPT'S BALANCE GATE (below) catches an empty wallet before
+#      firing, but confirming the faucet transfer actually landed in
+#      the first place (rather than just "the faucet page said
+#      success") is still your own judgment call — the gate can only
+#      tell you the balance IS zero, not whether a pending faucet
+#      transfer is about to arrive.
 #
 #   4. If config.toml's google_oauth_client_id is SET (step 10c identity
 #      enabled), /api/arm requires a fresh X-Step-Up-Totp header per
@@ -54,32 +78,42 @@
 #      implemented here — flagged, not silently worked around).
 #
 # Usage:
-#   ./run-benchmark.sh [N] [BOT_DIR]
+#   sudo TESTNET_WS_RPC_URL=... TESTNET_HTTP_RPC_URL=... \
+#     ./run-benchmark.sh [N] [BOT_DIR]
 #     N        - number of fires, default 15 (14b's own n)
-#     BOT_DIR  - the bot's WorkingDirectory, default: current directory
-#                (must contain audit.log and .sniper-token — run this
-#                from /opt/mint-sniper, or pass that path explicitly)
+#     BOT_DIR  - the bot's WorkingDirectory, default /opt/mint-sniper
+#                (must contain config.toml, audit.log, .sniper-token)
 
 set -euo pipefail
 
+if [[ $EUID -ne 0 ]]; then
+  echo "run as root (sudo ./run-benchmark.sh) — see this script's header comment for why" >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 N="${1:-15}"
-BOT_DIR="${2:-.}"
+BOT_DIR="${2:-/opt/mint-sniper}"
+SERVICE_NAME="${SERVICE_NAME:-mint-sniper}"
+SERVICE_USER="${SERVICE_USER:-mint-sniper}"
 BOT_URL="${BOT_URL:-http://127.0.0.1:4117}"
 INTER_FIRE_DELAY_SECS="${INTER_FIRE_DELAY_SECS:-3}"
 FIRE_TIMEOUT_SECS="${FIRE_TIMEOUT_SECS:-40}"  # generous over inclusion_timeout_ms's 30000ms default
+HEALTH_TIMEOUT_SECS="${HEALTH_TIMEOUT_SECS:-30}"
+MIN_BALANCE_ETH="${MIN_BALANCE_ETH:-0.01}"
+BENCHMARK_CHECK_ADDR="${BENCHMARK_CHECK_ADDR:-0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9}"
+
+TESTNET_WS_RPC_URL="${TESTNET_WS_RPC_URL:?set TESTNET_WS_RPC_URL to your Robinhood Chain testnet wss:// Alchemy URL first}"
+TESTNET_HTTP_RPC_URL="${TESTNET_HTTP_RPC_URL:?set TESTNET_HTTP_RPC_URL to your Robinhood Chain testnet https:// Alchemy URL first}"
 
 # STEP 15c FOLLOW-UP — audited this script for the same class of bug
 # benchmark-token.sh hit live (cast's bracket-annotated integers breaking
 # naive bash arithmetic): confirmed this script never calls `cast` at
 # all — its only numeric parsing is (a) bash arithmetic on values it
-# generates itself (date +%s, $N, the two *_SECS config vars, none of
-# them external RPC output) and (b) `jq -r` reads from audit.log, which
-# is plain serde_json output from the bot's own audit.rs — never
+# generates itself and (b) `jq -r` reads from audit.log/api/status,
+# which are plain serde_json output from the bot's own code — never
 # cast's human-readable annotation, so no equivalent bug exists here.
-# Confirmed `jq` is NOT preinstalled on a stock Ubuntu VPS either
-# (found live, same night as the cast bug) — the check below already
-# catches its absence, but now says how to fix it instead of just
-# stating the problem.
 for tool in curl jq python3; do
   if ! command -v "$tool" &>/dev/null; then
     echo "$tool is required and not on PATH — install it first (e.g. 'sudo apt-get install -y $tool' on Ubuntu)" >&2
@@ -87,22 +121,158 @@ for tool in curl jq python3; do
   fi
 done
 
+CONFIG_PATH="$BOT_DIR/config.toml"
+BACKUP_PATH="$BOT_DIR/config.toml.backup"
 AUDIT_LOG="$BOT_DIR/audit.log"
 TOKEN_FILE="$BOT_DIR/.sniper-token"
+
+if [[ ! -f "$CONFIG_PATH" ]]; then
+  echo "no config.toml found at $CONFIG_PATH — run this from the bot's WorkingDirectory (/opt/mint-sniper), or pass it as \$2" >&2
+  exit 1
+fi
 if [[ ! -f "$TOKEN_FILE" ]]; then
-  echo "no .sniper-token found at $TOKEN_FILE — run this from the bot's WorkingDirectory (/opt/mint-sniper), or pass it as \$2" >&2
+  echo "no .sniper-token found at $TOKEN_FILE" >&2
+  exit 1
+fi
+# STEP 15e FOLLOW-UP — refuse to run if a backup already exists, rather
+# than silently overwriting it. If a prior run crashed between backup
+# and restore, config.toml.backup right now holds the operator's REAL
+# original config — blindly `cp`-ing the CURRENT (possibly still
+# testnet-swapped) config.toml over it here would permanently destroy
+# the only copy of the real one. This is exactly the failure mode the
+# whole restore-and-verify design exists to prevent; it must not be
+# possible to trip it from the very first step.
+if [[ -f "$BACKUP_PATH" ]]; then
+  echo "$BACKUP_PATH already exists — refusing to proceed." >&2
+  echo "This usually means a prior run of this script did not complete its restore" >&2
+  echo "cleanly. Manually inspect both files RIGHT NOW:" >&2
+  echo "  diff $BACKUP_PATH $CONFIG_PATH" >&2
+  echo "If $BACKUP_PATH is your real original config, restore it yourself first:" >&2
+  echo "  cp $BACKUP_PATH $CONFIG_PATH && systemctl restart $SERVICE_NAME" >&2
+  echo "then remove $BACKUP_PATH before re-running this script." >&2
   exit 1
 fi
 API_TOKEN=$(cat "$TOKEN_FILE")
-touch "$AUDIT_LOG"  # so tail/wc below don't fail if nothing's been logged yet
+touch "$AUDIT_LOG"
 
+wait_for_healthy() {
+  local deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECS ))
+  while (( $(date +%s) < deadline )); do
+    if [[ "$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $API_TOKEN" "$BOT_URL/api/status" 2>/dev/null)" == "200" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# --- 1. back up the current config before touching anything ---
+echo "==> backing up $CONFIG_PATH -> $BACKUP_PATH"
+sudo -u "$SERVICE_USER" cp "$CONFIG_PATH" "$BACKUP_PATH"
+
+RESULTS_FILE=$(mktemp)
+RESTORE_VERIFIED=0
+
+# STEP 15e FOLLOW-UP — the actual safety net. Wraps steps 2-6 (swap,
+# restart, fire, restore, restart, verify): runs on ANY exit from this
+# script — normal completion, a thrown error under `set -e`, or an
+# operator Ctrl+C — so an interrupted run (same as happened live the
+# night this was found) still restores config.toml instead of leaving
+# the bot pointed at testnet with real mainnet wallets configured.
+cleanup() {
+  local exit_code=$?
+  # `set -e` is unreliable inside trap handlers across bash versions —
+  # this is the single most important command in the whole script, so
+  # it does not lean on that: its own exit status is checked explicitly
+  # rather than trusted to propagate.
+  set +e
+  echo
+  echo "==> restoring $CONFIG_PATH from $BACKUP_PATH"
+  sudo -u "$SERVICE_USER" cp "$BACKUP_PATH" "$CONFIG_PATH"
+  local cp_status=$?
+
+  # Step 7 — not optional, not best-effort: verify byte-for-byte before
+  # ever reporting success.
+  if [[ "$cp_status" -eq 0 ]] && cmp -s "$BACKUP_PATH" "$CONFIG_PATH"; then
+    echo "==> restore verified: config.toml matches config.toml.backup byte-for-byte"
+    systemctl restart "$SERVICE_NAME"
+    if wait_for_healthy; then
+      echo "==> service restarted and healthy on the restored config"
+      RESTORE_VERIFIED=1
+      rm -f "$BACKUP_PATH"
+    else
+      echo "==> !!! config.toml is restored correctly, but the service did NOT come back" >&2
+      echo "    healthy within ${HEALTH_TIMEOUT_SECS}s. Check manually:" >&2
+      echo "      systemctl status $SERVICE_NAME" >&2
+      echo "      journalctl -u $SERVICE_NAME -n 100 --no-pager" >&2
+      echo "    NOT deleting $BACKUP_PATH — keep it until you've confirmed this yourself." >&2
+    fi
+  else
+    echo "==> !!! RESTORE FAILED — $CONFIG_PATH does NOT match $BACKUP_PATH after copy !!!" >&2
+    echo "    DO NOT TRUST THE BOT'S CURRENT CONFIG. Manually run:" >&2
+    echo "      diff $BACKUP_PATH $CONFIG_PATH" >&2
+    echo "    and fix this before arming the bot for anything real." >&2
+  fi
+
+  rm -f "$RESULTS_FILE" 2>/dev/null || true
+
+  if [[ "$exit_code" -ne 0 ]]; then
+    echo "==> exiting non-zero (code $exit_code) — see messages above for what happened." >&2
+  fi
+  if [[ "$RESTORE_VERIFIED" -ne 1 ]]; then
+    echo "==> exiting WITHOUT a confirmed-good restore — see the !!! messages above, this needs manual attention." >&2
+    exit 1
+  fi
+  exit "$exit_code"
+}
+trap cleanup EXIT
+
+# --- 2. confirm the benchmark token and swap config.toml to testnet ---
+echo
+echo "==> confirming the benchmark token is live"
+CHECK_OUTPUT=$(RPC_URL="$TESTNET_HTTP_RPC_URL" "$SCRIPT_DIR/benchmark-token.sh" check "$BENCHMARK_CHECK_ADDR")
+echo "$CHECK_OUTPUT"
+NFT_CONTRACT=$(echo "$CHECK_OUTPUT" | grep '^BENCHMARK_NFT_CONTRACT=' | cut -d= -f2)
+if [[ -z "$NFT_CONTRACT" ]]; then
+  echo "could not confirm a live benchmark token — see output above. If EXPIRED, run" >&2
+  echo "'./benchmark-token.sh redeploy' first, then re-run this script with" >&2
+  echo "BENCHMARK_CHECK_ADDR set to the new address." >&2
+  exit 1
+fi
+
+echo
+echo "==> swapping $CONFIG_PATH to Robinhood Chain testnet + this benchmark contract"
+python3 "$SCRIPT_DIR/lib/swap_config_to_testnet.py" \
+  "$CONFIG_PATH" "$TESTNET_WS_RPC_URL" "$TESTNET_HTTP_RPC_URL" "$NFT_CONTRACT"
+chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_PATH"
+
+# --- 3. restart and wait for real health, not a fixed sleep ---
+echo "==> restarting $SERVICE_NAME on the swapped config"
+systemctl restart "$SERVICE_NAME"
+if ! wait_for_healthy; then
+  echo "service did not come back healthy within ${HEALTH_TIMEOUT_SECS}s after the testnet swap — check:" >&2
+  echo "  systemctl status $SERVICE_NAME" >&2
+  echo "  journalctl -u $SERVICE_NAME -n 100 --no-pager" >&2
+  echo "(config.toml will still be restored by this script's cleanup before it exits)" >&2
+  exit 1
+fi
+echo "==> service healthy on testnet config"
+
+# balance_poll_loop refreshes wallet balances every 15s (main.rs) — give
+# it time to complete at least one real cycle against the NEW network
+# before trusting balance_eth below; checking immediately after restart
+# would still show stale/zero data from before the swap.
+echo "==> waiting 20s for the first post-restart balance poll to land"
+sleep 20
+
+echo
 echo "==> pre-flight: GET /api/status"
 STATUS=$(curl -sS -H "Authorization: Bearer $API_TOKEN" "$BOT_URL/api/status")
 echo "$STATUS" | jq .
 WALLET_COUNT=$(echo "$STATUS" | jq '.wallets | length')
 if [[ "$WALLET_COUNT" != "1" ]]; then
   echo
-  echo "==> WARNING: $WALLET_COUNT wallets configured, not 1. See prerequisite #1"
+  echo "==> WARNING: $WALLET_COUNT wallets configured, not 1. See prerequisite #2"
   echo "    above — this script's per-attempt timing assumes a single"
   echo "    sequential wallet, same as step 14b's methodology. Continuing"
   echo "    anyway, but treat the results with that caveat if this wasn't"
@@ -113,16 +283,30 @@ if [[ "$(echo "$STATUS" | jq -r '.armed')" == "true" ]]; then
   exit 1
 fi
 
-RESULTS_FILE=$(mktemp)
-trap 'rm -f "$RESULTS_FILE"' EXIT
+# STEP 15e FOLLOW-UP — the pre-flight balance gate that was specified
+# but never actually built. Hard stop, not a warning: this is exactly
+# what would have caught the live incident (three wallets correctly
+# reporting 0 ETH on the network the bot was ACTUALLY connected to)
+# before firing, instead of proceeding anyway.
+UNDERFUNDED=$(echo "$STATUS" | python3 "$SCRIPT_DIR/lib/check_wallet_balances.py" "$MIN_BALANCE_ETH")
+if [[ -n "$UNDERFUNDED" ]]; then
+  echo
+  echo "==> STOPPING — the following wallet(s) are below MIN_BALANCE_ETH=$MIN_BALANCE_ETH ETH" >&2
+  echo "    on Robinhood Chain testnet. Fund them from the faucet" >&2
+  echo "    (https://faucet.testnet.chain.robinhood.com) and confirm the transfer" >&2
+  echo "    actually landed before re-running:" >&2
+  echo "$UNDERFUNDED" >&2
+  exit 1
+fi
+echo "==> balance gate passed — all configured wallets have >= $MIN_BALANCE_ETH ETH on testnet"
 
+# --- 4. the actual n=15+ fires ---
 echo
-echo "==> starting $N fires against the configured seadrop nft_contract"
+echo "==> starting $N fires against $NFT_CONTRACT"
 echo "    (config.toml's mint_mode=seadrop forces trigger_mode=timestamp"
 echo "    with the drop's real, already-past startTime at boot, per"
 echo "    main.rs — so each /api/arm below auto-fires within ~1s, no"
-echo "    separate /api/trigger call needed. See CLAUDE.md step 15e note"
-echo "    if this assumption doesn't hold for your config.)"
+echo "    separate /api/trigger call needed.)"
 echo
 
 for i in $(seq 1 "$N"); do
@@ -153,8 +337,7 @@ for i in $(seq 1 "$N"); do
   done
 
   if [[ -z "$FOUND" ]]; then
-    echo "   TIMED OUT after ${FIRE_TIMEOUT_SECS}s waiting for a mint_result — check journalctl -u mint-sniper for what happened" >&2
-    # Best-effort recovery so the loop doesn't wedge on a stuck arm.
+    echo "   TIMED OUT after ${FIRE_TIMEOUT_SECS}s waiting for a mint_result — check journalctl -u $SERVICE_NAME for what happened" >&2
     curl -sS -o /dev/null -X POST -H "Authorization: Bearer $API_TOKEN" "$BOT_URL/api/abort" || true
     continue
   fi
@@ -170,9 +353,9 @@ done
 
 echo
 echo "==> push vs. poll (step 15d cross-check, from this run's journal window):"
-PUSH_COUNT=$(journalctl -u mint-sniper --since "-$(( N * (INTER_FIRE_DELAY_SECS + FIRE_TIMEOUT_SECS) ))s" 2>/dev/null \
+PUSH_COUNT=$(journalctl -u "$SERVICE_NAME" --since "-$(( N * (INTER_FIRE_DELAY_SECS + FIRE_TIMEOUT_SECS) ))s" 2>/dev/null \
   | grep -c "WS push path established" || true)
-POLL_COUNT=$(journalctl -u mint-sniper --since "-$(( N * (INTER_FIRE_DELAY_SECS + FIRE_TIMEOUT_SECS) ))s" 2>/dev/null \
+POLL_COUNT=$(journalctl -u "$SERVICE_NAME" --since "-$(( N * (INTER_FIRE_DELAY_SECS + FIRE_TIMEOUT_SECS) ))s" 2>/dev/null \
   | grep -c "WS push path unavailable" || true)
 echo "    PUSH established: $PUSH_COUNT / POLL fallback: $POLL_COUNT (out of $N arms)"
 if [[ "$POLL_COUNT" -gt 0 ]]; then
@@ -232,12 +415,14 @@ for label, values in (("send_to_ack_ms", send_ack), ("dispatch_to_inclusion_ms",
         print(f"{label}: p50={p50:.0f}ms p90={p90:.0f}ms (n={len(values)})")
 PYEOF
 
-trap - EXIT  # cancel cleanup — the raw results are worth keeping
-echo
-echo "==> raw per-fire results (not auto-deleted — rm it yourself when done):"
-echo "    $RESULTS_FILE"
 echo
 echo "==> Paste the p50/p90 numbers above into CLAUDE.md's step 15f section,"
 echo "    marking step 14b's HTTP-poll-only numbers as superseded (not"
 echo "    deleted), same convention as every other superseded figure in"
 echo "    this project."
+echo
+echo "==> steps 5-7 (restore original config.toml, restart, verify) run next"
+echo "    automatically via this script's cleanup trap — see output below."
+
+# --- 5-7: restore, restart, verify — handled by the cleanup trap above,
+# which runs unconditionally on exit, including this normal completion.
