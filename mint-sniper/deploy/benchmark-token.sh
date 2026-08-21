@@ -116,6 +116,10 @@ case "$MODE" in
       echo "==> STILL LIVE. endTime=$END_TIME (now=$NOW), ~${REMAINING}h remaining."
       echo "    Use this contract address for step 15e's benchmark:"
       echo "      $NFT_CONTRACT"
+      # STEP 15e FOLLOW-UP — machine-parseable line for run-benchmark.sh
+      # to grep out, so it reuses this check's confirmed-live address
+      # instead of a second, independently-hardcoded copy of it.
+      echo "BENCHMARK_NFT_CONTRACT=$NFT_CONTRACT"
     else
       EXPIRED_HOURS=$(( (NOW - END_TIME) / 3600 ))
       echo

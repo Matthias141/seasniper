@@ -288,9 +288,13 @@ This is the actual point of getting a real VPS running — closing gap
 #11 for real (this bot's WS transport has never once connected outside
 a coding sandbox whose own TLS-interception proxy blocks it) and
 getting a genuinely PUSH-based `dispatch_to_inclusion_ms` number
-instead of step 14b's honestly-labeled-but-still-POLL-based one. All
-three scripts below are prepared and ready to run; none of them have
-been run by any coding session, since none of them can reach this VPS.
+instead of step 14b's honestly-labeled-but-still-POLL-based one. The
+scripts below (`deploy/benchmark-token.sh`, `deploy/run-benchmark.sh`,
+and its `deploy/lib/*.py` helpers) are prepared and ready to run —
+their pure-logic pieces are covered by `deploy/tests/*` (which real CI
+runs on every push), but the actual live cycle — restarting a real
+systemd service twice against a real bot on a real chain — has never
+run anywhere but this VPS, since no coding session can reach it.
 
 **15c — confirm or redeploy the benchmark token:**
 ```bash
@@ -314,27 +318,31 @@ access), but that was a sandbox-specific limitation, not a Foundry one
 standard way (`curl -L https://foundry.paradigm.xyz | bash && foundryup`)
 with no special workaround needed.
 
-**Update `config.toml`** with the confirmed-live (or freshly redeployed)
-token, then restart:
-```toml
-mint_mode = "seadrop"
-nft_contract = "<address from above>"
-fee_recipient = "0x0000a26b00c1F0DF003000390027140000fAa719"
-quantity_per_wallet = 1
-block_time_ms = 227   # step 14b's real measured Robinhood testnet figure
-```
-Keep exactly ONE `[[wallets]]` entry for this — the benchmark script's
-methodology assumes sequential single-wallet fires, same as step 14b.
-```bash
-sudo systemctl restart mint-sniper
-```
+**Note: you do NOT need to hand-edit `config.toml` for the benchmark
+itself.** An earlier version of this section said to — that assumed
+`run-benchmark.sh` would find config.toml already pointed at testnet,
+but nothing actually made that true, and a first live run confirmed it:
+the script fired straight against whatever network config.toml already
+had (mainnet, in that case), with three real testnet-funded wallets
+correctly reporting 0 balance on the wrong network and the run
+proceeding anyway. `run-benchmark.sh` now does the whole swap itself —
+backs up config.toml, points it at testnet + the confirmed-live
+benchmark contract, restarts the service, waits for real health,
+gates on wallet balance, fires, then restores your ORIGINAL config.toml
+and restarts again, verifying the restore byte-for-byte before ever
+reporting success. See CLAUDE.md's step 15e section for the full
+incident writeup.
 
-**15d — confirm PUSH actually engages (not silently falling back to
-POLL, which is what every single benchmark before this one has been
-stuck doing per gap #11):**
+**15d — confirm PUSH actually engages, as an independent sanity check
+before committing to the full cycle below** (not silently falling back
+to POLL, which is what every single benchmark before this one has been
+stuck doing per gap #11) — `run-benchmark.sh` also checks this
+automatically at the end of its own run, so this manual pre-check is
+optional, but useful to catch a bad testnet RPC URL before the swap
+even happens:
 ```bash
 sudo journalctl -u mint-sniper -f
-# in another terminal, arm once:
+# in another terminal, arm once against whatever config.toml already has:
 curl -sS -X POST -H "Authorization: Bearer $(cat /opt/mint-sniper/.sniper-token)" http://127.0.0.1:4117/api/arm
 ```
 Look for the line `inclusion detection: WS push path established for
@@ -347,20 +355,41 @@ this) before running the full benchmark. This log line was previously
 only visible in the live browser UI at the exact moment of arming —
 neither `journalctl` nor `audit.log` carried it (`bus::log`'s events
 don't reach either — see CLAUDE.md's step 17 finding on this same
-gap). Fixed alongside this step so it's checkable after the fact, same
+gap). Fixed alongside step 17 so it's checkable after the fact, same
 as everything else on this VPS.
 
-**15e — run the actual benchmark:**
+**15e — run the actual benchmark (must run as root):**
 ```bash
-cd /opt/mint-sniper
-sudo -u mint-sniper /opt/mint-sniper/repo/mint-sniper/deploy/run-benchmark.sh 15
+sudo TESTNET_WS_RPC_URL="wss://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY" \
+     TESTNET_HTTP_RPC_URL="https://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY" \
+     /opt/mint-sniper/repo/mint-sniper/deploy/run-benchmark.sh 15
 ```
-Read the script's own header comment for prerequisites BEFORE running
-— it will not check for you whether your testnet ETH faucet transfer
-actually landed, and it cannot automate a step-up TOTP loop if identity
-(step 10c) is enabled on this instance. Prints a p50/p90 summary for
-both `send_to_ack_ms` and `dispatch_to_inclusion_ms` at the end, plus a
-push-vs-poll count cross-checking 15d across the whole run.
+Read the script's own header comment for prerequisites BEFORE running.
+It handles the config swap, restart, health check, and balance gate
+itself — it will NOT check for you whether your testnet ETH faucet
+transfer actually landed in the first place (only that the balance is
+currently below threshold), and it cannot automate a step-up TOTP loop
+if identity (step 10c) is enabled on this instance. Prints a p50/p90
+summary for both `send_to_ack_ms` and `dispatch_to_inclusion_ms` at the
+end, plus a push-vs-poll count cross-checking 15d across the whole run,
+then restores your original config.toml automatically — including if
+you Ctrl+C partway through, or if the run itself errors out.
+
+**Verify the restore yourself too, once, the first time you run
+this** — the script verifies byte-for-byte internally and refuses to
+report success otherwise, but confirming it independently the first
+time costs one command and buys real confidence in the safety net:
+```bash
+sudo systemctl status mint-sniper          # active (running)
+curl -sS -H "Authorization: Bearer $(cat /opt/mint-sniper/.sniper-token)" http://127.0.0.1:4117/api/status | jq .
+# confirm this shows your real mainnet wallets/config, not the testnet ones
+ls /opt/mint-sniper/config.toml.backup     # should NOT exist after a successful run —
+                                            # the script deletes it once the restore is verified
+```
+If `config.toml.backup` DOES still exist after the script exits, it
+means the restore was not verified — the script's own output will have
+said so loudly (look for `!!!` in what it printed). Do not assume the
+bot is safely back on mainnet until you've checked this.
 
 **15f — update CLAUDE.md** with the real numbers this produces,
 following step 15e's own printed reminder at the end of its output.

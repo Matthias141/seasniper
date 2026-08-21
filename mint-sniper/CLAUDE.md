@@ -1431,6 +1431,106 @@ regression, and this whole class of "external command output fed
 straight into bash arithmetic" bug in this file, can't reach a live VPS
 silently again.
 
+**Follow-up: `run-benchmark.sh` fired against mainnet, not testnet — a
+real, missing-feature bug, found live.** The version of the script
+described above was written as if config.toml would already be pointed
+at Robinhood Chain testnet before it ran — but nothing in the script,
+or in `DEPLOY.md`'s instructions, actually made that true. Confirmed
+live: the bot doesn't hot-reload `ws_rpc_url`/`http_rpc_urls` (read
+once at `Config::load` time, per `main.rs` — a `systemctl restart` is
+required to pick up a config change, not just editing the file), so the
+script fired straight against whatever network config.toml already had
+on the real box (mainnet). The pre-flight check correctly reported
+`0.000000000000000000` balance on all three configured wallets (real
+Robinhood testnet-funded wallets, on a chain the bot wasn't actually
+connected to) — and the script proceeded to fire anyway. The balance
+gate this section already described as a prerequisite ("this script
+does not check this for you") had also never actually been built as a
+hard stop; it only printed a warning about wallet count, never balance.
+
+**Fixed — `run-benchmark.sh` now owns the whole network swap, not just
+the firing:**
+1. Backs up `config.toml` to `config.toml.backup` — but first checks
+   whether a backup already exists and REFUSES to proceed if so. A
+   naive unconditional backup here would be a real hazard: if a prior
+   run crashed between backup and restore, `config.toml.backup` right
+   now holds the operator's real original config — blindly copying the
+   (possibly still testnet-swapped) `config.toml` over it would
+   permanently destroy the only copy of the real one.
+2. Rewrites `config.toml`'s network/target fields
+   (`ws_rpc_url`/`http_rpc_urls`/`mint_mode`/`nft_contract`/
+   `fee_recipient`/`quantity_per_wallet`/`block_time_ms`) to point at
+   testnet and the confirmed-live benchmark contract from step 15c —
+   pulled from `benchmark-token.sh check`'s own machine-parseable
+   `BENCHMARK_NFT_CONTRACT=` output line, never a second, independently
+   hardcoded copy of that address. Extracted into its own file,
+   `deploy/lib/swap_config_to_testnet.py`, specifically so this logic
+   is unit-testable on its own (see below) without needing systemd,
+   sudo, or a real bot at all.
+3. Restarts the systemd service and polls `GET /api/status` for a real
+   200 response — not a fixed `sleep` — before proceeding.
+4. THEN runs the actual n=15+ fires, exactly as before.
+5. Restores `config.toml` from the backup.
+6. Restarts the service again.
+7. Verifies the restore byte-for-byte (`cmp -s`) before EVER reporting
+   success — this is the actual safety guarantee the whole redesign
+   exists for. Deliberately stricter than the literal spec in one way:
+   even a byte-for-byte-clean restore is not reported as verified
+   unless the service also comes back to a real healthy `/api/status`
+   afterward — a file matching on disk while the process is crash-
+   looping on it isn't actually "back to normal."
+
+Steps 2-6 are wrapped in a single `trap ... EXIT` (`cleanup()` in the
+script), so an interrupted run — an operator Ctrl+C, same as happened
+live the night this was found, or the script erroring out mid-fire —
+still runs the restore-and-verify before the process actually exits.
+The trap's own critical command does not lean on `set -e` propagating
+correctly inside trap handlers (a known cross-version inconsistency in
+bash) — its exit status is checked explicitly instead.
+
+**The pre-flight balance gate, actually built this time.** Extracted
+into `deploy/lib/check_wallet_balances.py` (same "make it independently
+testable" reasoning as the swap script) — reads a `GET /api/status`
+JSON body, flags every wallet below `MIN_BALANCE_ETH` (default 0.01,
+overridable), and `run-benchmark.sh` now hard-stops before firing if
+any are — printing exactly which wallets need funding, the literal
+scenario this section describes as the live incident. Given
+`balance_poll_loop` only refreshes every 15s (`main.rs`), the script
+waits 20s after the post-swap restart before trusting `balance_eth` at
+all, so it doesn't read stale pre-swap data as if it were current.
+
+**Verification — what could genuinely be tested here, and what
+couldn't.** This session still can't reach the live VPS, so the
+root-required, systemd-restarting orchestration in `run-benchmark.sh`
+itself has not run end to end anywhere but that VPS — `DEPLOY.md` §9
+has the precise operator-run verification steps for that part,
+including an explicit "confirm `config.toml.backup` no longer exists
+after a successful run" check. What COULD be tested, and was:
+- `deploy/tests/test-swap-config-to-testnet.py` — the config-rewrite
+  logic against a scratch config file shaped like the real
+  `config.example.toml`, including a multi-line `http_rpc_urls` array
+  and a commented-out example block reusing the same key names
+  (specifically checking the regex-based rewrite doesn't touch a
+  commented line just because it shares a key name with a real one —
+  the exact kind of naive-regex trap the cast-bracket bug earlier this
+  step was a version of). 13 assertions, all passing.
+- `deploy/tests/test-check-wallet-balances.py` — the balance gate
+  against mocked `/api/status` JSON, including the exact live incident
+  shape (three wallets at 0.000000000000000000), a boundary case
+  (balance exactly equal to the threshold passes, matching the script's
+  strict less-than), and an empty wallet list. 13 assertions, all
+  passing.
+- `deploy/tests/test-config-backup-restore.sh` — the two bash idioms
+  the safety net depends on (`[[ -f "$BACKUP_PATH" ]]` refusing a
+  second run, and `cmp -s` correctly distinguishing a clean restore
+  from a corrupted/partial one) against scratch files. 4 assertions,
+  all passing.
+
+All three are wired into CI's `deploy-scripts` job alongside the
+existing `test-benchmark-token.sh`, so this whole class of bug — and
+this specific one, if it ever regresses — fails a real, per-push CI
+check instead of reaching a live VPS silently again.
+
 **Still gated on the operator actually running these** — the real
 numbers, the final "is gap #11 closed" confirmation, and the
 per-metric colocation verdict all belong in a 15f update to this
