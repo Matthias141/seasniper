@@ -1786,6 +1786,114 @@ finally provides. Step 13f's original n=1 attempt (7551ms) remains
 superseded by 14b as before. **Gap #11 is closed, for real, with
 evidence — the first time that has ever been true in this project.**
 
+### 15g — a new, separate open question: real sequencer delay, or
+Alchemy-specific indexing lag? (does NOT change 15f's verdict above)
+
+15f's diagnostic confirmed real on-chain delay at the transaction-
+receipt level — genuine, not in question. What it could NOT distinguish
+is a more precise variant of the RPC-lag hypothesis: whether the
+Robinhood Chain *sequencer* actually produced the including block
+significantly earlier than *Alchemy's own node* indexed and served it
+as queryable — which would look identical to real sequencer delay from
+this bot's receipt-level view, while the underlying chain may have
+actually been faster. Investigated as far as this session honestly
+could; **inconclusive, and 15f's verdict above is unchanged by this
+section** — read on for exactly why, and what would actually settle it.
+
+**Protocol confirmed directly, not assumed — this was the first thing
+checked, per this project's own standard.** Robinhood's node-operator
+docs (`docs.robinhood.com/chain/run-a-full-node/`) and a third-party
+decoder project built specifically for this feed
+(`chainstacklabs/robinhood-chain-sequencer-feed`, whose own description
+is "Offchain Labs' Nitro relay for transport, a fast lazy decoder for
+everything after") both confirm: `wss://feed.testnet.chain.robinhood.com`
+speaks Arbitrum Nitro's own sequencer-feed relay protocol, **not**
+standard `eth_subscribe` JSON-RPC. It is not a drop-in swap for
+`alloy`'s existing `WsConnect`/`subscribe_blocks()`, which only speaks
+standard Ethereum pubsub — a real, code-relevant fact, confirmed before
+attempting anything, not assumed from the URL's `wss://` scheme alone.
+
+**Connected to it anyway, from this sandbox — and it worked, at the
+protocol level, which was itself unexpected.** Unlike every prior
+`alloy`/`rustls`-based WS attempt in this project's history (gap #11 —
+blocked by this sandbox's TLS-interception proxy, since `alloy`'s
+`webpki-roots` trust store doesn't trust that proxy's CA), a plain
+Python `websockets` client completed the TLS handshake and received
+real, well-formed JSON messages — `python3`'s TLS stack evidently trusts
+whatever CA this sandbox's proxy presents, where `rustls`'s
+hard-compiled trust store does not. Real message shape, captured live
+(not fabricated): `{"version":1,"messages":[{"sequenceNumber":N,
+"message":{"message":{"header":{"kind":3,"blockNumber":B,
+"timestamp":T,...},"l2Msg":"<base64>"},...},"blockHash":"0x...",
+"signatureV2":"...",...}]}`.
+
+**But the data received was frozen, not live — a concrete, evidenced
+finding, not a guess.** Three fully independent connection attempts,
+spread across real, separate process invocations several minutes
+apart, all returned a **byte-for-byte identical first message**
+(`sequenceNumber=105316976`, `header.blockNumber=11540856`,
+`header.timestamp=1787375057` — every single time). Draining 60
+consecutive messages from one connection advanced `sequenceNumber` by
+exactly 60 (one per message, real progress within the stream) but
+`header.blockNumber` never moved past its very first value, and the
+message timestamps stayed ~800+ seconds stale the entire time,
+regardless of real elapsed wall-clock time between attempts. This
+reads as this sandbox's own outbound proxy caching or otherwise not
+passing through genuinely live traffic for this specific long-lived
+WS endpoint — a different, more insidious manifestation of gap #11
+than an outright connection failure (a connection that *looks*
+successful but silently serves stale data is worse to build on than
+one that visibly fails), and worth flagging precisely for that reason.
+
+**A separate, real ambiguity surfaced along the way, unresolved:**
+`sequenceNumber` (~105.3M, matching the RPC's `eth_blockNumber` order
+of magnitude) and `header.blockNumber` (~11.5M, a completely different
+and far-slower-moving range) cannot both be "the L2 block number" —
+one of them is something else, likely an internal Nitro concept (an L1
+reference index, a delayed-inbox counter, or similar) distinct from
+the standard block height `eth_getBlockByNumber` exposes. This
+session's own frozen-data problem prevented resolving which is which
+with a live cross-check; the operator-run test below includes exactly
+how to settle it in passing.
+
+**Genuinely inconclusive from this sandbox — stated plainly, not
+stretched into a conclusion either direction.** Neither "real sequencer
+delay" nor "Alchemy-specific indexing lag" is confirmed or ruled out by
+anything captured here. 15f's own finding — that the ~15-block delay is
+real (not a bot-side detection artifact) and not gas-price-related —
+stands entirely unchanged; this section only narrows what "real" could
+still mean underneath that.
+
+**The exact operator-run test that would settle it, since this session
+cannot:**
+```bash
+# On the real VPS, at the moment of (or right after) a benchmark fire:
+# 1. Connect to the sequencer feed and capture ONE live message's
+#    sequenceNumber, header.blockNumber, header.timestamp, and blockHash.
+# 2. Immediately query the SAME Alchemy endpoint config.toml already
+#    uses for both candidate numbers, to resolve which one is the real
+#    L2 block height:
+curl -sS -X POST "$ALCHEMY_HTTP_URL" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x<sequenceNumber_hex>",false]}'
+curl -sS -X POST "$ALCHEMY_HTTP_URL" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x<header_blockNumber_hex>",false]}'
+# Whichever call's returned "hash" field matches the feed message's own
+# "blockHash" is the real L2 block number in the standard numbering
+# space. THEN compare that RPC block's "timestamp" against the feed
+# message's own header.timestamp for the SAME block, captured as close
+# in wall-clock time as practical. A material, consistent gap (Alchemy
+# reporting a LATER timestamp than the feed for the same block)
+# supports Alchemy-specific indexing lag; matching timestamps rule it
+# out and point back to genuine sequencer-side delay as 15f already
+# found.
+```
+This needs a real VPS whose outbound network isn't behind this
+sandbox's proxy (the stale-data problem above should not recur there),
+and the operator's own configured Alchemy endpoint (never available to
+this session). Worth running if inclusion latency matters enough for a
+real drop to justify chasing further — genuinely open, not urgent
+enough on its own to block anything already shipped.
+
 ## Live first deploy — real findings (step 16)
 
 The operator's first real attempt to actually deploy onto the `t4g.small`
