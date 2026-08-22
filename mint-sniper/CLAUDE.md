@@ -1119,6 +1119,15 @@ figure: **~227ms**, meaningfully higher than the commonly-cited ~100ms.
 Reported as measured, not silently substituted — `block_time_ms = 227`
 is what the benchmark config actually used.
 
+**SUPERSEDED by step 15f — kept below for the reasoning trail, not as
+the current numbers.** Every figure and every "cannot yet attribute
+this to X" hedge below was written before the PUSH path had ever run
+outside this coding sandbox — the whole point of gap #11. Step 15f has
+the real thing: a genuine n=15 PUSH-based run (zero POLL fallback) plus
+direct on-chain evidence resolving exactly the question this section
+could only speculate about. Read 15f for the actual current numbers
+and verdict; read below for how the investigation got there.
+
 **Real results, n=15 per chain, sequential fires from one funded
 wallet (same `.testnet-keys/wallet1` throughout), same bot binary,
 same methodology:**
@@ -1688,13 +1697,94 @@ n=15 benchmark and, ideally, the diagnostic tool above against at
 least one of its outliers. Reporting a verdict without that data would
 be exactly the kind of unearned confidence this project's own
 "verify, don't guess" standard has consistently rejected elsewhere.
+**That data now exists — see 15f directly below.**
 
-**Still gated on the operator actually running these** — the real
-numbers, the final "is gap #11 closed" confirmation, and the
-per-metric colocation verdict all belong in a 15f update to this
-section once that happens, not before. Until then: PUSH-based numbers
-do not exist yet, and 14b's POLL-based numbers stand as the last real
-measurement, not superseded by anything written in this session.
+### 15f — the real result: closing the entire step 14/15 arc
+
+**A full n=15 run, on the real VPS, genuinely PUSH-based throughout.**
+All 15 fires succeeded. PUSH confirmed on every arm — 30/30 push
+confirmations across the run (both the arm-time "WS push path
+established" log and each fire's `method="push"` result), **zero POLL
+fallback**. This is the first time in this project's history gap #11
+has actually been closed with evidence, not a "should work outside
+this sandbox" caveat — every number below is a genuine measurement of
+what this bot's own PUSH-based detection does on real infrastructure,
+not something entangled with a poll interval the way every prior
+benchmark (13f, 14b) necessarily was.
+
+| Metric | Real n=15 PUSH result | MintDash (p50) | Ratio |
+|---|---|---|---|
+| send→ack p50 | 174ms | 117ms | ~1.5x |
+| send→ack p90 | 235ms | — | — |
+| dispatch→inclusion p50 | 2127ms | 136ms | ~15.6x |
+| dispatch→inclusion p90 | 2367ms | — | — |
+
+**Diagnostic confirmation, not just a number taken at face value** —
+`deploy/lib/diagnose_inclusion_delay.py` run against a real mid-pack
+fire from this run (tx `0x3667e4bd...`, bot-measured
+`dispatch_to_inclusion_ms: 1888`): the tx's dispatch-time block was
+`~105155922`, its actual inclusion block was `105155937` — **~15 real
+blocks elapsed**, confirmed directly from on-chain block numbers, not
+inferred. This rules out the tool's own "≤2 blocks means node/
+subscription lag, not real delay" case entirely — the delay is
+genuinely on-chain, not a detection artifact. The same tx's
+`effectiveGasPrice` paid **zero priority fee above base fee** —
+consistent with, not contradicted by, Robinhood Chain's documented
+FCFS sequencing (gas price doesn't affect ordering there) — so this is
+**confirmed not attributable to underpriced gas**; raising
+`priority_fee_multiplier`/`max_priority_fee_gwei_cap` would not be
+expected to fix it.
+
+**The final verdict, per metric — this is the answer this whole step
+existed to produce:**
+
+- **send→ack (174ms vs. MintDash's 117ms, ~1.5x):** plausibly
+  explained by RPC/network proximity — this run's testnet Alchemy
+  endpoint from a `us-east-1` VPS vs. MintDash's own colocated node.
+  **This is the number a future colocation/dedicated-node step could
+  reasonably expect to move.**
+- **dispatch→inclusion (2127ms vs. MintDash's 136ms, ~15.6x):**
+  **CONFIRMED as real on-chain delay via direct block-number evidence**
+  — not a measurement artifact, not a poll-interval confound (unlike
+  every number in 13f/14b), not attributable to this bot's own
+  detection method at all. **Also confirmed not attributable to gas
+  pricing**, given this chain's documented FCFS model and the zero-
+  priority-fee-paid evidence above. **RPC proximity/colocation would
+  improve HOW FAST this bot learns about an inclusion that already
+  happened — it has no bearing on WHEN inclusion itself happens on
+  this specific chain's sequencing model.** These are two genuinely
+  different problems. A colocation/dedicated-node step is well-
+  supported for send→ack specifically; it would NOT be expected to
+  move dispatch→inclusion at all, and proposing it as a fix for that
+  number would be solving the wrong problem — this corrects 14b's own
+  (already appropriately hedged, but now resolvable) open question,
+  and supersedes any framing anywhere in this file that treated
+  "colocation helps proximity-sensitive numbers" as applying to
+  dispatch→inclusion broadly rather than to send→ack specifically.
+
+**The real open question, stated plainly rather than guessed at:**
+*why* Robinhood Chain testnet's sequencer takes ~15 blocks
+(~3.4s at the measured 227ms block time) to include a transaction that
+reached it, when the chain's own block-production cadence is far
+faster, is genuinely unknown from this investigation. This session has
+no ability to inspect Robinhood Chain's sequencer internals, no
+mainnet data to compare testnet behavior against, and no scope to
+investigate further here — worth its own dedicated investigation if
+inclusion latency matters for a real drop (it likely does, for a
+sniper), but explicitly out of scope for this write-up. Don't let the
+"confirmed real, confirmed not gas, confirmed not RPC lag" findings
+above be mistaken for "fully explained" — two real candidate causes
+(gas pricing, RPC/detection lag) were ruled out with evidence; the
+actual cause was not identified.
+
+**Step 14b's HTTP-poll-confounded numbers (978ms/1329ms p50/p90 on
+Robinhood testnet) are now explicitly superseded by the real PUSH
+numbers above** — not deleted, kept as the historical record of the
+investigation that correctly diagnosed its own limitation and scoped
+exactly what evidence would be needed to resolve it, which this step
+finally provides. Step 13f's original n=1 attempt (7551ms) remains
+superseded by 14b as before. **Gap #11 is closed, for real, with
+evidence — the first time that has ever been true in this project.**
 
 ## Live first deploy — real findings (step 16)
 
