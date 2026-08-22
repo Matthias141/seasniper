@@ -360,6 +360,22 @@ impl Config {
                     self.gas_jitter_pct
                 );
             }
+            // P0 follow-up 18b — a race_mode config with sequencer_http_url
+            // set but http_rpc_urls left empty (the exact shape this
+            // feature encourages: race the sequencer, treat backups as
+            // optional) used to leave inclusion confirmation structurally
+            // impossible whenever the sequencer's own connection wasn't
+            // reused for polling. That reuse is fixed in executor.rs now,
+            // but a config with BOTH left empty is still unfireable — there
+            // would be nothing to broadcast to at all — so reject that
+            // shape here rather than let it silently pass validate() and
+            // fail confusingly at fire time.
+            if self.sequencer_http_url.is_empty() && self.http_rpc_urls.is_empty() {
+                anyhow::bail!(
+                    "race_mode is set but both sequencer_http_url and http_rpc_urls are empty — \
+                     at least one broadcast target is required"
+                );
+            }
         }
 
         if self.looks_like_robinhood_chain() && self.block_time_ms == 12_000 {

@@ -326,8 +326,19 @@ pub async fn fire_prepared(
             let (sequencer_ack, mut results) = tokio::join!(sequencer_fut, backup_fut);
 
             if results.iter().all(|r| r.is_err()) {
+                // P0 follow-up 18b — prefer a warmed backup provider for
+                // polling (matches every other path in this file), but a
+                // sequencer-only race_mode config (few or no backup RPCs —
+                // exactly the shape this feature encourages) can leave
+                // `providers` empty, or every backup send can fail outright.
+                // The sequencer's own already-warmed connection is an
+                // equally valid `eth_getTransactionReceipt` client for a tx
+                // it just accepted — reuse it rather than falling through to
+                // the "sequencer acked but inclusion was not confirmed"
+                // branch below and reporting success: false for a tx that
+                // may have actually landed.
                 if let (Some((seq_ms, seq_url)), Some(provider)) =
-                    (sequencer_ack.as_ref(), providers.first())
+                    (sequencer_ack.as_ref(), providers.first().or(sequencer.as_ref()))
                 {
                     match crate::inclusion::wait_for_receipt(
                         provider,
@@ -440,6 +451,15 @@ pub async fn fire_prepared(
                     dispatch_to_inclusion_ms: None,
                 });
             } else if let Some((send_to_ack_ms, acked_url)) = sequencer_ack {
+                // P0 follow-up 18b — this branch should no longer be
+                // reachable in practice: whenever sequencer_ack is Some, the
+                // `providers.first().or(sequencer.as_ref())` fallback above
+                // always finds a provider to poll with (the sequencer
+                // connection itself, at minimum), so an Included or
+                // TimedOut result always gets pushed into `results` before
+                // this `else if` is even reached. Kept as defense-in-depth
+                // for a future refactor of the block above, not because
+                // this path is expected to fire.
                 info!(
                     url = %config::redact_rpc_url(&acked_url),
                     send_to_ack_ms,
@@ -494,7 +514,117 @@ fn apply_pct_jitter(value: u128, pct: i64) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_pct_jitter, sample_fire_jitter_ms};
+    use super::{apply_pct_jitter, fire_prepared, sample_fire_jitter_ms, HttpProvider, PreparedWallet};
+    use crate::bus;
+    use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
+    use alloy::primitives::{Address, Log, TxHash};
+    use alloy::providers::ProviderBuilder;
+    use alloy::rpc::types::TransactionReceipt;
+    use axum::{routing::post, Json, Router};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+
+    /// A minimal JSON-RPC mock that answers `eth_sendRawTransaction` with a
+    /// fixed hash and `eth_getTransactionReceipt` with an immediate,
+    /// successful receipt for that same hash — enough for `fire_prepared`
+    /// to exercise a real send + real inclusion-poll round trip without a
+    /// live chain. Not a general-purpose mock: any other method is a bug
+    /// in the test, not something to shrug off, so it panics loudly.
+    async fn spawn_mock_sequencer(tx_hash: TxHash) -> String {
+        let receipt = TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                receipt: Receipt::<Log> { status: Eip658Value::success(), cumulative_gas_used: 21_000, logs: vec![] },
+                logs_bloom: Default::default(),
+            }),
+            transaction_hash: tx_hash,
+            transaction_index: Some(0),
+            block_hash: Some(Default::default()),
+            block_number: Some(1),
+            gas_used: 21_000,
+            effective_gas_price: 1_000_000_000,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+        };
+        let receipt_json = serde_json::to_value(&receipt).expect("TransactionReceipt must serialize");
+
+        let handler = move |Json(body): Json<Value>| {
+            let receipt_json = receipt_json.clone();
+            async move {
+                let id = body["id"].clone();
+                let result = match body["method"].as_str() {
+                    Some("eth_sendRawTransaction") => json!(format!("{tx_hash:#x}")),
+                    Some("eth_getTransactionReceipt") => receipt_json,
+                    other => panic!("mock sequencer got an unexpected RPC method: {other:?}"),
+                };
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+            }
+        };
+        let app = Router::new().route("/", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    /// P0 follow-up 18b regression test — the exact false-negative this
+    /// closes: `sequencer_http_url` acks the broadcast, no backup RPC is
+    /// configured at all (`http_rpc_urls` empty, the shape a sequencer-only
+    /// race_mode config produces), and inclusion confirmation must now come
+    /// from the sequencer's own warmed connection instead of reporting
+    /// `success: false` for a tx that actually landed.
+    #[tokio::test]
+    async fn sequencer_ack_only_with_no_backup_rpc_resolves_to_real_inclusion() {
+        let tx_hash = TxHash::from([0x11u8; 32]);
+        let mock_url = spawn_mock_sequencer(tx_hash).await;
+
+        let sequencer: HttpProvider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(mock_url.parse().unwrap());
+
+        let mut cfg = crate::config::test_config();
+        cfg.http_rpc_urls = vec![];
+        cfg.sequencer_http_url = mock_url;
+        cfg.jitter_ms_min = 0;
+        cfg.jitter_ms_max = 0;
+        cfg.block_time_ms = 20;
+        cfg.inclusion_timeout_ms = 2_000;
+
+        let prepared = vec![PreparedWallet {
+            address: Address::ZERO,
+            raw_tx: Arc::from(vec![0xde, 0xad, 0xbe, 0xef]),
+            tx_hash,
+            prepared_at: std::time::Instant::now(),
+        }];
+
+        let bus = bus::new_bus();
+        let mut rx = bus.subscribe();
+
+        fire_prepared(&cfg, &prepared, &[], Some(&sequencer), &bus, std::time::Instant::now(), None)
+            .await
+            .expect("fire_prepared itself must not error — providers-empty-but-sequencer-present is a supported shape");
+
+        let mut saw_result = false;
+        while let Ok(event) = rx.try_recv() {
+            if let bus::ServerEvent::MintResult { success, dispatch_to_inclusion_ms, detail, .. } = event {
+                saw_result = true;
+                assert!(
+                    success,
+                    "sequencer-ack-only fire with no working backup RPC must resolve to a real \
+                     inclusion result, not a false success: false (detail was: {detail})"
+                );
+                assert!(
+                    dispatch_to_inclusion_ms.is_some(),
+                    "a real Included outcome must carry a real dispatch_to_inclusion_ms"
+                );
+            }
+        }
+        assert!(saw_result, "fire_prepared must emit a MintResult event for the one prepared wallet");
+    }
 
     #[test]
     fn zero_jitter_is_a_noop() {
