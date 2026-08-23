@@ -1894,6 +1894,58 @@ this session). Worth running if inclusion latency matters enough for a
 real drop to justify chasing further — genuinely open, not urgent
 enough on its own to block anything already shipped.
 
+### Step 19 — the original single-fire test's three tx, finally
+diagnosed directly (they never had been until now)
+
+15f's diagnostic ran against one representative tx from the n=15
+batch. The **original** three single-fire-test numbers this whole
+arc started from — `dispatch_to_inclusion_ms` **2722 / 2876 / 3023**,
+first reported earlier in this file — had never actually been run
+through `diagnose_inclusion_delay.py` themselves; that section
+explicitly said so ("this session still cannot reach the real chain
+or a real fire's tx hash"). Read-only, public-data check, done now:
+
+- **RPC used:** `https://rpc.testnet.chain.robinhood.com` — Robinhood
+  Chain's own public testnet endpoint, found directly in
+  `docs.robinhood.com/chain/connecting` (not reused from the
+  operator's Alchemy key, and not assumed from memory). Verified live
+  before use: `eth_chainId` → `0xb626`, `eth_blockNumber` → a current,
+  advancing block height. One wrinkle worth recording for next time:
+  this endpoint 403s Python's default `urllib` User-Agent (Cloudflare
+  in front of it) — plain `curl` and a spoofed `User-Agent` both work
+  fine; not a sign the endpoint itself is unhealthy.
+- **All three tx confirmed successful** (`status=success`), each with
+  `effectiveGasPrice == baseFeePerGas` — **zero priority fee paid**,
+  same as 15f's own tx — consistent with Robinhood Chain's documented
+  FCFS sequencing, not a new anomaly.
+
+| tx | logged dispatch_to_inclusion_ms | inclusion block | blocks elapsed |
+|---|---|---|---|
+| `0x6487f122...b4817` | 2722 | 105139097 | **21** |
+| `0xc88a41f7...6240b7` | 2876 | 105139098 | **22** |
+| `0x481d30b1...e4b8e54` | 3023 | 105139096 | **28** |
+
+All three inclusion blocks land within 2 of each other, consistent
+with these being the same single arm's near-simultaneous wallets, and
+all three show double-digit `blocks_elapsed` — nowhere near the tool's
+own `<=2` node/detection-lag threshold. **This confirms the existing
+write-up, not just as an isolated n=1 confound anymore:** two
+independent samples (this file's original n=1/three-wallet fire, and
+15f's separate n=15 run), against two independent RPC providers
+(Robinhood's own public endpoint here vs. Alchemy in 15f), both show
+tens of real blocks elapsed with zero priority fee paid. That a
+completely different, non-Alchemy RPC reproduces the same pattern is
+itself a small but real additional data point against the still-open
+15g "Alchemy-specific indexing lag" hypothesis specifically for these
+three tx — it does not settle 15g's broader question (this was a
+receipt/RPC-node check, not the sequencer-feed-vs-Alchemy-timestamp
+cross-check 15g's own operator-run test describes), but it is one
+more independent RPC agreeing with Alchemy's numbers rather than
+disagreeing with them.
+
+No code changes were made or needed — this was a verification of
+existing evidence, not a new finding requiring a fix.
+
 ## Live first deploy — real findings (step 16)
 
 The operator's first real attempt to actually deploy onto the `t4g.small`
