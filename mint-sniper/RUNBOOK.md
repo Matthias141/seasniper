@@ -337,3 +337,34 @@ wouldn't have been able to reach.
    Cloudflare Access group can still reach the login wall (harmless on
    its own, per this section's opening note, but pointless exposure);
    keep the two lists in sync as part of any operator offboarding.
+
+## 7. OpenSea instant self-serve API key expired (step 8b/8c)
+
+Trigger: `opensea_api_key_env`'s configured key stops working — 8b's
+OpenSea-URL/slug resolution or 8c's name search starts failing with an
+auth error, even though nothing in `config.toml` changed.
+
+**This is expected, not a compromise or a bug.** OpenSea's *instant*
+self-serve API key (one API call, no signup) expires 7 days after
+issuance — this is the tradeoff for skipping the traditional
+application-form key's manual review, not a fixed credential meant to
+be set once and forgotten. See `Config::opensea_api_key_env`'s own doc
+comment in `config.rs` for where this is documented in code.
+
+1. Confirm this is really expiry, not something else: a raw `0x`
+   contract address for 8b needs zero external calls and will keep
+   working regardless — if that path also fails, the problem isn't the
+   OpenSea key.
+2. Re-issue a new instant self-serve key from OpenSea's developer
+   portal (same one-call process as the original), or switch to the
+   traditional application-form key if you want to stop doing this
+   every 7 days (no documented turnaround time for that path as of
+   `opensea_api_key_env`'s doc comment).
+3. Update the env var `opensea_api_key_env` names in `config.toml` —
+   store the new key's actual value under that same env var name on the
+   VPS (e.g. via systemd's environment file or the shell profile that
+   starts this service), never in `config.toml` itself. Restart the
+   service so it picks up the new value.
+4. If you're relying on the instant key long-term, put a recurring
+   reminder (7 days is short enough that "I'll remember" doesn't hold up
+   over weeks) — there's no in-app expiry warning for this today.
