@@ -58,6 +58,36 @@ pub async fn warm_connections(cfg: &Config, bus: &EventBus) -> Vec<HttpProvider>
 
 /// Same arm-time TCP/TLS handshake as `warm_connections`, for the optional sequencer URL.
 /// Returns `None` when unset or unparseable.
+///
+/// P0 follow-up 21b — the naive health check here used to be
+/// `provider.get_block_number()` (`eth_blockNumber`), which was wrong for
+/// this specific endpoint and logged a false "warm failed" warning on
+/// every single Arm even when the connection was completely fine.
+/// Confirmed directly, not assumed: Robinhood Chain's real sequencer
+/// submit endpoint (`https://sequencer.{mainnet,testnet}.chain.robinhood.com`)
+/// only implements `eth_sendRawTransaction` (and
+/// `eth_sendRawTransactionConditional`) — every general read method tried
+/// (`eth_chainId`, `eth_blockNumber`, `eth_gasPrice`, `net_version`,
+/// `web3_clientVersion`, `eth_syncing`, `eth_getBalance`, `eth_call`,
+/// `eth_estimateGas`, `eth_maxPriorityFeePerGas`,
+/// `eth_getTransactionCount`, `eth_getTransactionReceipt`) returns a
+/// `-32601 method does not exist` JSON-RPC error. There is no cheap read
+/// call this endpoint will ever answer with a real `Ok`, so a
+/// success/failure health check modeled on `warm_connections`'s
+/// `eth_blockNumber` probe can't work here — the fix is not a different
+/// method, there isn't one.
+///
+/// Instead: send a harmless probe method anyway (still forces the real
+/// TCP/TLS handshake — the endpoint has to accept the connection and
+/// parse a well-formed JSON-RPC request to send back ANY response, error
+/// or not), but classify the result by what KIND of failure comes back.
+/// A well-formed JSON-RPC error response (`RpcError::ErrorResp` —
+/// `is_error_resp()`) proves the connection and handshake succeeded; the
+/// -32601 is simply this write-only endpoint correctly saying "not
+/// implemented," not a warm failure. Only a genuine transport-level
+/// error (DNS failure, connection refused, TLS failure, timeout — none
+/// of which produce a JSON-RPC error payload at all) is a real warm
+/// failure worth logging as a warning.
 pub async fn warm_sequencer(cfg: &Config, bus: &EventBus) -> Option<HttpProvider> {
     if cfg.sequencer_http_url.is_empty() {
         return None;
@@ -71,8 +101,13 @@ pub async fn warm_sequencer(cfg: &Config, bus: &EventBus) -> Option<HttpProvider
         }
     };
     let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(parsed);
-    match provider.get_block_number().await {
+    match provider.raw_request::<_, serde_json::Value>("eth_chainId".into(), [(); 0]).await {
         Ok(_) => bus::log(bus, "info", format!("sequencer connection warmed: {url}")),
+        Err(e) if e.is_error_resp() => bus::log(
+            bus,
+            "info",
+            format!("sequencer connection warmed: {url} (write-only endpoint, as expected: {e})"),
+        ),
         Err(e) => bus::log(
             bus,
             "warn",
@@ -514,7 +549,7 @@ fn apply_pct_jitter(value: u128, pct: i64) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_pct_jitter, fire_prepared, sample_fire_jitter_ms, HttpProvider, PreparedWallet};
+    use super::{apply_pct_jitter, fire_prepared, sample_fire_jitter_ms, warm_sequencer, HttpProvider, PreparedWallet};
     use crate::bus;
     use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::primitives::{Address, Log, TxHash};
@@ -664,5 +699,86 @@ mod tests {
             let ms = sample_fire_jitter_ms(40, 400).expect("max > 0 must sample");
             assert!((40..=400).contains(&ms), "sampled {ms} outside 40..=400");
         }
+    }
+
+    async fn spawn_mock_write_only_rpc() -> String {
+        let handler = |Json(body): Json<Value>| async move {
+            let id = body["id"].clone();
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32601, "message": "the method does not exist/is not available"}
+            }))
+        };
+        let app = Router::new().route("/", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    fn last_log_level(rx: &mut tokio::sync::broadcast::Receiver<bus::ServerEvent>) -> Option<String> {
+        let mut level = None;
+        while let Ok(event) = rx.try_recv() {
+            if let bus::ServerEvent::Log { level: l, .. } = event {
+                level = Some(l);
+            }
+        }
+        level
+    }
+
+    /// P0 follow-up 21b regression test — a write-only endpoint (real
+    /// JSON-RPC error response to every method, exactly Robinhood Chain's
+    /// real sequencer submit endpoint's shape) must be classified as a
+    /// successful warm (`info`), not a warm failure (`warn`): the
+    /// connection and handshake genuinely succeeded, the endpoint just
+    /// doesn't implement general read methods.
+    #[tokio::test]
+    async fn warm_sequencer_treats_a_write_only_endpoints_error_response_as_a_successful_warm() {
+        let mock_url = spawn_mock_write_only_rpc().await;
+        let mut cfg = crate::config::test_config();
+        cfg.sequencer_http_url = mock_url;
+
+        let bus = bus::new_bus();
+        let mut rx = bus.subscribe();
+
+        let result = warm_sequencer(&cfg, &bus).await;
+        assert!(result.is_some(), "warm_sequencer must still return the provider even when the probe errors");
+
+        let level = last_log_level(&mut rx);
+        assert_eq!(
+            level.as_deref(),
+            Some("info"),
+            "a JSON-RPC error response (endpoint reachable, method just unimplemented) must log info, not warn"
+        );
+    }
+
+    /// A genuine transport-level failure (nothing listening at all — no
+    /// JSON-RPC error payload is even possible) must still be classified
+    /// as a real warm failure (`warn`), so this distinction isn't just
+    /// "always claim success."
+    #[tokio::test]
+    async fn warm_sequencer_still_warns_on_a_genuine_connection_failure() {
+        let mut cfg = crate::config::test_config();
+        // Port 0 is not a listening address once resolved by connect_http —
+        // using an address nothing binds to (a closed/reserved port on
+        // loopback) forces a real connection-level failure, not a JSON-RPC
+        // error response.
+        cfg.sequencer_http_url = "http://127.0.0.1:1/".to_string();
+
+        let bus = bus::new_bus();
+        let mut rx = bus.subscribe();
+
+        let result = warm_sequencer(&cfg, &bus).await;
+        assert!(result.is_some(), "warm_sequencer must still return the provider even when the probe fails outright");
+
+        let level = last_log_level(&mut rx);
+        assert_eq!(
+            level.as_deref(),
+            Some("warn"),
+            "a genuine connection failure (no JSON-RPC error payload possible) must still log warn"
+        );
     }
 }
