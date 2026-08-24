@@ -52,13 +52,30 @@ echo "=== test 1: still-live drop, cast output with bracket annotations ==="
 echo "    (this is the exact bug found live — a real captured line was"
 echo "     '1787557476 [1.787e9]', not the bare integer the script"
 echo "     originally assumed)"
-cat > "$FAKE_BIN_DIR/cast" <<'EOF'
+# STEP 21 FOLLOW-UP — the original fixture hardcoded an ABSOLUTE endTime
+# (1787557476) meant to be "still in the future" the night this test was
+# written. It was a real time bomb, not a stable regression fixture: once
+# real wall-clock time passed that instant, this test started failing
+# every run — CI (`test-benchmark-token.sh`) genuinely reported "EXPIRED"
+# for what the test still asserted was "STILL LIVE," which is a test bug,
+# not a regression in benchmark-token.sh's own logic (confirmed live: the
+# script's real `(( END_TIME > NOW ))` check was correct both before and
+# after this fix). Computed relative to `date +%s` now instead, 10 years
+# out, so this can't happen again. The bracket-annotation format (the
+# actual thing under test — `[X.XXXe9]`) is computed to match cast's real
+# shape, not hand-typed, so it stays realistic without being a fixed
+# value.
+START_TIME=$(( $(date +%s) - 1000 ))
+END_TIME=$(( $(date +%s) + 315360000 ))
+START_BRACKET=$(awk -v v="$START_TIME" 'BEGIN { printf "%.3fe9", v / 1e9 }')
+END_BRACKET=$(awk -v v="$END_TIME" 'BEGIN { printf "%.3fe9", v / 1e9 }')
+cat > "$FAKE_BIN_DIR/cast" <<EOF
 #!/usr/bin/env bash
-if [[ "$1" == "call" ]]; then
-  cat <<'OUT'
+if [[ "\$1" == "call" ]]; then
+  cat <<OUT
 0
-1787471076 [1.787e9]
-1787557476 [1.787e9]
+$START_TIME [$START_BRACKET]
+$END_TIME [$END_BRACKET]
 65535
 0
 false
@@ -71,7 +88,7 @@ OUT=$(run_check "0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9") || {
   FAILURES=$((FAILURES + 1))
 }
 assert_contains "$OUT" "STILL LIVE" "test 1: reports still-live without crashing on the bracket annotation"
-assert_contains "$OUT" "endTime=1787557476" "test 1: extracts the bare integer, not the bracket-annotated string"
+assert_contains "$OUT" "endTime=$END_TIME" "test 1: extracts the bare integer, not the bracket-annotated string"
 
 echo
 echo "=== test 2: expired drop, same bracket-annotated format ==="
