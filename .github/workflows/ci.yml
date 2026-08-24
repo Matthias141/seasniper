@@ -155,18 +155,32 @@ jobs:
 
       - name: npm audit
         # --omit=dev: audits only what ships in ui/dist. Explicit, checked
-        # decision, not a blanket weakening — as of this workflow's authoring
-        # there is exactly one advisory in the full (dev+prod) tree: esbuild
-        # <=0.24.2 / GHSA-67mh-4wv8-2f99, "esbuild enables any website to
-        # send any requests to the development server and read the
-        # response." It's a `vite`/`vite-plugin-pwa` transitive devDependency,
-        # only reachable by something that can already reach your machine's
-        # `npm run dev` process — it ships in nothing this job builds. The
-        # only available fix is vite 8 (breaking, unverified against this
-        # project). Revisit --omit=dev (or bump to vite 8 and drop it) next
-        # time dependencies are touched. Fails on any moderate-or-higher
-        # advisory in production dependencies — those DO ship, so there's no
-        # equivalent excuse to soften that half of the check.
+        # decision, not a blanket weakening. STEP 21d — re-checked directly
+        # against a fresh `npm audit`, not assumed still accurate from this
+        # comment's original count: the full (dev+prod) tree now carries
+        # THREE advisories, all still dev-only and all still the same
+        # category as the original one this comment described — `vite`
+        # <=6.4.2 (GHSA-4w7w-66w2-5vf9 path traversal in optimized-deps
+        # `.map` handling; GHSA-v6wh-96g9-6wx3, a `launch-editor`
+        # NTLMv2-hash-disclosure Windows-only dev-server issue; GHSA-fx2h-
+        # pf6j-xcff, high, a `server.fs.deny` bypass on Windows alternate
+        # paths — all three are `vite dev`-server-reachable only, one is
+        # Windows-specific on top of that), plus the original transitive
+        # `esbuild` <=0.24.2 / GHSA-67mh-4wv8-2f99 dev-server advisory this
+        # comment already covered. None of the three ship in `ui/dist` —
+        # confirmed live with `npm audit --omit=dev --audit-level=moderate`
+        # itself (0 vulnerabilities) against the actual command this step
+        # runs, not inferred from the dependency tree by eye. The only
+        # available fix for any of them is still vite 8.x — `npm audit fix`
+        # (no --force) confirms no non-breaking fix exists; `--force` would
+        # install vite@8.2.2, a major version bump unverified against this
+        # project's actual `npm run build`/`npm run dev` usage, and is not
+        # something to force through this comment alone. Revisit --omit=dev
+        # (or bump to vite 8 and drop it, with real build/dev testing) next
+        # time dependencies are deliberately touched. Fails on any
+        # moderate-or-higher advisory in production dependencies — those DO
+        # ship, so there's no equivalent excuse to soften that half of the
+        # check.
         run: npm audit --omit=dev --audit-level=moderate
 
   deploy-scripts:
