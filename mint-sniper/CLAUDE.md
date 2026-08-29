@@ -2535,3 +2535,133 @@ OpenZeppelin's EOA Delegation docs; BuildBear's ERC-4337-vs-EIP-7702
 comparison; Ethereum.org's Pectra/7702 guidelines; EIP-7702's own spec
 (eips.ethereum.org/EIPS/eip-7702) for the revocation mechanism.
 
+## Step 22 — InkChain support
+
+Same rigor as step 13's Robinhood Chain work: verify before building, no
+assumption carried over just because the pattern is familiar. All facts
+below are from real, live checks run this session (RPC calls, direct
+docs fetches), not memory.
+
+### 22a — SeaDrop deployment, confirmed via real eth_getCode
+
+- **InkChain mainnet:** `eth_getCode` against
+  `0x00005EA00Ac477B1030CE78506496e8C2dE24bf5` (the SeaDrop V1 singleton
+  address this codebase already targets on Ethereum/Robinhood Chain)
+  returned real, non-empty deployed bytecode. **Confirmed deployed**, same
+  address as every other chain checked so far — the cross-chain
+  deterministic-address theory holds here, but it was verified, not
+  assumed.
+- **InkChain testnet (Ink Sepolia):** the SAME `eth_getCode` call against
+  the SAME address returned `0x` — **empty, not deployed there.** The
+  singleton does not hold everywhere; testnet is the exception found by
+  actually checking rather than assuming. No alternate InkChain-testnet
+  SeaDrop address was found in the time available for this step — this is
+  an explicit, stated gap (see 22d), not silently worked around.
+
+### 22b — real chain facts
+
+- **Chain IDs, confirmed from InkChain's own docs
+  (docs.inkonchain.com/general/network-information), not memory:**
+  mainnet **57073**, testnet (Ink Sepolia) **763373**. Cross-checked live:
+  `eth_chainId` against the mainnet RPC returned `0xdef1` (57073) and
+  against testnet RPC returned `0xba5ed` (763373) — docs and live
+  responses agree.
+- **RPC provider support:** Alchemy supports InkChain mainnet
+  (`ink-mainnet.g.alchemy.com`), same provider pattern already used for
+  Ethereum and Robinhood Chain — no new provider integration needed.
+  InkChain's own docs also publish public (rate-limited) endpoints:
+  `https://rpc-gel.inkonchain.com` (mainnet) / `https://rpc-gel-
+  sepolia.inkonchain.com` (testnet), both confirmed live and responsive
+  this session.
+- **Real, measured block time** (same methodology as step 14b — walking
+  real consecutive block timestamps, not trusting a documented figure):
+  50 consecutive InkChain mainnet blocks, timestamp deltas **every single
+  one exactly 1 second** — a consistent, real **1000ms** block time.
+  InkChain's own docs do not publish a block-time figure at all (checked
+  directly — the "note" is real, not a gap in this session's search), so
+  there was no documented number to compare this measurement against the
+  way Robinhood Chain's ~100ms-documented-vs-~227ms-measured mismatch
+  existed. Same 1-second-timestamp-granularity caveat as every prior
+  measurement in this file applies (true value could differ from exactly
+  1000ms within that resolution).
+- **FCFS-vs-gas-priority sequencing:** InkChain is built on the OP Stack,
+  with Kraken operating as its sequencer. OP Stack sequencers generally
+  default to first-come-first-served ordering by arrival time at the
+  sequencer, the same qualitative model already confirmed for Robinhood
+  Chain — **but this is the general OP Stack pattern, not a statement
+  independently confirmed from InkChain's own docs the way Robinhood's
+  FCFS claim was step 13's own direct finding.** Treat as
+  likely-but-not-independently-verified for InkChain specifically; worth
+  a direct confirmation (an InkChain support/docs question, or empirical
+  testing) before designing race_mode-style behavior around it the way
+  step 23 discusses.
+- **Mempool/pending-transaction visibility — real, negative finding.**
+  Directly probed InkChain's public mainnet RPC:
+  - `eth_newPendingTransactionFilter` → `{"code":-32601,"message":"rpc
+    method is not whitelisted"}`
+  - `txpool_status` → same "not whitelisted" rejection
+  - A raw WS `eth_subscribe("newPendingTransactions")` attempt against
+    `wss://rpc-gel.inkonchain.com` was rejected outright at the
+    connection layer (`HTTP 405`), before ever reaching subscription
+    logic.
+  - By contrast, `eth_getBlockByNumber("pending", false)` DID succeed and
+    returned a real, non-empty "pending block" object (with one
+    transaction hash in it) — a different, more limited kind of
+    pre-confirmation visibility than a true pending-tx subscription,
+    worth noting rather than flattening into a blanket "no visibility at
+    all."
+  
+  **This directly confirms the task's own prediction**: mempool
+  visibility is chain-specific, not guaranteed by EVM-compatibility
+  alone. Copymint's existing detection mechanism (`copymint.rs`'s
+  `subscribe_full_pending_transactions`, the same call
+  `watcher.rs::run_mempool_watcher` uses for `trigger_mode =
+  "mempool_watch"`) is **not confirmed usable on InkChain** via the
+  public RPC checked here. A private/paid RPC provider (Alchemy or
+  similar) *might* expose full pending-tx visibility where the public
+  endpoint doesn't — genuinely unconfirmed either way from this session,
+  not assumed to be better just because it's a paid tier. **Until
+  verified against a real private endpoint, InkChain should be treated as
+  `poll_state`/`timestamp`-mode-only** — this is the direct gate step 23
+  needed and now has.
+
+### 22c — configurable network, chain-agnostic re-verified
+
+- **`chain_id` is read live, not hardcoded — re-confirmed for a second
+  chain, not just assumed to still hold from step 13b's Robinhood Chain
+  finding.** Grepped `executor.rs`/`config.rs` directly: `let chain_id =
+  reader.get_chain_id().await...` in `prepare_fire`, used once via
+  `tx.chain_id = Some(chain_id)` — a fresh RPC read every prepare, no
+  chain ID constant anywhere in the signing/firing path. This genuinely
+  is chain-agnostic infrastructure, not something that happened to work
+  for Robinhood Chain specifically.
+- **`config.example.toml` updated** with a documented InkChain example
+  section (mainnet + testnet RPC URLs via Alchemy, the measured
+  `block_time_ms = 1000`, and an explicit note on the testnet SeaDrop gap
+  and the mempool-visibility finding above), matching the existing
+  Robinhood Chain section's style exactly.
+
+### 22d — testnet dry run: explicit gap, not skipped silently
+
+**No live dry run was performed.** Two blockers, both real and confirmed,
+not assumed:
+1. SeaDrop is not deployed at the standard singleton address on InkChain
+   testnet (22a) — no known live SeaDrop-based collection to target was
+   found there in the time available for this step.
+2. This session has no VPS access and cannot deploy a dedicated
+   benchmark-only token the way step 14b's live operator-run dry run did
+   for Robinhood Chain testnet.
+
+**This is a stated, explicit gap**, same as this file's standing
+convention for anything not actually verified end-to-end: InkChain support
+as landed here is chain-configuration and fact-verification only (22a-22c)
+— a real live-fire dry run (finding or deploying a real testnet SeaDrop
+target, confirming a real mint succeeds, confirming real
+`dispatch_to_inclusion_ms`/`send_to_ack_ms` numbers) has NOT happened and
+should not be assumed to work the same way step 5's Sepolia dry run or
+step 13d's Robinhood Chain dry run did, until it actually runs once.
+
+cargo build/check/test clean (no functional Rust changes in this step —
+`chain_id`-live-read was re-verified, not modified; only
+`config.example.toml` changed).
+
