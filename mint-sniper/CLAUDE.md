@@ -2837,3 +2837,161 @@ with how every other major architecture fork in this project (custody
 model, WebAuthn origin, the EIP-7702 options in step 20 above) has been
 handled — no option above is recommended over another.
 
+## Step 24 — seadrop-noir-bot pattern evaluation (research only, no implementation)
+
+Cloned `Kuriare7Rz/seadrop-noir-bot` to a scratch directory (same pattern
+as step 1's audit of `morsyxbt/nft-public-mint`) and read the actual
+source for four specific README claims — scope explicitly limited to its
+legitimate on-chain SeaDrop fallback path, not its OpenSea Drops API
+primary path (already scoped out of this project).
+
+### 24a — risk validation checklist: partially real, one claim is dead code
+
+Read `src/risk/` directly, not the README's summary of it:
+- **`checkGoPlus` (`goplusCheck.ts`) is real and well-implemented**, and
+  genuinely wired into the actual validation path
+  (`validator.ts::validateMint` calls it). Hits GoPlus's real NFT security
+  API (`nft_security/{chain_id}`), checks `is_honeypot` and
+  `malicious_behavior`, fails open by default (a real, explicit design
+  choice — `strictMode` flag controls whether an API failure blocks or
+  just warns). Their own comment confirms GoPlus does not cover Robinhood
+  Chain (chain id 4663) yet.
+- **`checkContractAge` and `checkEtherscanVerified` (`etherscanCheck.ts`)
+  are real, correctly-implemented functions — and dead code.** Grepped the
+  whole repo: **zero call sites outside their own definition file.**
+  `validator.ts::validateMint` calls ONLY the blacklist check and GoPlus —
+  the README's claim of "pre-mint checks including contract age (>1hr),
+  Etherscan verification status" describes functions that exist and work
+  in isolation but are never actually invoked in the live validation path.
+  This is exactly the "don't take the README at face value" case the task
+  anticipated.
+
+**Recommendation: worth a follow-up implementation step, with a
+correction.** GoPlus honeypot/malicious-contract scanning is a genuine,
+currently-missing gap in seasniper's own 8b/8c target-resolve flow — right
+now namesquatting gets a warning label (8c) and nothing else is
+automated. GoPlus's NFT security API is free/accessible (same endpoint
+seadrop-noir-bot hits, no signup barrier evident from their code). Sketch,
+not implemented: add a `resolve_address`-adjacent check in `target.rs`
+that hits `https://api.gopluslabs.io/api/v1/nft_security/{chain_id}?
+contract_addresses={addr}`, checked against `is_honeypot`/
+`malicious_behavior`, fail-open by default (matching seadrop-noir-bot's
+own justified choice — a security API being briefly unavailable should
+not block an otherwise-legitimate target), surfaced as an additional
+warning tier alongside the existing namesquatting warning, not a hard
+block. The contract-age/Etherscan-verification idea is real and worth
+copying too, but implement it for real (actually call it from the
+resolve path) rather than reproducing seadrop-noir-bot's own gap of
+building it and never wiring it in.
+
+### 24b — NTP clock drift check: real, wired in, one accuracy correction
+
+Read `src/utils/clockCheck.ts` directly. **Not actually NTP** — the
+README's framing is a slight mischaracterization of the real mechanism:
+it's an HTTP `Date`-header comparison against Cloudflare's
+`/cdn-cgi/trace` endpoint, RTT-compensated (adds half the round-trip to
+the local timestamp before comparing), with an explicit, documented
+~1-second inherent quantization error from the `Date` header's own
+resolution. Threshold 1500ms, chosen specifically to sit above that
+quantization noise. Non-blocking: logs a warning, never refuses to start.
+**Confirmed genuinely wired into their boot sequence** — grepped for the
+call site: `src/index.ts` imports and awaits `checkClockDrift()`, not
+just defined-and-unused the way 24a's Etherscan checks were.
+
+**Recommendation: worth a small follow-up step.** This is real, cheap
+(one HTTP HEAD request, no new dependency — `fetch` is already available),
+and directly protects `timestamp`-mode's entire correctness model, which
+depends on the VPS's system clock being accurate — currently nothing in
+`main.rs`'s boot sequence checks this at all. Sketch: port an equivalent
+check into `main()` before `config::Config::load` or right after, log via
+both `bus::log` and `tracing::warn!` (this project's own established
+"both, not either" standard from step 17's finding), and — the one
+deliberate improvement over seadrop-noir-bot's own choice worth
+considering at implementation time — decide whether `timestamp`-mode
+triggers specifically should refuse to arm above some threshold, rather
+than only warning, given how directly this bot's core trigger mode depends
+on clock accuracy (their bot logs and continues either way; this project's
+own "reject a bad shape early" convention, used throughout `config.rs`'s
+`validate()`, argues for being stricter here, not just matching their
+non-blocking choice by default).
+
+### 24c — RPC benchmarking/ranking beyond broadcast-time racing: real infrastructure
+
+Read `src/rpc/client.ts` directly. Real: `benchmarkAndRank()` probes every
+configured custom endpoint's real `eth_blockNumber` latency, persists the
+measured latency, and rebuilds a `viem` `fallback()` transport ordered
+fastest-first (`rank: false` — they deliberately keep their own measured
+order rather than letting viem's own dynamic ranking override it). The
+exported `publicClient` is a `Proxy` that always forwards to the current
+underlying (possibly-just-rebuilt) client, so every read call anywhere in
+their codebase — not just a broadcast-time race — benefits from the
+ranking once computed. This is genuinely broader than seasniper's own
+`http_rpc_urls` racing, which only applies to the already-optimized
+`fire_prepared` broadcast path (`warm_connections`/racing every configured
+URL at fire time), not to `getPublicDrop` checks, balance polling, or any
+other read.
+
+**Recommendation: worth a follow-up step, tied directly to the still-open
+15f/19 colocation question.** Step 15f's own finding was explicit:
+`send_to_ack_ms`'s ~1.5x gap vs. MintDash is "plausibly explained by RPC/
+network proximity" and is "the number a future colocation/dedicated-node
+step could reasonably expect to move" — but colocation is real
+infrastructure work (a new VPS location, at minimum). RPC ranking is a
+cheaper lever aimed at the same underlying problem (this bot's own
+distance/quality to whichever RPC it's actually talking to) without
+needing new infrastructure — worth trying BEFORE colocation, not instead
+of it necessarily, since it's strictly cheaper to attempt. Sketch, not
+implemented: a periodic (or on-demand, admin-triggered) benchmark pass
+over `http_rpc_urls`, persisting measured latency (a new small table or a
+`config.rs` runtime field, not necessarily `identity.db` — implementation
+detail), reordering read-path calls (NOT the already-optimized
+`fire_prepared`/`warm_connections` hot path, which already races in
+parallel and gains nothing from sequential ranking) to prefer the
+fastest-measured endpoint first.
+
+### 24d — per-chain profile config structure: real, clean reference shape
+
+Read `src/chains.ts` directly. Real: a single `ChainProfile` interface per
+`ChainKey`, centralizing `chainId`, RPC/explorer/OpenSea-slug metadata,
+AND a nested `SnipeProfile` (priority fee, base-fee multiplier, hammer
+interval, lead time, fixed gas limit) — one object per chain, not values
+scattered across independent fields the way seasniper's own `block_time_ms`
+etc. currently are. Their own Robinhood Chain profile comment
+independently corroborates this project's own step 13 finding (no
+priority-fee market, latency-only racing, `eth_maxPriorityFeePerGas`
+returns 0) — real cross-validation from an independent codebase, not just
+agreement with itself.
+
+**Recommendation: worth a follow-up step, with InkChain (step 22, this
+same session) landing as a live example why.** Right now,
+`Config::looks_like_robinhood_chain()`'s existence in `config.rs` is
+itself a symptom of the scattered-values problem this pattern would fix —
+a per-chain-quirk special case bolted onto otherwise chain-agnostic
+validation, because there's no single place "here's what's different
+about this chain" lives. With three chains now confirmed relevant
+(Ethereum, Robinhood Chain, InkChain) and step 22b independently finding
+InkChain has its own quirks worth encoding (measured 1000ms block time,
+unconfirmed FCFS, unconfirmed mempool visibility), the risk of a FOURTH
+chain addition missing a needed per-chain tuning value (forgetting to set
+`block_time_ms` correctly, the exact class of bug `looks_like_robinhood_
+chain()`'s own validate() check exists to catch after the fact) grows with
+every chain added under the current scattered-fields shape. Sketch, not
+implemented: a `ChainProfile`-equivalent struct in `config.rs` (not a new
+file — the task's own instruction) holding the fields that are genuinely
+per-chain (block_time_ms, and — if steps 20/23's race_mode-adjacent work
+lands — sequencer URL conventions, gas-jitter defaults), with `Config`
+holding one `Option<ChainProfile>` or resolving one from `chain_id` at
+validate() time, replacing ad hoc per-chain `if` branches like
+`looks_like_robinhood_chain()` with a single lookup.
+
+### OpenSea key expiry corroboration — confirmed, no action needed
+
+seadrop-noir-bot's README states: "max 2 keys/day, expire after 7 days."
+Grepped their README directly (not summarized): confirmed verbatim —
+"Limits: read 600/h, write 30/h; **max 2 keys/day**, **expire after 7
+days**." This matches RUNBOOK.md's step 21e entry (7-day instant-key
+expiry) — independent corroboration from an unrelated codebase pointed at
+the same real OpenSea API, not just internal consistency with this
+project's own earlier finding. No action needed beyond this confirmation.
+
+No code changes in this step.
