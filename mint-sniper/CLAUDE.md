@@ -2665,3 +2665,175 @@ cargo build/check/test clean (no functional Rust changes in this step —
 `chain_id`-live-read was re-verified, not modified; only
 `config.example.toml` changed).
 
+## Step 23 — copymint front-running: research and design, no implementation
+
+Scope: Robinhood Chain, Ethereum mainnet, InkChain. Uses step 22's actual
+findings on InkChain below, not re-derived or guessed. No code changes in
+this step.
+
+### 23a — what copymint actually does right now, read directly from the code
+
+**Copymint does NOT wait for the tracked wallet's transaction to confirm
+before acting — this contradicts how it was described in prior
+conversation.** Read `copymint.rs::handle_candidate` directly: it fires the
+instant a tracked wallet's `mintPublic` call is seen **pending** (via
+`subscribe_full_pending_transactions`, before any confirmation), does one
+fresh `getPublicDrop` read to independently verify the drop is real and
+currently live (never trusting the pending tx's own calldata beyond which
+contract/fee-recipient it names), and — if `should_auto_fire` allows it —
+immediately sends `ControlMsg::FireCopymint`. There is no wait, no
+polling for the tracked wallet's own receipt, nothing that reads "was
+their mint the one that landed" anywhere in this path.
+
+**This means an emergent race already exists today, independent of
+anything step 23 would add.** The tracked wallet's original transaction
+and copymint's own generated transaction are both in flight simultaneously
+the moment copymint decides to fire — whichever lands first is whichever
+the underlying chain's ordering happens to favor, with zero deliberate
+influence from this codebase over which one wins. **"Add front-running" is
+therefore not new behavior in the sense of creating a race that doesn't
+currently exist — it would be an optimization of a race copymint already
+runs every single time it auto-fires**, specifically: deliberately trying
+to win that already-existing race (via submission speed or gas bidding)
+instead of leaving the outcome to chance. This reframes the actual
+decision in front of the operator: not "should copymint start racing," but
+"should copymint's already-existing race be actively won more often."
+
+### 23b — per-chain mechanism
+
+- **Robinhood Chain.** Confirmed FCFS, no gas-price priority (step 13's
+  research, re-confirmed step 22b's InkChain check against the same
+  question). "Front-running" here can only mean winning on raw submission
+  speed to the sequencer — gas bidding has no effect on ordering by this
+  chain's own documented design. **PR #9 (`p0-rh-race-jitter-sequencer`)
+  is still open, not merged, as of this check** (confirmed live via the
+  GitHub API, not assumed from memory) — but its `race_mode`/
+  `sequencer_http_url` work already IS the right primitive: sequencer-
+  first `eth_sendRawTransaction` submission, jitter disabled, is exactly
+  "win on raw speed." Copymint would not need its own separate fast-path
+  — it already calls the same `fire_prepared`/`ControlMsg::FireCopymint`
+  path every other trigger mode uses (23a), so once PR #9 lands, copymint
+  automatically inherits sequencer-racing behavior for free on this chain,
+  no copymint-specific code required.
+- **Ethereum mainnet.** Standard gas-priority ordering — a fundamentally
+  different mechanism from Robinhood Chain's. Front-running here means
+  reading the tracked wallet's PENDING transaction's actual fee fields
+  (`maxFeePerGas`/`maxPriorityFeePerGas`, from the same pending-tx data
+  copymint already decodes calldata from) and bidding above them —
+  copymint currently decodes only calldata (contract/fee-recipient/
+  quantity), never touches the pending tx's fee fields at all, so this is
+  new decoding work, not a reuse of anything existing. **This is the case
+  with real, direct stakes**: outbidding the tracked wallet on a
+  tight-supply drop can cause THEIR transaction to revert (they lose the
+  mint they were trying to make, not just a race copymint also entered).
+  Copymint's existing `getPublicDrop` verification already fetches
+  `maxTotalMintableByWallet`; extending it to also check real scarcity —
+  `IERC721SeaDrop.getMintStats(address)` on the NFT contract itself
+  (returns `minterNumMinted`, `currentTotalSupply`, `maxSupply` — a real,
+  standard SeaDrop-adjacent function, confirmed to exist, not assumed) —
+  is concretely buildable: `currentTotalSupply` vs `maxSupply` is exactly
+  the scarcity signal 23c's gate needs, callable from the same RPC
+  connection `fetch_public_drop` already uses.
+- **InkChain.** Per step 22b's actual finding: the public RPC checked
+  explicitly rejects `eth_newPendingTransactionFilter`/`txpool_status`
+  ("not whitelisted"), and a raw WS pending-tx subscription was rejected
+  at the connection layer entirely. **Copymint's detection mechanism —
+  which structurally depends on subscribing to pending transactions —
+  is not confirmed buildable on InkChain via the endpoint checked.**
+  Stated plainly, not designed around: until a private/paid RPC endpoint
+  is confirmed to expose full pending-tx visibility on InkChain (genuinely
+  unverified, not assumed better just because it's paid), copymint should
+  not be offered as a supported trigger on InkChain at all — only
+  `poll_state`/`timestamp` modes, which don't need pending-tx visibility,
+  are confirmed usable there.
+
+### 23c — the safety/harm design (not optional)
+
+**Scarcity gate, same spirit as the existing free/paid split (step 6c).**
+Before any front-run attempt is even offered, let alone auto-fired: call
+`getMintStats` on the target NFT contract, compute `remaining =
+maxSupply - currentTotalSupply` and how close that is to zero relative to
+the mint quantity in flight. Two zones:
+- **Supply abundant relative to demand:** both the tracked wallet's mint
+  and copymint's own mint are very likely to succeed regardless of who
+  lands first — no real harm model exists here (nobody's mint gets pushed
+  over a cap by one more transaction). Default-safe territory, the same
+  category free copymint opportunities already occupy today.
+- **Supply tight/near cap:** a real, non-hypothetical chance that winning
+  the race causes the tracked wallet's own transaction to revert (their
+  mint pushed past the now-exhausted cap by copymint's own action).
+  **This must require the same tier of explicit, deliberate opt-in the
+  existing paid-mint gate already uses** — never auto-fire, the operator
+  must consciously enable front-running for this specific risk tier, not
+  just see a warning label and proceed. A warning label is what search
+  results already get (8c); this is a strictly higher-stakes action
+  (deliberately risking causing someone else's transaction to fail) and
+  needs the stronger gate, not the weaker one.
+
+**Dedup-by-target check, designed as a real check, not a comment.** If two
+different tracked wallets are both detected minting the SAME collection
+within a short window, only act on the first; skip the second with a
+clear, logged reason. Without this, copymint could fire twice on the same
+drop from two independent triggers — wasted gas, wasted wallet allocation
+on a redundant mint, and (once front-running exists) potentially two
+separate front-run attempts against two different targets on the same
+drop, compounding the scarcity risk above. Concrete design: an in-memory
+(or `identity.db`-backed, for restart-survival — a decision for
+implementation time) map of `nft_contract → last-fired timestamp`,
+checked and updated atomically inside `handle_candidate` before any
+`ControlMsg::FireCopymint` send, with a short TTL (long enough to cover
+one realistic "two wallets both minting the same drop within seconds of
+each other" window, short enough that a genuinely separate later drop on
+the same contract — e.g. a second stage — isn't permanently blocked). A
+competitor's own copy-mint tool implements exactly this pattern
+("Copy mint skipped because this collection already has an active or
+copied task"), independently validating the pattern is worth having, not
+just this project's own idea.
+
+### 23d — options, not a recommendation
+
+1. **Network-speed racing only, no gas bidding, Robinhood-first.** Ship
+   nothing copymint-specific for Robinhood Chain (23b: it already inherits
+   PR #9's sequencer racing once that merges). Explicitly do NOT build the
+   Ethereum gas-bidding path or the scarcity-gate infrastructure it
+   requires. Buys: the lowest-risk win available — Robinhood Chain's own
+   FCFS model means winning the race has no victim-revert harm model the
+   way outbidding does on Ethereum, so this is close to free correctness
+   improvement with none of 23c's hardest design work. Costs: does
+   nothing for Ethereum mainlnet copymint opportunities, which stay
+   exactly as risky/un-raced as they are today (i.e., today's existing
+   emergent race continues, un-optimized, un-gated).
+2. **Full gas-priority racing on Ethereum, with the scarcity gate as a
+   hard requirement.** Ship both the Ethereum fee-bidding path (23b) and
+   23c's full scarcity-gate + explicit-opt-in-for-tight-supply design
+   together, as one unit — never ship gas-bidding without the gate. Buys:
+   the highest-value copymint improvement (Ethereum mainnet has the
+   biggest existing drop ecosystem this bot targets). Costs: the most
+   implementation and review effort — new fee-field decoding, a new
+   supply-check RPC call added to the hot detection path, a new
+   confirmation-tier UI flow for the opt-in, and real testnet validation
+   before trusting any of it live, given the direct "causes someone else's
+   tx to revert" stakes.
+3. **Defer Ethereum entirely until the scarcity-check infrastructure is
+   proven on Robinhood Chain first.** Ship option 1 now; build and test
+   the `getMintStats`-based scarcity check as its own standalone,
+   low-stakes addition to `getPublicDrop`'s existing verification (surfaced
+   in the UI, not yet gating anything) before ever pairing it with
+   Ethereum gas-bidding. Buys: de-risks the hardest part (does the scarcity
+   read actually work reliably, across real live drops, before it's ever
+   load-bearing for a fire/no-fire decision) separately from the highest-
+   stakes part (bidding real ETH against a real drop's real cap). Costs:
+   slower path to Ethereum front-running than option 2, two separate
+   review/testnet cycles instead of one.
+
+Also decided as part of this scope, not deferred: **InkChain gets no
+copymint front-running design at all in any of the three options above** —
+per 23b, its detection mechanism itself is unconfirmed buildable there.
+Whichever option is chosen, InkChain waits for that question to resolve
+first, independent of the Robinhood-vs-Ethereum decision.
+
+This is the operator's decision to make with full information, consistent
+with how every other major architecture fork in this project (custody
+model, WebAuthn origin, the EIP-7702 options in step 20 above) has been
+handled — no option above is recommended over another.
+
