@@ -2,6 +2,8 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  row-gap: var(--space-1);
   padding: var(--space-2) var(--space-4);
   border-bottom: var(--border-hairline);
   background: linear-gradient(to bottom, var(--color-surface-1), var(--color-surface-0));
@@ -40,7 +42,10 @@
 .right {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  row-gap: var(--space-1);
   gap: var(--space-2);
+  min-width: 0;
 }
 
 .pill {
@@ -111,5 +116,24 @@
 @media (prefers-reduced-motion: reduce) {
   .pillDown {
     animation: none;
+  }
+}
+
+/* STEP 16 — real iPhone (~390px) overflow: this row previously forced
+   page-wide horizontal scroll (5 unwrapped items: brand + 3 pills +
+   clock + sign-out). .bar/.right above now wrap; this just tightens
+   pill/clock/brand-sub sizing at narrow widths so wrapped rows still
+   read cleanly rather than looking merely "allowed to overflow onto a
+   second line." */
+@media (max-width: 480px) {
+  .brandSub {
+    display: none;
+  }
+  .pill {
+    padding: 3px 8px;
+    font-size: 0.65rem;
+  }
+  .clock {
+    font-size: var(--text-xs);
   }
 }

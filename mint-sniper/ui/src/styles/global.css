@@ -10,6 +10,19 @@ body,
   height: 100%;
 }
 
+/* STEP 16 — body's own overflow-x: hidden below does not reliably stop
+   horizontal scroll caused by a too-wide descendant on real mobile
+   Safari/Chrome (confirmed live on an actual iPhone, not just a
+   resized desktop window, which can hide this) — the html element
+   itself is the actual scrolling container in that case. Both, not
+   either, as the real defense-in-depth backstop; the underlying fixes
+   are still in each component (StatusBar, TargetResolver's .row) —
+   this is a safety net, not a substitute for fixing what's actually
+   too wide. */
+html {
+  overflow-x: hidden;
+}
+
 body {
   margin: 0;
   background: var(--color-surface-0);
