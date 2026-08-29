@@ -17,6 +17,20 @@
   gap: var(--space-1);
 }
 
+/* STEP 16 — real iPhone (~390px) overflow: the input alone was near
+   full-width, leaving no room for the button beside it (used by both
+   the paste-box and the name-search box below — same fix covers both).
+   Stack instead of forcing a side-by-side row once there isn't enough
+   width for the button not to get crushed. */
+@media (max-width: 600px) {
+  .row {
+    flex-direction: column;
+  }
+  .resolveBtn {
+    padding: 8px var(--space-3);
+  }
+}
+
 .row input {
   flex: 1;
   background: var(--color-surface-1);
