@@ -2320,3 +2320,218 @@ different origin stop validating the moment that switch happens
   as already established. Closed for real here: PR #10 (steps 15f/15g/19)
   merged to `main` as commit `f06e937`, confirmed reachable via the same
   ancestor check this convention now requires.
+
+## Step 20 — EIP-7702 delegation/batching: research and design, no implementation
+
+Same discipline as step 10a's identity research: confirm real facts before
+writing any code. This expands the codebase's trust surface more than
+anything built so far, including identity — a malicious or buggy delegate
+contract has **full authority over a wallet**, not read access or a scoped
+permission. No code changes in this step.
+
+### 20a — the actual mechanism, confirmed not assumed
+
+**alloy 2.4.1 (already in use throughout this codebase) supports EIP-7702
+natively.** Confirmed directly against the vendored crate source, not
+assumed from the EIP being live: `alloy-consensus-2.4.1/src/transaction/
+eip7702.rs` defines `TxEip7702` (the type-0x04 `SetCodeTransaction`) with a
+real `authorization_list: Vec<SignedAuthorization>` field, part of the
+standard transaction envelope alongside the existing EIP-1559 type this
+codebase already signs and sends. Signing/sending support exists; nothing
+about alloy itself blocks building this.
+
+**The architecture question, answered — this determines the whole scope:**
+- EIP-7702 ALONE gives one thing: an EOA can point its own code at a
+  deployed contract, so *that specific EOA* starts executing arbitrary
+  delegate logic instead of nothing. It does NOT by itself give "one
+  operator wallet pays gas for N sniper wallets" — that requires the
+  delegate contract to expose sponsor/relayer execution logic on top of
+  the base EIP (someone else's tx invokes the delegate, the delegate acts
+  on the now-smart EOA's behalf), or pairing with ERC-4337's paymaster
+  mechanism once the EOA has become a smart account via 7702.
+- Real BATCHING (combining multiple wallets' operations into fewer
+  transactions) is the same story: 7702 alone lets a single delegated EOA
+  batch its OWN multiple calls into one transaction (useful, but not what
+  "N sniper wallets, fewer txs" means). Batching *across* wallets needs
+  ERC-4337-style infrastructure (a bundler/EntryPoint) layered on top —
+  every source describes 7702 and 4337 as complementary, not either/or:
+  "the future of account abstraction likely involves both standards
+  working in harmony." **This is a two-layer feature, not a one-EIP
+  feature** — 7702 alone does not give this codebase gas-sponsorship or
+  cross-wallet batching; it's the enabling primitive ERC-4337
+  infrastructure would sit on top of.
+
+### 20b — security research (the part that matters most)
+
+**Real, large-scale, ongoing attacks — this is not a theoretical risk.**
+Since Pectra activated EIP-7702 on Ethereum mainnet (May 7, 2025):
+- Within four weeks, Wintermute's research team found **more than 97% of
+  EIP-7702 delegations on mainnet pointed to copy-pasted sweeper
+  contracts**, the largest family dubbed "CrimeEnjoyor."
+- Independent security research links **63% of analyzed EIP-7702
+  authorization transactions to attacker-controlled contracts**, with
+  **more than $2.3 million in confirmed thefts** identified.
+- By late August 2026, a single user lost **$1.54 million** in one 7702
+  batch-transaction phishing attack.
+- Attack mechanism: a victim signs ONE authorization tuple (can look
+  structurally harmless), which installs delegate code with **persistent,
+  unconditional execution control** over the EOA — categorically different
+  from phishing a single transaction, since every subsequent action routes
+  through attacker logic with no further victim signature required.
+
+**Verdict for this codebase specifically:** the dominant real-world outcome
+of EIP-7702 adoption so far is mass phishing against end users signing
+authorizations toward attacker contracts they didn't audit. That is a
+different threat model from this project's own wallets (private keys held
+server-side, never end-user-signed in a browser) — but it establishes that
+**the mechanism itself is proven dangerous when the delegate target is
+wrong**, which is exactly the risk of writing a custom delegate contract
+in-house versus reusing something already battle-tested.
+
+**Audited, reusable delegate implementations exist and should be strongly
+preferred over a custom one.** OpenZeppelin publishes `EOA Delegation`
+documentation and reference contracts as part of their audited 5.x
+contracts library. MetaMask's Delegation Toolkit works with any ERC-4337
+bundler/paymaster. Safe{Wallet}'s own delegate pattern is referenced as the
+"become a smart account" path multiple sources point to. **A
+custom-written delegate contract holding full authority over this
+project's sniper wallets is a categorically larger, more dangerous attack
+surface than reusing one of these** — if this is ever built, reuse is not
+optional-but-preferred, it's close to a hard requirement given the proven
+blast radius of getting the delegate contract wrong.
+
+**Revocation — real, documented, RUNBOOK.md-worthy procedure exists.**
+Setting the authorization's target address to the zero address
+(`0x0000000000000000000000000000000000000000`) is the canonical
+revocation: sign a fresh authorization (using the EOA's own still-held
+private key — the EOA is never dispossessed of its key by delegating) with
+the zero address as target, broadcast it. `cast wallet sign-auth
+--private-key <KEY> --chain <ID> --nonce <NONCE> 0x0000...0000` is the
+concrete CLI form; libraries like Candide's AbstractionKit expose the same
+as `createRevokeDelegationTransaction`. There is no permanent migration —
+this genuinely returns the EOA to a normal, undelegated account. **This is
+the RUNBOOK.md entry this feature would need before shipping**: if a
+delegate is later found compromised or buggy, the operator's procedure is
+"sign and broadcast a zero-address authorization from the affected wallet's
+own key" — cheap (one small tx per wallet), fast, and does not require
+migrating funds to a new address.
+
+### 20c — compatibility check against existing invariants
+
+- **`advance_nonces` / the prepare/fire split's nonce assumptions (step
+  3b):** EIP-7702 does not introduce a separate or parallel nonce space —
+  the delegating EOA's existing account nonce continues incrementing
+  normally, and signing an authorization itself consumes one nonce slot
+  (same sequential-nonce rule as any transaction). This does not BREAK the
+  existing model (still one linear nonce counter per EOA, still
+  client-side tracked, still the same "advance exactly once, at the moment
+  of commit" rule step 3b established) — it would just mean a wallet's
+  first-ever authorization tx is one more nonce-consuming event
+  `next_nonce` tracking needs to account for, the same way any other
+  transaction from that wallet already is. Genuinely orthogonal to the
+  actual bug class step 3b fixed (premature nonce advancement on a
+  never-broadcast prepare) — nothing about 7702 reintroduces that risk.
+- **Custody discussion (steps 11/12 — operators eventually bringing their
+  own keys, session-scoped custody):** this is a real, direct connection,
+  not orthogonal, and worth flagging explicitly. If wallets are ever
+  delegated to a shared contract, "who controls this wallet" stops being
+  a single fact (the private key holder) and becomes at least two facts
+  (the key holder AND whoever controls/can upgrade the delegate
+  implementation). Any future custody model that lets an operator bring
+  their own key needs to also account for whether that operator's wallet
+  is delegated, and to what — a session-scoped custody boundary that
+  doesn't also scope delegate-contract trust would leave a gap. This
+  should be resolved in the SAME architecture conversation as steps 11/12,
+  not decided independently and bolted on afterward.
+
+### 20d — real options, not a recommendation
+
+1. **No 7702, status quo.** Keeps the current, well-understood surface
+   (server-held keys, `advance_nonces`, prepare/fire split — nothing about
+   wallet authority changes). Buys nothing new. Zero new attack surface,
+   zero new implementation cost. The only cost is *not* getting
+   gas-consolidation or batching, if either turns out to matter enough to
+   justify the alternative below.
+2. **7702 for gas-consolidation only, reusing an audited delegate contract**
+   (OpenZeppelin's or an equivalent, never custom-written). Buys: one
+   operator-funded wallet can cover gas for N sniper wallets without
+   pre-funding each one individually — a real operational simplification
+   for wallet management. New attack surface: the reused delegate
+   contract's own trust assumptions become this project's trust
+   assumptions (bounded by whatever audit/track record it has, not
+   unbounded); the revocation procedure from 20b becomes a real
+   operational dependency (RUNBOOK.md entry, tested at least once).
+   Implementation cost: moderate — new `authorization_list` construction
+   and signing path in executor.rs, a decision on which audited delegate
+   to target, real testnet dry-run before trusting it for a live mint,
+   same standard as every other feature in this project's history.
+3. **7702 + ERC-4337 for full batching.** Buys the most: genuine
+   cross-wallet batching (fewer total transactions across N wallets), the
+   closest match to the 100-wallet/16-second/near-zero-cost shape 20e
+   below describes. New attack surface is the largest of the three: a
+   bundler/paymaster dependency added on top of the delegate-contract
+   trust from option 2, meaning two new pieces of external infrastructure
+   this project would depend on, not one. Implementation cost is the
+   highest — this is a genuinely new subsystem, not an incremental change
+   to `fire_prepared`.
+
+This is the operator's decision, not a recommendation — consistent with
+how the custody-model question in step 12 and the WebAuthn-origin decision
+in step 10.5a were both left as explicit choices, not defaults.
+
+### 20e — the 100-wallet / 16-second / 0.0006 ETH data point
+
+A competitor's own execution history reportedly shows: 97/100 wallets
+included, 16 seconds total, 0.0006 ETH total gas across all 100 wallets —
+averaging **~0.000006 ETH (~$0.01–0.02) per wallet**. Whether this ran on
+Ethereum mainnet is explicitly **not confirmed** from what's available to
+this session (a screenshot detail, not independently verifiable) — treated
+as an open question, not a fact, throughout this analysis.
+
+**Two questions, answered as plainly as the evidence allows:**
+
+1. **Is this per-wallet cost achievable via EIP-7702 specifically on a
+   real-gas-cost chain, or is a near-zero-gas L2 the simpler explanation?**
+   A single ERC-721-style mint transaction on Ethereum mainnet typically
+   costs on the order of 21,000 (base) + 50,000–150,000+ (mint logic) gas
+   — even at a low 1 gwei gas price, that's roughly 0.00007–0.00017 ETH for
+   ONE wallet's mint alone. 100 independent mints at that rate would cost
+   on the order of 0.007–0.017 ETH total, not 0.0006 ETH — **the claimed
+   total is 1–2 orders of magnitude too low for 100 real, independently-
+   priced mainnet mint transactions**, with or without EIP-7702 in the
+   picture (7702 authorizations themselves cost real gas too — one model
+   cited ~35,190 gas per new delegation indicator, which is additive on
+   top of the mint cost, not a discount on it). A near-zero-gas L2 (this
+   project's own Robinhood Chain benchmarks show baseFeePerGas on the
+   order of 0.01 gwei — four to five orders of magnitude below typical
+   mainnet gas prices) fits this number far more simply, with no
+   delegation mechanism of any kind required to explain it.
+2. **If 7702 genuinely could produce this on mainnet, how?** No credible
+   mechanism was found. EIP-7702 authorizations do not share or amortize
+   execution gas cost across delegated accounts — each mint is still a
+   full, independently-metered EVM execution; the delegation only changes
+   WHO can author calls FROM that account, not what those calls cost to
+   execute. An operator wallet "sponsoring" gas via a relayer pattern
+   changes who PAYS, not the total amount paid — 100 independent mints
+   still cost the sum of 100 independent mints' worth of gas, sponsor or
+   no sponsor. Nothing in EIP-7702's own mechanism reduces per-transaction
+   execution cost.
+
+**Verdict, stated without hedging where the evidence supports one:** the
+evidence strongly favors explanation 2 — a near-zero-gas chain (most
+plausibly Robinhood Chain, an L2 this project already benchmarks against),
+not EIP-7702 delegation, explains this number. This is **not** a
+numbers-backed case for building EIP-7702 on Ethereum mainnet — if
+anything, it's a data point that a chain choice (already-supported
+Robinhood Chain, or a similarly cheap L2) does far more for per-wallet
+cost than any delegation mechanism could, on mainnet or otherwise. Flagged
+as ambiguous only insofar as the exact chain is unconfirmed; the magnitude
+argument against "this is what 7702 buys you on mainnet" is not ambiguous.
+
+Sources consulted (WebSearch, current as of this writing): arXiv "EIP-7702
+Phishing Attack" (2512.12174); TradingView/NewsBTC/Cryptopolitan coverage
+of Wintermute's CrimeEnjoyor research and the $1.54M single-user loss;
+OpenZeppelin's EOA Delegation docs; BuildBear's ERC-4337-vs-EIP-7702
+comparison; Ethereum.org's Pectra/7702 guidelines; EIP-7702's own spec
+(eips.ethereum.org/EIPS/eip-7702) for the revocation mechanism.
+
