@@ -307,6 +307,34 @@ if ! wait_for_healthy; then
 fi
 echo "==> service healthy on testnet config"
 
+# STEP 28 — real gap found while writing up a benchmark result: this
+# script's config swap (swap_config_to_testnet.py) never touches
+# race_mode/sequencer_http_url at all — it only rewrites the network/
+# target fields it explicitly lists (ws_rpc_url, http_rpc_urls,
+# mint_mode, nft_contract, fee_recipient, quantity_per_wallet,
+# block_time_ms). Whatever race_mode/sequencer_http_url the config
+# already had BEFORE the swap carries through unchanged, silently. A
+# ~5.5x dispatch_to_inclusion improvement was observed between two
+# benchmark runs, and the leading hypothesis was PR #9's sequencer-racing
+# feature — but neither this script's own output NOR audit.log's
+# persisted MintResult records say which submission path (sequencer vs.
+# backup RPC) actually acked each fire (that detail only ever reaches
+# `tracing::info!`/journalctl, per executor.rs's "using this URL's ack"
+# log line — never the durable audit trail), so the cause could not be
+# confirmed after the fact. Same class of bug as steps 26/27: a script
+# silently blind to a newer feature. Fixed here by making this explicit
+# and printed, so a FUTURE run's own console output is self-sufficient
+# evidence — no more "which mode was this actually running under?"
+# ambiguity. NOT fixed: forcing race_mode to a specific value here would
+# change this script's behavior beyond what was asked and isn't needed —
+# reporting what's actually configured is the real gap.
+echo
+echo "==> race_mode / sequencer_http_url as the bot is ACTUALLY running (GET /api/config,"
+echo "    read post-swap-restart — this is what this run's numbers should be attributed to,"
+echo "    not assumed from the swap script, which never touches either field):"
+RUNTIME_CONFIG=$(curl -sS -H "Authorization: Bearer $API_TOKEN" "$BOT_URL/api/config")
+echo "$RUNTIME_CONFIG" | jq '{race_mode, sequencer_http_url}'
+
 # balance_poll_loop refreshes wallet balances every 15s (main.rs) — give
 # it time to complete at least one real cycle against the NEW network
 # before trusting balance_eth below; checking immediately after restart
@@ -478,7 +506,18 @@ echo
 echo "==> Paste the p50/p90 numbers above into CLAUDE.md's step 15f section,"
 echo "    marking step 14b's HTTP-poll-only numbers as superseded (not"
 echo "    deleted), same convention as every other superseded figure in"
-echo "    this project."
+echo "    this project. Paste this run's race_mode/sequencer_http_url"
+echo "    values (printed earlier, before the fires started) alongside"
+echo "    them too — attributing a result to sequencer racing without"
+echo "    that confirmed is a guess, not a finding (step 28)."
+echo
+echo "==> STEP 28 — if you need to know which submission path (sequencer vs."
+echo "    backup RPC) acked any INDIVIDUAL fire, that detail is not in"
+echo "    audit.log (MintResult's persisted detail is just the tx hash on"
+echo "    success) — it only ever reaches journalctl, via executor.rs's"
+echo "    'using this URL's ack for send_to_ack_ms' info! line. Check"
+echo "    journalctl -u $SERVICE_NAME while this run is still fresh if"
+echo "    per-fire attribution matters, not after the fact."
 echo
 echo "==> If any individual dispatch_to_inclusion_ms is a clear outlier"
 echo "    (many multiples of step 14b's measured ~227ms block time),"

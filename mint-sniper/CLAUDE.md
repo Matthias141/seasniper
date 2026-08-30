@@ -1786,6 +1786,113 @@ finally provides. Step 13f's original n=1 attempt (7551ms) remains
 superseded by 14b as before. **Gap #11 is closed, for real, with
 evidence — the first time that has ever been true in this project.**
 
+## Step 28 — a real n=15 improvement, cause NOT confirmable, do not credit PR #9 yet
+
+A fresh live n=15 run (all 15 fires successful, PUSH confirmed on all 15
+arms, zero POLL fallback — same rigor as 15f) produced numbers
+genuinely different from 15f's own real PUSH-confirmed result:
+
+| Metric | This run (n=15) | 15f (n=15) | Change |
+|---|---|---|---|
+| send→ack p50 | 169ms | 174ms | ~unchanged |
+| send→ack p90 | 320ms | 235ms | up |
+| dispatch→inclusion p50 | 385ms | 2127ms | **~5.5x faster** |
+| dispatch→inclusion p90 | 434ms | 2367ms | **~5.5x faster** |
+
+send→ack being essentially flat is expected — nothing about RPC
+proximity changed between runs. The dispatch→inclusion drop is large
+and real, and the leading hypothesis going in was PR #9
+(`p0-rh-race-jitter-sequencer`, merged into `main` since 15f's run)
+actually engaging its sequencer-racing path this time. **This was
+checked directly rather than assumed, per this project's own standing
+rule, and could NOT be confirmed either way — stated plainly rather
+than credited on the strength of plausible timing alone.**
+
+**What was checked, and what it found:**
+- `deploy/lib/swap_config_to_testnet.py` (the config-rewrite
+  `run-benchmark.sh` uses for every testnet benchmark run, this one
+  included) **never touches `race_mode` or `sequencer_http_url` at
+  all** — confirmed by reading the file directly. It only rewrites the
+  seven fields it explicitly lists (`ws_rpc_url`, `http_rpc_urls`,
+  `mint_mode`, `nft_contract`, `fee_recipient`, `quantity_per_wallet`,
+  `block_time_ms`). Whatever `race_mode`/`sequencer_http_url` the
+  config already had **before** the swap — set by hand at some earlier
+  point, or never set at all — carries through completely unchanged.
+  This means the swap script itself is silent on the one variable this
+  investigation most needs to know, in either direction; it neither
+  confirms nor rules out sequencer racing having been active.
+- `ServerEvent::MintResult` (`bus.rs`) — what `audit.rs` persists to
+  `audit.log` for every fire — carries no `method`/`acked_url` field at
+  all. `executor.rs`'s success path sets `detail` to just the tx hash
+  (`format!("{tx_hash:#x}")`); the actual "which path acked this send"
+  information (`prefer_sequencer_ack`'s result) only ever reaches a
+  `tracing::info!("using this URL's ack for send_to_ack_ms")` call —
+  visible in `journalctl` at the time, if anyone was watching, but
+  **never written to the durable audit trail**. Confirmed directly
+  against the code, not assumed. This means even a fully intact
+  `audit.log` from tonight's run cannot retroactively answer "did the
+  sequencer ack these sends" — that evidence, if it ever existed, only
+  ever lived in journald, and this session has no VPS/journalctl access
+  to check it.
+
+**Conclusion: the cause of the ~5.5x improvement is genuinely
+unconfirmed, not "probably PR #9."** Two real, unresolved
+possibilities, both left open rather than one being assumed:
+1. PR #9's sequencer racing was actually enabled in the pre-swap
+   config and engaged during this run, closing real ground on the
+   sequencer-side delay 15f/19 left as an open question.
+2. Testnet conditions varied between the two runs — real and plausible
+   on a shared public testnet with variable load, and nothing about
+   this investigation can rule it out.
+
+Both send→ack numbers being nearly identical is *consistent with*
+possibility 1 (racing wouldn't be expected to move send→ack, only
+dispatch→inclusion) but is not evidence FOR it — a quieter testnet
+window would produce the same flat send→ack alongside a faster
+dispatch→inclusion just as easily.
+
+**Fixed, so this ambiguity can't recur silently:** `run-benchmark.sh`
+now reads `GET /api/config` right after the testnet swap+restart and
+prints the bot's actual running `race_mode`/`sequencer_http_url`
+values, before any fires happen — the exact same class of "script
+silently blind to a newer feature" bug steps 26 and 27 both found and
+closed. A future benchmark run's own console output is now
+self-sufficient evidence of which regime it ran under; this one's
+wasn't captured, which is exactly why this section can't credit PR #9
+with a straight face. The script also now points at `journalctl`
+(not `audit.log` — confirmed above it has nothing usable here) for
+anyone who needs live, per-fire method attribution during a future run.
+
+**Numbers vs. MintDash, reported with the honest caveat attached, not
+as a settled competitive position:**
+
+| Metric | This run | MintDash (p50) | Ratio |
+|---|---|---|---|
+| send→ack p50 | 169ms | 117ms | ~1.4x |
+| dispatch→inclusion p50 | 385ms | 136ms | ~2.8x |
+
+If this ~2.8x figure is repeatable and attributable to PR #9, it is a
+materially better competitive position than 15f's ~15.6x — but that
+"if" is exactly the open question this section cannot close. **15f's
+numbers above (p50=2127ms/2367ms) are marked superseded by this run's
+numbers as the more recent real measurement, same convention as every
+other superseded figure in this project — NOT because this run's cause
+is confirmed, purely because it's the newer real data point.** Treat
+the ~2.8x figure as provisional until the follow-up below runs.
+
+**Concrete follow-up needed, not optional:** a benchmark run with
+`race_mode`/`sequencer_http_url` explicitly confirmed-enabled
+beforehand (now checkable at a glance via this step's own fix, before
+firing) — ideally back-to-back with one confirmed-disabled, same
+methodology, same night, to control for testnet-condition drift as much
+as a shared public testnet allows. Until that runs, whether PR #9
+closed real ground on the still-open 15f/19 sequencer-delay question
+remains genuinely unknown, not "probably yes."
+
+cargo build/check/test: no Rust changes — `run-benchmark.sh`'s new
+`GET /api/config` report is a read-only addition to an existing
+deploy-only script.
+
 ### 15g — a new, separate open question: real sequencer delay, or
 Alchemy-specific indexing lag? (does NOT change 15f's verdict above)
 
