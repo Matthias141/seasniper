@@ -313,6 +313,14 @@ fn resolved_target_json(r: &target::ResolvedTarget, now: u64) -> serde_json::Val
         // fee_recipient isn't accepted. The UI should gate its "set as
         // active target" action on this, not just fee_recipient_ok alone.
         "settable": r.is_live(now) && r.fee_recipient_ok,
+        // STEP 29b — additional signals alongside the existing
+        // namesquatting warning; neither blocks resolution or replaces
+        // human judgment. contract_age_secs is null when it couldn't be
+        // determined — the UI must not read null as "old and safe."
+        "contract_age_secs": r.contract_age_secs,
+        "goplus_malicious": r.goplus.malicious_nft_contract,
+        "goplus_create_block_number": r.goplus.create_block_number,
+        "goplus_concerning": r.goplus.is_concerning(),
     })
 }
 
@@ -381,7 +389,8 @@ async fn post_target_set(
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad nft_contract: {e}")).into_response(),
     };
 
-    let resolved = match target::resolve_address(&cfg, nft_contract).await {
+    let preferred_rpc = state.best_http_rpc_url().await; // step 29c
+    let resolved = match target::resolve_address(&cfg, nft_contract, preferred_rpc.as_deref()).await {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     };
@@ -1039,6 +1048,7 @@ mod step_up_tests {
             identity_totp_cipher: keys.totp_cipher,
             google_oidc,
             webauthn: None,
+            ranked_http_rpc_urls: RwLock::new(Vec::new()),
         })
     }
 
@@ -1225,6 +1235,7 @@ mod cors_tests {
             },
             google_oidc: None,
             webauthn: None,
+            ranked_http_rpc_urls: RwLock::new(Vec::new()),
         });
         (state, google_oauth_redirect_url.to_string())
     }

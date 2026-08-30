@@ -3222,3 +3222,172 @@ line names that same address.
 
 cargo build/check/test: no Rust changes in either step 26 or step 27 —
 both are `deploy/*.sh` fixes only.
+
+## Step 29 — four ready-to-build items from step 24's evaluation
+
+Four independently-scoped implementations of the sketches step 24's
+evaluation of `seadrop-noir-bot` left as follow-up recommendations.
+`cargo build`/`cargo test`/`cargo clippy --all-targets -- -D warnings`
+all clean throughout, 104 tests as of 29d (up from 98 before this step).
+
+### 29a — boot-time and arm-time clock-drift check
+
+`trigger_mode = "timestamp"` fires purely off the VPS's own system clock
+(`watcher::run_timestamp_watcher` compares `SystemTime::now()` against
+`trigger_timestamp_unix` — no RPC involved at all), and nothing checked
+that clock's accuracy before this step.
+
+Confirmed, not assumed, that an HTTP `Date`-header comparison (RTT-
+compensated) is genuinely simpler and equally reliable here, rather than
+true NTP: step 24's evaluation of `seadrop-noir-bot` found the exact same
+technique behind their own "NTP" framing (a mischaracterization,
+confirmed by reading their source) — true NTP needs a UDP client and a
+new protocol dependency this codebase has no other use for, while a
+`Date` header comes back on every HTTP response for free, reusing the
+existing `reqwest`/`rustls` stack. `parse_http_date`/`days_from_civil`
+(Howard Hinnant's well-known algorithm) are hand-rolled in `main.rs`
+rather than pulling in a date crate for one fixed HTTP-spec format —
+independently verified against RFC 7231's own worked example and several
+other reference points in this step's own tests, not just "the code
+agrees with itself."
+
+Two checks, both config-gated so an existing deployment sees zero
+behavior change on upgrade (`clock_check_url`/`clock_drift_warn_ms`/
+`clock_drift_refuse_arm_ms` in `config.rs`):
+- **Boot-time**, always (any deployment, not just timestamp mode) —
+  logs a loud warning via both `bus::log` and `tracing::warn!` (step 17's
+  "both, not either" standard) above `clock_drift_warn_ms` (default
+  1500ms, matching `seadrop-noir-bot`'s own threshold).
+- **Arm-time, timestamp mode only** — a FRESH re-check (not the
+  boot-time snapshot; a long-running process's clock can drift further
+  over days) inside `control_loop`'s `Arm` handler, checked BEFORE
+  `state.armed` is ever set true. Refuses to arm if drift is at or above
+  `clock_drift_refuse_arm_ms`. Defaults to 0 = disabled — this is a real
+  hard-failure mode, and an operator must explicitly opt in by setting a
+  nonzero value; nothing about upgrading into this feature can silently
+  start refusing arms that used to succeed.
+
+### 29b — contract-age + GoPlus honeypot signal in target resolution
+
+Extends `target::resolve_address` (8b/8c's verification path) with two
+additional pre-arm signals alongside the existing namesquatting warning —
+neither blocks resolution or replaces human judgment; both fail open on
+any check failure rather than treating a failure as "confirmed clean."
+
+**`contract_age_secs`** — binary search on `eth_getCode` (present vs.
+absent at a given block height, `target.rs::estimate_contract_age_secs`)
+to find the deployment block, then one `eth_getBlockByNumber` call for
+its real timestamp. No external indexer needed — works on any EVM chain
+this codebase targets, including ones no third-party service covers
+(Robinhood Chain testnet, per step 22a). Deliberately NOT delegated to
+GoPlus's own `create_block_number` field: confirmed live that field is
+null on plenty of real contracts, and a namesquatting fake is exactly the
+kind of low-profile, very recently deployed contract a security scanner
+is least likely to have indexed yet — relying on GoPlus alone would
+systematically miss the adversarial case this check exists to catch.
+Bounded to ~log2(latest_block) RPC round trips; only runs on an explicit
+resolve/set action, never the hot prepare/fire path.
+
+**GoPlus NFT security check** (new `src/goplus.rs`) — confirmed real,
+free, and its actual response schema via a live request against BAYC's
+mainnet contract before writing any parsing logic, not assumed from the
+endpoint name or `seadrop-noir-bot`'s own summary of it (their own README
+uses `nft_security/{chain_id}`, which is real and matches). **Correction
+to step 24's original framing:** the NFT security endpoint has NO
+`is_honeypot` field at all — that belongs to GoPlus's separate token/
+address security product, a different endpoint from the one this
+integration or `seadrop-noir-bot`'s own code actually calls. This module
+therefore checks `malicious_nft_contract` (an explicit, self-describing
+0/1 flag) and surfaces `create_block_number`, and deliberately does NOT
+interpret the response's `privileged_minting`/`self_destruct`/
+`transfer_without_approval`/etc. object fields — their `value: -1/0/1`
+encoding couldn't be confirmed against GoPlus's own docs (JS-rendered,
+not fetchable via a plain HTTP GET in the time available) and guessing
+wrong would be worse than not using them: a false "safe" reading is
+actively dangerous, a false "risky" one erodes trust in every future
+warning this feature raises.
+
+Surfaced in `/api/target/resolve`'s existing JSON response
+(`contract_age_secs`, `goplus_malicious`, `goplus_create_block_number`,
+`goplus_concerning`) for the UI's existing resolve-then-confirm flow —
+no new endpoint, no new confirmation step, additional signal only.
+
+### 29c — RPC latency ranking for read-path calls
+
+Beyond the existing broadcast-time parallel racing (`http_rpc_urls` on
+the hot fire path — `executor.rs`'s `warm_connections`/`fire_prepared`,
+which already races every configured URL in parallel and gains nothing
+from sequential ranking), applies fastest-first RPC selection to
+read-path calls that aren't on that hot path.
+
+Reuses `rpc_health_poll_loop`'s existing real per-15s `eth_blockNumber`
+latency measurements (already made for the UI's health pill) rather than
+running a second, separate benchmark pass — a new
+`AppState.ranked_http_rpc_urls` field is updated from those same
+measurements each round (`main.rs`'s new `rank_by_latency`, extracted as
+pure, independently-tested logic), exposed via
+`AppState::best_http_rpc_url()`.
+
+Wired into: `target::resolve_address` (getPublicDrop,
+`is_fee_recipient_allowed`, and 29b's new contract-age/GoPlus reads all
+now prefer the fastest-known-healthy endpoint), `copymint.rs`'s
+`handle_candidate` and `verify_and_fire` (the same verification reads on
+copymint's detection/manual-fire paths), and `balance_poll_loop`
+(rebuilds its provider only when the preferred URL actually changes tick
+to tick, keeping the original "build once, reuse the warm connection"
+behavior for the common case). Every call site falls back to
+`cfg.http_rpc_urls[0]` — unchanged prior behavior — when ranking data
+isn't available yet (before the first health-poll round completes): this
+can only change WHICH configured endpoint answers a read, never the
+correctness of the answer.
+
+**Lower-priority per step 28's own finding** (that run's ~5.5x
+`dispatch_to_inclusion_ms` improvement couldn't be confirmed as a
+proximity effect — genuinely unattributed, per that step's own honest
+write-up) but still built per this step's own instructions. The actual
+basis for this being worth having at all is step 15f's separate, earlier,
+more confidently-attributed finding: `send_to_ack`'s ~1.5x gap vs.
+MintDash is "plausibly explained by RPC/network proximity" — a real
+signal proximity matters for that specific metric, independent of
+whether step 28's later, larger improvement is ever explained.
+
+### 29d — ChainProfile: a consolidated view over scattered per-chain fields
+
+Per step 24d's finding: with three chains now relevant (Ethereum,
+Robinhood Chain, InkChain), `Config::looks_like_robinhood_chain()` is
+itself a symptom of per-chain tuning values (`block_time_ms`,
+`race_mode`, `sequencer_http_url`, gas/jitter settings) being scattered
+across flat `Config` fields with no single "here's what differs for this
+chain" location — growing the risk of a future chain addition missing a
+needed value the same way earlier steps had to catch reactively.
+
+**Deliberately NOT the chain_id-keyed registry 24d's original sketch
+described.** `chain_id` is never trusted from config anywhere in this
+codebase — read live per-instance via `executor.rs`'s `get_chain_id()`
+call, step 13b/22c's own hard-won, explicit finding — and
+`Config::validate()` is synchronous, called from both `Config::load` and
+every `PUT /api/config`. Resolving a profile from a live RPC call inside
+`validate()` would be a real architecture change to code that gates
+every config write; re-adding `chain_id` as a plain config field just to
+make that lookup synchronous would undo the very principle 13b/22c
+established. `ChainProfile` is instead the safe, genuinely
+no-behavior-change piece of that idea: a pure, read-only grouping struct
+(`config.rs`) built from existing flat `Config` fields via the new
+`Config::chain_profile()` accessor. Zero TOML schema change — every
+existing `config.toml` continues parsing and validating identically,
+proven by every pre-existing `Config::validate()` test still passing
+unmodified, plus a new round-trip test built specifically to catch a
+copy-paste mistake between similarly-named fields (e.g.
+`jitter_ms_min`/`jitter_ms_max`).
+
+Wired into one real, low-risk use site — the
+`looks_like_robinhood_chain()` `block_time_ms` sanity check in
+`validate()` — as proof this isn't dead code, confirmed via the existing
+`accepts_robinhood_shaped_config_with_fast_block_time`/
+`rejects_robinhood_shaped_config_with_mainnet_block_time` tests still
+passing unchanged. **Deliberately scoped narrow, stated explicitly, not
+silently left incomplete:** migrating `executor.rs`/`inclusion.rs`'s own
+hot-path field reads to use `chain_profile()` is a natural follow-up,
+left for a separate step so this one's "clean refactor, no behavior
+change" claim stays easy to verify by inspection on code that doesn't
+touch real money movement.
