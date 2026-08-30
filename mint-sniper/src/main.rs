@@ -252,6 +252,7 @@ async fn main() -> Result<()> {
         identity_totp_cipher: identity_keys.totp_cipher,
         google_oidc,
         webauthn: webauthn_state,
+        ranked_http_rpc_urls: RwLock::new(cfg.http_rpc_urls.clone()),
     });
 
     // Background: refresh wallet ETH balances every 15s and push updates
@@ -307,8 +308,24 @@ async fn main() -> Result<()> {
 }
 
 async fn balance_poll_loop(state: SharedState, http_url: String, addrs: Vec<Address>) {
-    let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_url.parse().unwrap());
+    let mut current_url = http_url.clone();
+    let mut provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_url.parse().unwrap());
     loop {
+        // STEP 29c — prefer the fastest-known-healthy configured RPC
+        // (rpc_health_poll_loop's own real per-15s measurements), same
+        // read-path-only ranking used by target resolution. Only rebuilds
+        // the provider when the preferred URL actually changed since the
+        // last tick — this loop's providers are deliberately built once
+        // and reused (see this function's original reasoning, unchanged
+        // for the common case where the ranking is stable tick to tick).
+        if let Some(best) = state.best_http_rpc_url().await {
+            if best != current_url {
+                if let Ok(parsed) = best.parse() {
+                    provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(parsed);
+                    current_url = best;
+                }
+            }
+        }
         for addr in &addrs {
             if let Ok(balance) = provider.get_balance(*addr).await {
                 let eth_str = format_units(balance, "ether").unwrap_or_else(|_| "?".into());
@@ -351,6 +368,12 @@ async fn rpc_health_poll_loop(state: SharedState, http_rpc_urls: Vec<String>) {
         .collect();
 
     loop {
+        // STEP 29c — collected this round, then used once at the end to
+        // update `state.ranked_http_rpc_urls` — the existing per-tick
+        // `ServerEvent::RpcHealth` sends above stay exactly as they were
+        // (the UI's health pill), this reuses the same measurements for a
+        // second purpose rather than pinging twice.
+        let mut round: Vec<(String, bool, u64)> = Vec::with_capacity(providers.len());
         for (url, provider) in &providers {
             let start = std::time::Instant::now();
             let healthy = provider.get_block_number().await.is_ok();
@@ -360,9 +383,31 @@ async fn rpc_health_poll_loop(state: SharedState, http_rpc_urls: Vec<String>) {
                 healthy,
                 latency_ms,
             });
+            round.push((url.clone(), healthy, latency_ms));
         }
+
+        let ranked = rank_by_latency(&round);
+        if !ranked.is_empty() {
+            *state.ranked_http_rpc_urls.write().await = ranked;
+        }
+
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     }
+}
+
+/// STEP 29c — pure ranking logic, extracted so it's independently
+/// testable without a real RPC round trip: fastest-first among URLs
+/// healthy this round, with any unhealthy-this-round URL appended after
+/// (in its original relative order) rather than dropped — a single
+/// failed ping doesn't mean an endpoint is gone for good, just
+/// deprioritized until it responds again.
+fn rank_by_latency(round: &[(String, bool, u64)]) -> Vec<String> {
+    let mut healthy: Vec<(&str, u64)> =
+        round.iter().filter(|(_, h, _)| *h).map(|(u, _, l)| (u.as_str(), *l)).collect();
+    healthy.sort_by_key(|(_, latency_ms)| *latency_ms);
+    let mut ranked: Vec<String> = healthy.into_iter().map(|(u, _)| u.to_string()).collect();
+    ranked.extend(round.iter().filter(|(_, h, _)| !*h).map(|(u, _, _)| u.clone()));
+    ranked
 }
 
 /// STEP 29a — parses an RFC 7231 IMF-fixdate HTTP `Date` header value (the
@@ -1408,6 +1453,41 @@ mod tests {
         assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 UTC"), None); // wrong TZ token — HTTP dates are always GMT
         assert_eq!(parse_http_date("Sun, XX Nov 1994 08:49:37 GMT"), None);
         assert_eq!(parse_http_date("Sun, 06 Nvx 1994 08:49:37 GMT"), None); // bad month name
+    }
+
+    // --- STEP 29c: rank_by_latency ---
+
+    #[test]
+    fn ranks_healthy_urls_fastest_first() {
+        let round = vec![
+            ("slow".to_string(), true, 300u64),
+            ("fast".to_string(), true, 50u64),
+            ("medium".to_string(), true, 150u64),
+        ];
+        assert_eq!(rank_by_latency(&round), vec!["fast", "medium", "slow"]);
+    }
+
+    #[test]
+    fn unhealthy_urls_are_deprioritized_not_dropped() {
+        let round = vec![
+            ("dead".to_string(), false, 0u64),
+            ("fast".to_string(), true, 50u64),
+            ("also-dead".to_string(), false, 0u64),
+        ];
+        // healthy first (fastest-first among themselves), unhealthy after
+        // in original relative order — never removed from the list.
+        assert_eq!(rank_by_latency(&round), vec!["fast", "dead", "also-dead"]);
+    }
+
+    #[test]
+    fn all_unhealthy_still_returns_every_url() {
+        let round = vec![("a".to_string(), false, 0u64), ("b".to_string(), false, 0u64)];
+        assert_eq!(rank_by_latency(&round), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn empty_round_ranks_to_empty() {
+        assert!(rank_by_latency(&[]).is_empty());
     }
 
     #[test]

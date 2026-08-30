@@ -111,6 +111,34 @@ pub struct AppState {
     /// identity/webauthn.rs's doc comment) — every /auth/webauthn/* route
     /// must check this and return a clear "not configured" error.
     pub webauthn: Option<Arc<crate::identity::webauthn::WebauthnState>>,
+    /// STEP 29c — `http_rpc_urls`, reordered fastest-known-healthy-first.
+    /// Maintained by `main.rs`'s `rpc_health_poll_loop` (which already
+    /// measures real per-URL latency every 15s for the UI's health pill —
+    /// this reuses that same measurement rather than running a second,
+    /// separate benchmark pass) and consulted by read-path call sites that
+    /// aren't on the hot `fire_prepared`/`warm_connections` broadcast path
+    /// (which already races every configured URL in parallel and gains
+    /// nothing from sequential ranking — see `executor.rs`). Initialized
+    /// to `cfg.http_rpc_urls`'s original order and stays that way until
+    /// the first health-poll round completes, so a read before that point
+    /// behaves exactly as it always did (config order), never blocks or
+    /// errors waiting for ranking data to exist.
+    pub ranked_http_rpc_urls: RwLock<Vec<String>>,
+}
+
+impl AppState {
+    /// STEP 29c — the current best-guess fastest HTTP RPC URL, for
+    /// read-path calls that care about latency but aren't on the hot fire
+    /// path (target resolution's getPublicDrop/contract-age/chain-id
+    /// reads, copymint.rs's verification read). Returns None if the
+    /// ranked list is empty; confirmed by reading Config::validate()
+    /// directly that http_rpc_urls is only required non-empty
+    /// conditionally (race_mode with no sequencer_http_url set) - an
+    /// empty list is a real, valid-per-validate() shape a caller must
+    /// handle, not something safe to unwrap or index into.
+    pub async fn best_http_rpc_url(&self) -> Option<String> {
+        self.ranked_http_rpc_urls.read().await.first().cloned()
+    }
 }
 
 // NOTE: deliberately no `impl FromRef<SharedState> for cookie::Key` here.

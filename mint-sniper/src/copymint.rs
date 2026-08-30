@@ -303,7 +303,12 @@ async fn handle_candidate(
         }
     };
 
-    let drop = match seadrop::fetch_public_drop(&cfg.http_rpc_urls[0], seadrop_address, nft_contract).await {
+    // STEP 29c — prefer the fastest-known-healthy configured RPC for this
+    // verification read, same as target resolution's own use of
+    // AppState::best_http_rpc_url(). Falls back to cfg.http_rpc_urls[0]
+    // exactly as before if ranking data isn't available yet.
+    let http_rpc_url = state.best_http_rpc_url().await.unwrap_or_else(|| cfg.http_rpc_urls[0].clone());
+    let drop = match seadrop::fetch_public_drop(&http_rpc_url, seadrop_address, nft_contract).await {
         Ok(d) => d,
         Err(e) => {
             bus::log(
@@ -400,7 +405,9 @@ pub async fn verify_and_fire(
     let cfg = state.config.read().await.clone();
     let seadrop_address = resolve_seadrop_address(&cfg)?;
 
-    let drop = seadrop::fetch_public_drop(&cfg.http_rpc_urls[0], seadrop_address, nft_contract)
+    // STEP 29c — see handle_candidate's identical comment above.
+    let http_rpc_url = state.best_http_rpc_url().await.unwrap_or_else(|| cfg.http_rpc_urls[0].clone());
+    let drop = seadrop::fetch_public_drop(&http_rpc_url, seadrop_address, nft_contract)
         .await
         .context("getPublicDrop failed")?;
 

@@ -58,13 +58,22 @@ pub struct ResolvedTarget {
 /// explicitly-picklist-based flow, not something to guess into here.
 pub async fn resolve(state: &SharedState, http_client: &reqwest::Client, input: &str) -> Result<ResolvedTarget> {
     let cfg = state.config.read().await.clone();
+    // STEP 29c — the fastest-known-healthy configured RPC, per
+    // rpc_health_poll_loop's own real per-15s measurements; `None` until
+    // the first poll round completes (or if ranking data is otherwise
+    // unavailable), in which case resolve_address falls back to
+    // cfg.http_rpc_urls[0] exactly as it always did — see
+    // AppState::best_http_rpc_url's own doc comment.
+    let preferred_rpc = state.best_http_rpc_url().await;
 
     match opensea::parse_input(input) {
-        Some(opensea::ResolvedInput::Address(nft_contract)) => resolve_address(&cfg, nft_contract).await,
+        Some(opensea::ResolvedInput::Address(nft_contract)) => {
+            resolve_address(&cfg, nft_contract, preferred_rpc.as_deref()).await
+        }
         Some(opensea::ResolvedInput::OpenSeaSlug(slug)) => {
             let api_key = cfg.resolve_opensea_api_key();
             let collection = opensea::resolve_slug(http_client, api_key.as_deref(), &slug).await?;
-            let mut resolved = resolve_address(&cfg, collection.nft_contract).await?;
+            let mut resolved = resolve_address(&cfg, collection.nft_contract, preferred_rpc.as_deref()).await?;
             resolved.name = Some(collection.name);
             resolved.links = collection.links;
             Ok(resolved)
@@ -80,7 +89,21 @@ pub async fn resolve(state: &SharedState, http_client: &reqwest::Client, input: 
 /// `resolve`'s address branch and by `/api/target/set`, which never
 /// trusts a client-supplied resolution and always re-derives everything
 /// from a live `getPublicDrop` call immediately before committing.
-pub async fn resolve_address(cfg: &Config, nft_contract: Address) -> Result<ResolvedTarget> {
+///
+/// `preferred_http_rpc_url` (step 29c) — when `Some`, used for every
+/// read-path RPC call in this function instead of `cfg.http_rpc_urls[0]`;
+/// callers pass `AppState::best_http_rpc_url()`'s result. `None` (a
+/// caller with no `SharedState` handy, or ranking data not yet
+/// available) falls back to `cfg.http_rpc_urls[0]` exactly as before this
+/// step — this parameter can only ever change WHICH configured endpoint
+/// answers these reads, never the correctness of the answer itself.
+pub async fn resolve_address(
+    cfg: &Config,
+    nft_contract: Address,
+    preferred_http_rpc_url: Option<&str>,
+) -> Result<ResolvedTarget> {
+    let http_rpc_url = preferred_http_rpc_url.unwrap_or(&cfg.http_rpc_urls[0]);
+
     let seadrop_address: Address = if cfg.seadrop_address.is_empty() {
         seadrop::SEADROP_1_0_MAINNET
             .parse()
@@ -89,7 +112,7 @@ pub async fn resolve_address(cfg: &Config, nft_contract: Address) -> Result<Reso
         cfg.seadrop_address.parse().context("bad seadrop_address in config")?
     };
 
-    let drop = seadrop::fetch_public_drop(&cfg.http_rpc_urls[0], seadrop_address, nft_contract)
+    let drop = seadrop::fetch_public_drop(http_rpc_url, seadrop_address, nft_contract)
         .await
         .context("getPublicDrop failed")?;
 
@@ -99,7 +122,7 @@ pub async fn resolve_address(cfg: &Config, nft_contract: Address) -> Result<Reso
         .context("current fee_recipient in config is not a valid address — set one before resolving a target")?;
 
     let fee_recipient_ok = if drop.restrict_fee_recipients {
-        seadrop::is_fee_recipient_allowed(&cfg.http_rpc_urls[0], seadrop_address, nft_contract, fee_recipient)
+        seadrop::is_fee_recipient_allowed(http_rpc_url, seadrop_address, nft_contract, fee_recipient)
             .await
             .unwrap_or(false)
     } else {
@@ -109,8 +132,8 @@ pub async fn resolve_address(cfg: &Config, nft_contract: Address) -> Result<Reso
     // STEP 29b — best-effort, never blocks resolution on failure (both
     // fail open independently of each other and of the getPublicDrop
     // result above, which is the one check that DOES gate resolution).
-    let contract_age_secs = estimate_contract_age_secs(&cfg.http_rpc_urls[0], nft_contract).await;
-    let goplus = match http_client_and_chain_id(&cfg.http_rpc_urls[0]).await {
+    let contract_age_secs = estimate_contract_age_secs(http_rpc_url, nft_contract).await;
+    let goplus = match http_client_and_chain_id(http_rpc_url).await {
         Some((client, chain_id)) => goplus::check(&client, chain_id, nft_contract).await,
         None => goplus::NftSecurityCheck::default(),
     };

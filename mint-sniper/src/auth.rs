@@ -223,6 +223,7 @@ mod tests {
             identity_totp_cipher: keys.totp_cipher,
             google_oidc,
             webauthn: None,
+            ranked_http_rpc_urls: RwLock::new(Vec::new()),
         })
     }
 

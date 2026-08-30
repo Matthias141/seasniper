@@ -389,7 +389,8 @@ async fn post_target_set(
         Err(e) => return (StatusCode::BAD_REQUEST, format!("bad nft_contract: {e}")).into_response(),
     };
 
-    let resolved = match target::resolve_address(&cfg, nft_contract).await {
+    let preferred_rpc = state.best_http_rpc_url().await; // step 29c
+    let resolved = match target::resolve_address(&cfg, nft_contract, preferred_rpc.as_deref()).await {
         Ok(r) => r,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
     };
@@ -1047,6 +1048,7 @@ mod step_up_tests {
             identity_totp_cipher: keys.totp_cipher,
             google_oidc,
             webauthn: None,
+            ranked_http_rpc_urls: RwLock::new(Vec::new()),
         })
     }
 
@@ -1233,6 +1235,7 @@ mod cors_tests {
             },
             google_oidc: None,
             webauthn: None,
+            ranked_http_rpc_urls: RwLock::new(Vec::new()),
         });
         (state, google_oauth_redirect_url.to_string())
     }
