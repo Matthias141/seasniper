@@ -1,4 +1,14 @@
-import type { AuthSession, Config, ResolvedTarget, SearchHit, StatusResponse, TotpSetupMaterial, WebauthnDevice } from '../types';
+import type {
+  AuthSession,
+  Config,
+  DelegatedPreflightResult,
+  DelegatedStatus,
+  ResolvedTarget,
+  SearchHit,
+  StatusResponse,
+  TotpSetupMaterial,
+  WebauthnDevice,
+} from '../types';
 import type {
   CreationChallengeResponseJSON,
   PublicKeyCredentialJSON,
@@ -178,6 +188,25 @@ export const api = {
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ query }),
     }).then((r) => json<SearchHit[]>(r)),
+
+  // --- delegated mint mode (v1, DELEGATED_SERIAL) ---
+  // status/preflight are both read-only — see api.rs's own doc comments
+  // on get_delegated_status/post_delegated_preflight. Neither ever
+  // returns anything beyond public addresses; see
+  // api::delegated_secrets_tests for the tests that assert this.
+  getDelegatedStatus: () => fetch('/api/delegated/status', { headers: authHeaders() }).then((r) => json<DelegatedStatus>(r)),
+
+  preflightDelegated: () =>
+    fetch('/api/delegated/preflight', { method: 'POST', headers: authHeaders() }).then((r) => json<DelegatedPreflightResult>(r)),
+
+  // Same sensitivity class as arm()/fireNow() — step-up gated, no
+  // request body (everything is re-read from config and re-derived from
+  // the mnemonic fresh, server-side, at fire time). See api.rs's
+  // post_delegated_fire doc comment.
+  fireDelegated: () =>
+    withStepUp((code) =>
+      fetch('/api/delegated/fire', { method: 'POST', headers: authHeaders(stepUpHeader(code)) }).then(assertStepUpOk),
+    ),
 
   // --- identity (step 10c-10h) ---
   // None of these go through authHeaders()/the bearer token — they're

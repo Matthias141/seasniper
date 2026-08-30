@@ -4,7 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-alloy = { version = "2", features = ["full", "node-bindings"] }
+# --- delegated mint mode (MintDash-style, v1) ---
+# "full" (below) pulls in "essentials" -> "signer-local", but NOT the BIP-39/
+# BIP-32 mnemonic machinery specifically -- confirmed directly against
+# alloy 2.4.1's own Cargo.toml feature graph, not assumed from "full"'s name.
+# "signer-mnemonic" adds alloy_signer_local::MnemonicBuilder (wrapping
+# coins-bip32/coins-bip39) at the exact default path this feature needs,
+# `m/44'/60'/0'/0/{index}` -- reused as-is rather than hand-rolling HD
+# derivation.
+alloy = { version = "2", features = ["full", "node-bindings", "signer-mnemonic"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -18,6 +26,16 @@ axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 url = "2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
+# Zeroizes the raw OPERATOR_MNEMONIC string read from the env var, on top of
+# (not instead of) alloy-signer-local's own internal zeroizing of the
+# MnemonicBuilder/derived keys (its "zeroize" feature, pulled in transitively
+# by "signer-mnemonic" above) -- the plain String this codebase reads via
+# std::env::var() is a separate allocation MnemonicBuilder never sees or
+# zeroizes on our behalf. Already present transitively in this project's
+# dependency graph (webauthn-rs and others already pull in zeroize 1.x) --
+# adding it as a direct dependency here doesn't introduce a new version to
+# resolve.
+zeroize = "1"
 
 # --- identity (step 10) ---
 # See CLAUDE.md's "Identity (step 10)" section for the full stack writeup

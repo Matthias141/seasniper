@@ -36,7 +36,44 @@ export interface Config {
 
   // --- target resolution (step 8b/8c) ---
   opensea_api_key_env: string;
+
+  // --- delegated mint mode (v1, DELEGATED_SERIAL) ---
+  // Flat fields, not a nested [mint]/[mint.delegated] table — see
+  // config.example.toml's own comment on why this deviates from the
+  // feature's original spec to match this codebase's real convention.
+  // "parallel" (default) leaves the existing race path completely
+  // untouched; these three fields are only read when it's "delegated".
+  mint_execution: 'parallel' | 'delegated';
+  delegate_mnemonic_env: string;
+  delegate_count: number;
 }
+
+// --- delegated mint mode (v1) — GET /api/delegated/status response.
+// Never carries anything beyond public addresses — see
+// api.rs's delegated_secrets_tests for the tests asserting this.
+export interface DelegatedReceiver {
+  index: number;
+  address: string;
+}
+
+export interface DelegatedStatus {
+  operator_address: string;
+  operator_balance_eth: string;
+  delegate_count: number;
+  receivers_derived: boolean;
+  max_delegates: number;
+  receivers: DelegatedReceiver[];
+  mode_label: 'DELEGATED_SERIAL';
+}
+
+// POST /api/delegated/preflight response — see delegated/preflight.rs's
+// PreflightOutcome. "minter_mismatch" means the contract rejected a
+// nonzero minterIfNotPayer specifically — this mode can never be armed
+// against that contract, no fallback to parallel mode is offered.
+export type DelegatedPreflightResult =
+  | { outcome: 'ok'; estimated_max_spend_wei: string; delegate_count: number }
+  | { outcome: 'minter_mismatch'; revert_reason: string }
+  | { outcome: 'other_failure'; revert_reason: string };
 
 export interface WalletStatus {
   address: string;
@@ -114,7 +151,13 @@ export type ServerEvent =
       is_free: boolean;
       fireable: boolean;
     }
-  | { type: 'snapshot'; armed: boolean; wallets: WalletStatus[] };
+  | { type: 'snapshot'; armed: boolean; wallets: WalletStatus[] }
+  // --- delegated mint mode (v1, DELEGATED_SERIAL) --- see bus.rs's
+  // ServerEvent doc comment. Never carries a receiver's private key or
+  // anything beyond its public address.
+  | { type: 'delegated_run_started'; delegate_count: number; estimated_max_spend_wei: string }
+  | { type: 'delegated_mint_result'; receiver_index: number; receiver_address: string; success: boolean; detail: string }
+  | { type: 'delegated_run_complete'; minted: number; attempted: number; total_cost_wei: string };
 
 // --- identity (step 10) ---
 // Mirrors api.rs's get_auth_session response shape exactly — see that

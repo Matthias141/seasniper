@@ -368,3 +368,55 @@ comment in `config.rs` for where this is documented in code.
 4. If you're relying on the instant key long-term, put a recurring
    reminder (7 days is short enough that "I'll remember" doesn't hold up
    over weeks) — there's no in-app expiry warning for this today.
+
+---
+
+## 8. Delegated mint mode (v1, `DELEGATED_SERIAL`) — receiver wallet recovery
+
+Trigger: you need to access, sweep, or otherwise act on a RECEIVER
+wallet's own funds/NFTs after a delegated mint run (`mint_execution =
+"delegated"`), and need that wallet's private key.
+
+**This app never derives, stores, logs, or displays a receiver's private
+key, anywhere — by design, not an oversight.** `src/delegated/
+wallet_derivation.rs` only ever produces receiver *public addresses*
+(`DerivedReceiverSet`); no API response, UI prop, DOM node, or log line
+in this codebase can ever contain one (see `api.rs`'s
+`delegated_secrets_tests` module for the tests that assert this
+directly). There is no "reveal private key" feature for receivers and
+none should be added — see CLAUDE.md's delegated-mint-mode section and
+the original feature spec's explicit exclusion list.
+
+**Recovery does not need this app at all.** Every receiver key is
+standard BIP-39/BIP-44, derivable in any wallet tool that supports a
+custom derivation path, from the SAME mnemonic phrase stored under
+whatever env var `delegate_mnemonic_env` in `config.toml` names (e.g.
+`OPERATOR_MNEMONIC`) — never from this app itself.
+
+1. Get the mnemonic phrase from wherever it's actually stored (the
+   VPS's env file, a password manager, an offline backup — never from
+   this app; it holds only the env var *name*, never the value, same
+   convention as `private_key_env`).
+2. Open a standard wallet tool that supports custom BIP-44 derivation
+   paths — **prefer an offline/air-gapped tool for this step** (e.g. a
+   hardware wallet's own companion app, or a trusted offline signer);
+   avoid pasting a mnemonic into an arbitrary web-based "recovery" tool.
+3. Import the mnemonic, and set the derivation path to
+   `m/44'/60'/0'/0/i`, where `i` is the receiver's index (1 through
+   `delegate_count` — index 0 is always the operator, never a receiver).
+   Most wallet tools let you enter this path directly, or step through
+   account indices one at a time under the standard Ethereum path.
+4. The address that derivation produces should match the receiver
+   address shown for that index in the operator panel UI or
+   `GET /api/delegated/status`'s `receivers` list — confirm this match
+   before trusting the derived key, as a sanity check that you used the
+   right mnemonic and index.
+5. From there, use the wallet tool's own send/sweep functionality —
+   this app has no role in that step and none is planned (an in-app
+   "sweep all receivers" tool is explicitly out of scope for v1 — see
+   CLAUDE.md).
+
+**The operator wallet (index 0)** is recovered the exact same way — same
+mnemonic, same path, index 0 — and is additionally the one wallet you
+should already be tracking balance/activity for directly, since it's the
+only funded, signing wallet in this mode.

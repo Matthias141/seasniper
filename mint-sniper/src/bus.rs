@@ -82,6 +82,35 @@ pub enum ServerEvent {
         is_free: bool,
         fireable: bool,
     },
+    /// --- Delegated mint mode (v1) --- see `delegated/executor.rs`'s own
+    /// doc comment for why every one of these is explicitly labeled
+    /// DELEGATED_SERIAL rather than implying single-transaction batching.
+    /// Emitted once, before the first receiver fires — carries the exact
+    /// figure the operator was shown and had to acknowledge before this
+    /// run was allowed to start (see `delegated/preflight.rs`).
+    DelegatedRunStarted {
+        delegate_count: u32,
+        estimated_max_spend_wei: String,
+    },
+    /// One per receiver, in firing order — `receiver_index` is the 1-based
+    /// HD derivation index (matches `wallet_derivation.rs`'s
+    /// `1..=delegate_count` range), never the receiver's private key or
+    /// any value that could reconstruct it. `detail` carries the tx hash
+    /// on success or the verbatim revert/error reason on failure, same
+    /// convention as `MintResult::detail`.
+    DelegatedMintResult {
+        receiver_index: u32,
+        receiver_address: String,
+        success: bool,
+        detail: String,
+    },
+    /// Emitted once, after every receiver has been attempted (or the run
+    /// was aborted) — the terminal summary card's own data.
+    DelegatedRunComplete {
+        minted: u32,
+        attempted: u32,
+        total_cost_wei: String,
+    },
 }
 
 pub type EventBus = broadcast::Sender<ServerEvent>;

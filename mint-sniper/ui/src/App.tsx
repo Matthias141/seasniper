@@ -6,6 +6,7 @@ import { EventFeed, type FeedLine } from './components/EventFeed';
 import { ConfigPanel } from './components/ConfigPanel';
 import { TriggerConsole } from './components/TriggerConsole';
 import { CopyOpportunities, type CopyOpportunity } from './components/CopyOpportunities';
+import { OperatorPanel, type DelegatedRunState } from './components/OperatorPanel';
 import { TargetResolver } from './components/TargetResolver';
 import { LoginScreen } from './components/LoginScreen';
 import { IdentitySetup } from './components/IdentitySetup';
@@ -100,6 +101,11 @@ function Control({ onSignOut }: { onSignOut?: () => void }) {
   const [copyOpportunities, setCopyOpportunities] = useState<Map<string, CopyOpportunity>>(
     new Map(),
   );
+  // Delegated mint mode (v1, DELEGATED_SERIAL) — lifted up here rather
+  // than owned inside OperatorPanel.tsx so it drives off the same single
+  // WS connection every other panel already shares (see
+  // useEventSocket.ts), same pattern as copyOpportunities above.
+  const [delegatedRun, setDelegatedRun] = useState<DelegatedRunState | null>(null);
 
   const pushLine = useCallback((level: FeedLine['level'], message: string, ts?: number) => {
     setLines((prev) => [
@@ -177,6 +183,44 @@ function Control({ onSignOut }: { onSignOut?: () => void }) {
             }`,
           );
           break;
+        // --- delegated mint mode (v1, DELEGATED_SERIAL) --- see
+        // bus.rs's ServerEvent doc comment. Never carries anything
+        // beyond a receiver's public address.
+        case 'delegated_run_started':
+          setDelegatedRun({
+            delegateCount: event.delegate_count,
+            estimatedMaxSpendWei: event.estimated_max_spend_wei,
+            results: new Map(),
+            complete: null,
+          });
+          pushLine('warn', `DELEGATED_SERIAL run started — ${event.delegate_count} receivers`);
+          break;
+        case 'delegated_mint_result':
+          setDelegatedRun((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  results: new Map(prev.results).set(event.receiver_index, {
+                    address: event.receiver_address,
+                    success: event.success,
+                    detail: event.detail,
+                  }),
+                }
+              : prev,
+          );
+          pushLine(
+            event.success ? 'info' : 'error',
+            `DELEGATED_SERIAL #${event.receiver_index} ${event.receiver_address}: ${event.success ? 'confirmed' : 'failed'} — ${event.detail}`,
+          );
+          break;
+        case 'delegated_run_complete':
+          setDelegatedRun((prev) =>
+            prev
+              ? { ...prev, complete: { minted: event.minted, attempted: event.attempted, totalCostWei: event.total_cost_wei } }
+              : prev,
+          );
+          pushLine('warn', `DELEGATED_SERIAL run complete — ${event.minted}/${event.attempted} minted`);
+          break;
       }
     },
     [pushLine],
@@ -216,6 +260,9 @@ function Control({ onSignOut }: { onSignOut?: () => void }) {
 
         <div className={styles.right}>
           <TriggerConsole armed={armed} />
+          {config?.mint_execution === 'delegated' && (
+            <OperatorPanel config={config} run={delegatedRun} onRunReset={() => setDelegatedRun(null)} />
+          )}
           <TargetResolver onTargetSet={(nftContract) => setConfig((c) => (c ? { ...c, nft_contract: nftContract } : c))} />
           {config && (
             <ConfigPanel config={config} onSaved={setConfig} disabled={armed} />

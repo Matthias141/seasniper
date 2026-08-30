@@ -13,6 +13,7 @@ mod bus;
 mod config;
 mod copymint;
 mod db;
+mod delegated;
 mod executor;
 mod goplus;
 mod identity;
@@ -1210,6 +1211,34 @@ async fn control_loop(
                         if was_armed { " — disarmed (re-arm to watch the new target)" } else { "" }
                     ),
                 );
+            }
+
+            ControlMsg::FireDelegated => {
+                // STEP: delegated mint mode (v1). Deliberately spawned,
+                // NOT awaited inline the way FireCopymint's fire sequence
+                // is above — a delegated run is N sequential, individually
+                // awaited transactions (potentially many minutes for a
+                // large delegate_count), and this codebase's own
+                // "must not slow down, alter timing of, or share code
+                // paths with the parallel race logic" requirement for
+                // this feature means control_loop cannot sit blocked on
+                // it: Arm/FireNow/FireCopymint for the parallel path must
+                // stay responsive while a delegated run is still going.
+                // Everything this spawned task touches — the freshly
+                // read cfg, the freshly derived operator/receivers inside
+                // delegated::executor::run_delegated_mint itself — is
+                // independent of every piece of control_loop's own local
+                // state (wallets, warmed_providers, prepared_fire,
+                // watcher_handle), so there is no shared mutable state to
+                // race.
+                let cfg = state.config.read().await.clone();
+                let bus = state.bus.clone();
+                bus::log(&bus, "warn", "FIRING delegated mint (DELEGATED_SERIAL)".to_string());
+                tokio::spawn(async move {
+                    if let Err(e) = delegated::executor::run_delegated_mint(&cfg, &bus).await {
+                        bus::log(&bus, "error", format!("delegated mint run failed: {e:#}"));
+                    }
+                });
             }
         }
     }

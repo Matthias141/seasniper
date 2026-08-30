@@ -80,6 +80,9 @@ pub fn router(state: SharedState, google_oauth_redirect_url: &str) -> Router {
         .route("/api/target/resolve", post(post_target_resolve))
         .route("/api/target/set", post(post_target_set))
         .route("/api/target/search", post(post_target_search))
+        .route("/api/delegated/status", get(get_delegated_status))
+        .route("/api/delegated/preflight", post(post_delegated_preflight))
+        .route("/api/delegated/fire", post(post_delegated_fire))
         .route("/ws/events", get(ws_handler))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth::require_token_or_session));
 
@@ -499,6 +502,200 @@ async fn post_target_search(
         Ok(hits) => Json(hits).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
     }
+}
+
+// --- Delegated mint mode (v1) ---
+//
+// Every response below carries receiver ADDRESSES only, never a
+// mnemonic, a private key, or anything derived from one — see
+// `delegated::wallet_derivation::DerivedReceiverSet`'s own doc comment
+// for the type-level enforcement this relies on, and
+// `tests::delegated_status_response_never_contains_key_shaped_fields`
+// below for a real, running assertion of it, not just this comment.
+
+async fn get_delegated_status(State(state): State<SharedState>) -> impl IntoResponse {
+    let cfg = state.config.read().await.clone();
+    if cfg.mint_execution != crate::config::MintExecution::Delegated {
+        return (
+            StatusCode::BAD_REQUEST,
+            "mint_execution is not \"delegated\" — set it in config before using this panel".to_string(),
+        )
+            .into_response();
+    }
+    let mnemonic = match std::env::var(&cfg.delegate_mnemonic_env) {
+        Ok(m) => m,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "env var {} (delegate_mnemonic_env) is not set",
+                    cfg.delegate_mnemonic_env
+                ),
+            )
+                .into_response();
+        }
+    };
+    let (operator, receivers) =
+        match crate::delegated::wallet_derivation::derive_operator_and_receivers(mnemonic, cfg.delegate_count) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+        };
+
+    let http_rpc_url = match cfg.http_rpc_urls.first() {
+        Some(u) => u.clone(),
+        None => return (StatusCode::BAD_REQUEST, "http_rpc_urls is empty".to_string()).into_response(),
+    };
+    let operator_balance_eth = {
+        use alloy::providers::{Provider, ProviderBuilder};
+        match http_rpc_url
+            .parse()
+            .ok()
+            .map(|u| ProviderBuilder::new().disable_recommended_fillers().connect_http(u))
+        {
+            Some(provider) => match provider.get_balance(operator.address()).await {
+                Ok(bal) => alloy::primitives::utils::format_units(bal, "ether")
+                    .unwrap_or_else(|_| "?".to_string()),
+                Err(_) => "?".to_string(),
+            },
+            None => "?".to_string(),
+        }
+    };
+
+    let receiver_rows: Vec<serde_json::Value> = receivers
+        .addresses()
+        .iter()
+        .enumerate()
+        .map(|(i, addr)| {
+            serde_json::json!({
+                "index": (i + 1) as u32,
+                "address": format!("{addr:#x}"),
+            })
+        })
+        .collect();
+
+    let delegate_count = receivers.len() as u32;
+    let receivers_is_empty = receivers.is_empty();
+    Json(serde_json::json!({
+        "operator_address": format!("{:#x}", operator.address()),
+        "operator_balance_eth": operator_balance_eth,
+        // Reports the actual derived count, not just an echo of
+        // cfg.delegate_count — these are the same value by construction,
+        // but reading it off the real DerivedReceiverSet is the more
+        // honest source of truth for a status endpoint.
+        "delegate_count": delegate_count,
+        "receivers_derived": !receivers_is_empty,
+        "max_delegates": crate::config::MAX_DELEGATES,
+        "receivers": receiver_rows,
+        "mode_label": "DELEGATED_SERIAL",
+    }))
+    .into_response()
+}
+
+/// Read-only: runs `delegated::preflight::run_preflight` and returns its
+/// classification + estimated max spend, WITHOUT firing anything — the
+/// figure this response returns is exactly what the UI's pre-arm summary
+/// must show and require an explicit acknowledgment click on, before
+/// `/api/delegated/fire` can ever be called (see `preflight.rs`'s own doc
+/// comment for how `MinterMismatch` is actually detected).
+async fn post_delegated_preflight(State(state): State<SharedState>) -> impl IntoResponse {
+    let cfg = state.config.read().await.clone();
+    if cfg.mint_execution != crate::config::MintExecution::Delegated {
+        return (StatusCode::BAD_REQUEST, "mint_execution is not \"delegated\"".to_string()).into_response();
+    }
+
+    let mnemonic = match std::env::var(&cfg.delegate_mnemonic_env) {
+        Ok(m) => m,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("env var {} (delegate_mnemonic_env) is not set", cfg.delegate_mnemonic_env),
+            )
+                .into_response();
+        }
+    };
+    let (operator, receivers) =
+        match crate::delegated::wallet_derivation::derive_operator_and_receivers(mnemonic, cfg.delegate_count) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+        };
+    let Some(first_receiver) = receivers.addresses().first().copied() else {
+        return (StatusCode::BAD_REQUEST, "delegate_count derived zero receivers".to_string()).into_response();
+    };
+
+    let seadrop_address: Address = if cfg.seadrop_address.is_empty() {
+        crate::seadrop::SEADROP_1_0_MAINNET.parse().unwrap()
+    } else {
+        match cfg.seadrop_address.parse() {
+            Ok(a) => a,
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("bad seadrop_address: {e}")).into_response(),
+        }
+    };
+    let nft_contract: Address = match cfg.nft_contract.parse() {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad nft_contract: {e}")).into_response(),
+    };
+    let fee_recipient: Address = match cfg.fee_recipient.parse() {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad fee_recipient: {e}")).into_response(),
+    };
+    let Some(http_rpc_url) = cfg.http_rpc_urls.first() else {
+        return (StatusCode::BAD_REQUEST, "http_rpc_urls is empty".to_string()).into_response();
+    };
+
+    match crate::delegated::preflight::run_preflight(
+        http_rpc_url,
+        seadrop_address,
+        nft_contract,
+        fee_recipient,
+        operator.address(),
+        first_receiver,
+        cfg.quantity_per_wallet,
+        cfg.delegate_count,
+    )
+    .await
+    {
+        Ok(crate::delegated::preflight::PreflightOutcome::Ok { estimated_max_spend_wei }) => Json(serde_json::json!({
+            "outcome": "ok",
+            "estimated_max_spend_wei": estimated_max_spend_wei.to_string(),
+            "delegate_count": cfg.delegate_count,
+        }))
+        .into_response(),
+        Ok(crate::delegated::preflight::PreflightOutcome::MinterMismatch { revert_reason }) => Json(serde_json::json!({
+            "outcome": "minter_mismatch",
+            "revert_reason": revert_reason,
+        }))
+        .into_response(),
+        Ok(crate::delegated::preflight::PreflightOutcome::OtherFailure { revert_reason }) => Json(serde_json::json!({
+            "outcome": "other_failure",
+            "revert_reason": revert_reason,
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
+    }
+}
+
+/// Actually starts a `DELEGATED_SERIAL` run. Step-up-gated, same
+/// sensitivity class as `/api/arm`/`/api/trigger` — this immediately
+/// begins spending real ETH from the operator wallet, no separate
+/// "armed, waiting for trigger" state the way the parallel path's watcher
+/// has (delegated mode has no trigger-wait concept in v1; the UI's own
+/// pre-arm summary + explicit spend acknowledgment, reusing the same
+/// cover-lift confirm pattern `TriggerConsole.tsx`'s FIRE button already
+/// uses, is what stands in for arm-then-wait here). Never trusts
+/// anything from the request body — there is none; every value this
+/// fires with is re-read fresh from config and re-derived fresh from the
+/// mnemonic inside `delegated::executor::run_delegated_mint` itself,
+/// including a fresh preflight run immediately before the first send.
+async fn post_delegated_fire(State(state): State<SharedState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err((code, msg)) = require_step_up(&state, &headers).await {
+        return (code, msg).into_response();
+    }
+    let cfg = state.config.read().await.clone();
+    if cfg.mint_execution != crate::config::MintExecution::Delegated {
+        return (StatusCode::BAD_REQUEST, "mint_execution is not \"delegated\"".to_string()).into_response();
+    }
+    let _ = state.control_tx.send(ControlMsg::FireDelegated).await;
+    StatusCode::ACCEPTED.into_response()
 }
 
 // --- identity (step 10c) ---
@@ -991,6 +1188,144 @@ async fn stream_events(mut socket: WebSocket, state: SharedState) {
                 break; // client disconnected
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod delegated_secrets_tests {
+    //! Delegated mint mode (v1) — a real, running assertion that the
+    //! mnemonic (and anything derived from it beyond a plain address)
+    //! never reaches an API response body, not just a doc comment
+    //! claiming so. Uses the standard, universally-public BIP-39 test
+    //! mnemonic (same one `wallet_derivation.rs`'s own tests use) set via
+    //! a real env var, so `get_delegated_status`/`post_delegated_preflight`
+    //! run their real derivation path end to end — not a mock standing in
+    //! for it.
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use tokio::sync::{mpsc, RwLock};
+
+    const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
+
+    // `std::env::set_var`/`remove_var` mutate real, process-global state —
+    // `cargo test` runs tests in parallel by default, so two tests
+    // sharing one env var NAME would race (one's `remove_var` could fire
+    // while another's derivation is still reading it). Each test below
+    // gets its OWN distinct env var name specifically to make that
+    // impossible, rather than relying on a mutex or `--test-threads=1`.
+    async fn delegated_test_state(mnemonic_env_var: &str) -> SharedState {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("id.db");
+        let key_path = dir.path().join(".session-key");
+        Box::leak(Box::new(dir));
+        let db = crate::db::open(db_path.to_str().unwrap()).await.unwrap();
+        let keys = crate::identity::crypto::load_or_create(key_path.to_str().unwrap()).unwrap();
+
+        let mut cfg = crate::config::test_config();
+        cfg.mint_mode = "seadrop".to_string();
+        cfg.mint_execution = crate::config::MintExecution::Delegated;
+        cfg.delegate_mnemonic_env = mnemonic_env_var.to_string();
+        cfg.delegate_count = 5;
+        cfg.nft_contract = "0x603a481580c8Cf85ee169b315653bd9D33C39e52".to_string();
+        cfg.fee_recipient = "0x0000a26b00c1F0DF003000390027140000fAa719".to_string();
+
+        let (control_tx, _control_rx) = mpsc::channel(8);
+        std::sync::Arc::new(crate::state::AppState {
+            config: RwLock::new(cfg),
+            wallet_status: RwLock::new(Vec::new()),
+            armed: AtomicBool::new(false),
+            bus: bus::new_bus(),
+            control_tx,
+            config_path: "unused-in-this-test".to_string(),
+            api_token: "unused-in-this-test".to_string(),
+            http_client: reqwest::Client::new(),
+            identity_db: db,
+            identity_cookie_key: keys.cookie_key,
+            identity_totp_cipher: keys.totp_cipher,
+            google_oidc: None,
+            webauthn: None,
+            ranked_http_rpc_urls: RwLock::new(Vec::new()),
+        })
+    }
+
+    async fn body_string(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn delegated_status_response_never_contains_the_mnemonic() {
+        const ENV_VAR: &str = "MINT_SNIPER_TEST_MNEMONIC_STATUS";
+        std::env::set_var(ENV_VAR, TEST_MNEMONIC);
+        let state = delegated_test_state(ENV_VAR).await;
+
+        let resp = get_delegated_status(State(state)).await.into_response();
+        let body = body_string(resp).await;
+
+        std::env::remove_var(ENV_VAR);
+
+        // The mnemonic itself, or any individual word of it (a partial
+        // leak is still a leak), must never appear.
+        assert!(!body.contains(TEST_MNEMONIC), "full mnemonic phrase leaked into response body");
+        for word in TEST_MNEMONIC.split_whitespace() {
+            assert!(!body.contains(word), "mnemonic word '{word}' leaked into response body");
+        }
+        // The response must still be real, useful data — this is a
+        // positive assertion, not just "the forbidden string is absent
+        // from an otherwise-empty body."
+        assert!(body.contains("operator_address"), "expected a real status response: {body}");
+        assert!(body.contains("receivers"), "expected a real status response: {body}");
+    }
+
+    #[tokio::test]
+    async fn delegated_preflight_response_never_contains_the_mnemonic() {
+        const ENV_VAR: &str = "MINT_SNIPER_TEST_MNEMONIC_PREFLIGHT";
+        std::env::set_var(ENV_VAR, TEST_MNEMONIC);
+        let state = delegated_test_state(ENV_VAR).await;
+
+        // No real RPC access in this test environment — the preflight
+        // call itself will fail (network unreachable), which is fine:
+        // this test's only claim is about what DOES appear in whatever
+        // response comes back, error or not.
+        let resp = post_delegated_preflight(State(state)).await.into_response();
+        let body = body_string(resp).await;
+
+        std::env::remove_var(ENV_VAR);
+
+        assert!(!body.contains(TEST_MNEMONIC), "full mnemonic phrase leaked into response body");
+        for word in TEST_MNEMONIC.split_whitespace() {
+            assert!(!body.contains(word), "mnemonic word '{word}' leaked into response body");
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_status_response_contains_no_64_hex_char_private_key_shaped_string() {
+        // A raw secp256k1 private key is 32 bytes = 64 hex chars. Scans
+        // the WHOLE response body for any contiguous 64-hex-char run —
+        // catches a key leaking through ANY field, not just ones named
+        // suggestively ("key", "secret", etc.), which a name-based grep
+        // alone would miss.
+        const ENV_VAR: &str = "MINT_SNIPER_TEST_MNEMONIC_HEXSCAN";
+        std::env::set_var(ENV_VAR, TEST_MNEMONIC);
+        let state = delegated_test_state(ENV_VAR).await;
+        let resp = get_delegated_status(State(state)).await.into_response();
+        let body = body_string(resp).await;
+        std::env::remove_var(ENV_VAR);
+
+        let body_hex_only: String = body.chars().map(|c| if c.is_ascii_hexdigit() { c } else { ' ' }).collect();
+        let longest_hex_run = body_hex_only
+            .split_whitespace()
+            .map(|run| run.len())
+            .max()
+            .unwrap_or(0);
+        // Addresses are 40 hex chars (20 bytes) — those are expected and
+        // fine (operator_address, every receiver address). A private key
+        // is 64 hex chars (32 bytes) — that must never appear as one
+        // contiguous run.
+        assert!(
+            longest_hex_run < 64,
+            "found a {longest_hex_run}-char contiguous hex run in the response body — a private key is exactly 64 hex chars; body: {body}"
+        );
     }
 }
 

@@ -3391,3 +3391,182 @@ hot-path field reads to use `chain_profile()` is a natural follow-up,
 left for a separate step so this one's "clean refactor, no behavior
 change" claim stays easy to verify by inspection on code that doesn't
 touch real money movement.
+
+## Step 30 — Delegated mint mode (v1, `DELEGATED_SERIAL`)
+
+A second, opt-in mint execution path (MintDash-style: one funded
+OPERATOR wallet pays gas + mint price, N unfunded RECEIVER wallets are
+credited via SeaDrop's `minterIfNotPayer`). `mint_execution = "parallel"`
+remains the default — the existing race path (`wallet.rs`/`executor.rs`)
+is completely untouched, default behavior, and shares no mutable state
+or code path with this feature. `src/delegated/{mod.rs,
+wallet_derivation.rs, preflight.rs, executor.rs}`; `Config`'s
+`mint_execution`/`delegate_mnemonic_env`/`delegate_count` fields;
+`ui/src/components/OperatorPanel.tsx`.
+
+**v1 ships operator → N SEQUENTIAL `mintPublic` calls
+(`DELEGATED_SERIAL`) — never a batched single transaction, no helper/
+factory contract.** Every user-visible label (backend event, API field,
+UI text) says `DELEGATED_SERIAL`; none say "batch" or "one transaction".
+A batched-mint helper contract was explicitly out of scope for v1 per
+the original spec and was not built.
+
+**Wallet derivation** (`wallet_derivation.rs`): single BIP-39 mnemonic,
+standard path `m/44'/60'/0'/0/i` via `alloy::signers::local::
+MnemonicBuilder` (the `signer-mnemonic` alloy feature, not included in
+`"full"` — confirmed by reading alloy 2.4.1's own feature graph, added
+explicitly). Index 0 = operator (only funded wallet, only signer);
+indices `1..=delegate_count` = receivers. The raw mnemonic `String` is
+`zeroize()`'d on every path (success or error) via the new `zeroize`
+direct dependency, on top of (not instead of) alloy-signer-local's own
+internal zeroizing. `DerivedReceiverSet` (a thin wrapper over
+`Vec<Address>`) has no public constructor accepting an externally-
+supplied address list — the only way to get one is
+`derive_operator_and_receivers`, which always derives every address
+itself. This is the type-level enforcement of the hard invariant that
+`minterIfNotPayer` can only ever be an address this codebase itself
+derived — no config flag or API param can supply an arbitrary address.
+
+**Secrets convention matches `private_key_env` exactly**: `config.toml`'s
+`delegate_mnemonic_env` holds an env var *name*, never a value —
+`deploy/mint-sniper.env.example`'s new `OPERATOR_MNEMONIC` entry follows
+the same pattern. `api::delegated_secrets_tests` (backend) and
+`OperatorPanel.test.tsx` (UI, see below) both actively assert the
+mnemonic and any 64-hex-char private-key-shaped string never reach an
+API response body or a rendered DOM node — not just relied on by review.
+
+**Preflight is a mandatory gate before firing, re-run fresh every time,
+never trusted from an earlier check** (`preflight.rs`): simulates
+(`eth_call`, never sent) BOTH `minterIfNotPayer = ZERO` (known-good,
+matches the parallel path's own behavior) and the real delegated call
+(`minterIfNotPayer = receiver`). If ZERO succeeds but the real call
+reverts, that isolates the delta as the minter param itself
+(`MinterMismatch`) — refuses to arm, surfaces the raw revert reason
+verbatim, **never falls back to parallel mode**. If both revert, that's
+an unrelated, separately-reported `OtherFailure`. Computes
+`estimated_max_spend_wei = qty_per_wallet × mint_price × delegate_count +
+delegate_count × gas_estimate × gas_price` before the `eth_call`, and the
+UI's pre-arm summary block shows this figure and requires an explicit
+acknowledgment (the cover-lift gesture below) before firing is possible.
+`executor.rs::run_delegated_mint` re-runs preflight fresh at fire time
+too — nothing from an earlier `/api/delegated/preflight` call is ever
+trusted at the moment of actually spending.
+
+**Config surface is flat, not the nested `[mint]`/`[mint.delegated]`
+TOML table the original spec proposed** — confirmed via direct grep that
+this codebase has no `[mint]` table anywhere; every field is flat at the
+TOML root, so `mint_execution`/`delegate_mnemonic_env`/`delegate_count`
+follow that same convention instead. All three are `#[serde(default)]`,
+default arm is `MintExecution::Parallel`, so every existing `config.toml`
+still parses and validates unmodified (`parallel_mode_ignores_unset_
+delegated_fields_entirely` and the extended backcompat test both cover
+this directly). `MAX_DELEGATES: u32 = 200` (confirmed with the operator,
+not assumed) is a hard ceiling `Config::validate()` enforces alongside
+requiring `mint_mode = "seadrop"` and a non-empty `delegate_mnemonic_env`
+whenever `mint_execution = "delegated"`.
+
+**Nonce-safety semantics in the serial firing loop**
+(`executor::run_delegated_mint`): nonce fetched once, advanced ONLY after
+a real receipt is observed (success OR on-chain revert both consume and
+advance it). A broadcast failure doesn't advance the nonce and the loop
+continues to the next receiver. A receipt-confirmation TIMEOUT leaves
+nonce state genuinely ambiguous, so the loop STOPS entirely rather than
+guessing — avoids both nonce collisions and silently-skipped receivers.
+
+**`ControlMsg::FireDelegated`** (no payload) re-reads config AND
+re-derives operator+receivers fresh at fire time — nothing mnemonic-
+derived ever crosses the `control_tx` channel or lives in `AppState`.
+Deliberately `tokio::spawn`'d in `main.rs`'s `control_loop` (unlike
+`FireCopymint`'s synchronous in-line await) specifically so a
+potentially multi-minute `DELEGATED_SERIAL` run never blocks
+`control_loop` from handling the parallel path's own
+Arm/FireNow/FireCopymint messages — a deliberate divergence, required by
+the "must not slow down the parallel race logic" constraint.
+
+**API routes** (step-up-gated the same as `/api/arm`, same sensitivity
+class): `GET /api/delegated/status` (operator/receiver addresses +
+operator balance, read-only, no step-up needed), `POST /api/delegated/
+preflight` (read-only, no step-up needed — nothing is committed),
+`POST /api/delegated/fire` (step-up-gated — this is the money-moving
+action; named "fire" not "arm" since delegated mode has no separate
+arm-then-wait state the way the watcher does).
+
+**UI** (`ui/src/components/OperatorPanel.tsx`, rendered only when
+`config.mint_execution === "delegated"`; `DelegatedRunStatus.tsx` for the
+live per-receiver status list): header (operator address + balance,
+"only funded wallet" label), capacity line (`delegate_count /
+MAX_DELEGATES active`), receiver table (truncated address + copy, ~0
+balance shown as reassurance — receivers are unfunded by design, not an
+error state), pre-arm summary (contract/qty/delegate_count/estimated max
+spend/`DELEGATED_SERIAL` label) gated behind the SAME cover-lift
+confirm gesture `TriggerConsole.tsx`'s FIRE button already uses
+(confirmed via AskUserQuestion — reuse, not a new modal or a plain
+toggle) before FIRE becomes clickable, live run view (queued → confirmed
+/failed per receiver, tx hash on success, expandable VERBATIM raw revert
+reason on failure — never paraphrased), and the terminal summary card in
+the exact format the spec required. `DelegatedRunStatus.tsx` is a new
+component styled like `CopyOpportunities.tsx`'s existing card
+conventions (confirmed via AskUserQuestion) but not a generalization of
+it — two unrelated features (copy-trading vs. delegated firing) that
+happen to share a visual language, kept deliberately uncoupled.
+Delegated-run state (`DelegatedRunState`) is lifted into `App.tsx`'s
+`Control` component and driven off the same shared WS connection every
+other panel already uses, same pattern as `copyOpportunities`, rather
+than opening a second socket inside `OperatorPanel.tsx` itself.
+
+**First UI test framework in this project — added specifically because
+this spec's own acceptance criteria needed one.** `vitest` +
+`@testing-library/react` (+ `jsdom`, `@testing-library/jest-dom`) as
+dev dependencies; `ui/vitest.config.ts` kept deliberately separate from
+`vite.config.ts` (the PWA plugin has nothing to do with component
+tests); `npm test` script; wired into CI's `ui` job as a new step between
+typecheck and build. `OperatorPanel.test.tsx` is the actual "mnemonic/
+private key never reaches any prop/state/DOM node" test the spec
+required, structured to mirror `api.rs`'s `delegated_secrets_tests`: a
+mock of `lib/api` returns fixture data (real public addresses only,
+never anything mnemonic-shaped), the component is rendered across three
+states (pre-fire, live/complete run, preflight-refused), and the
+rendered container is scanned for the forbidden mnemonic's own words AND
+for any contiguous 64-hex-char (or `0x`+64) run — the exact length of a
+raw private key, checked independent of any specific field name. Caught
+and fixed a real test-isolation bug while writing this (no
+`afterEach(cleanup)` was registered — vitest doesn't auto-wire
+`@testing-library/react`'s cleanup the way Jest's global `afterEach`
+does — so a mounted tree leaked across tests and turned a single-match
+query into a multi-match failure two tests later); fixed in
+`src/test/setup.ts`, not worked around in the test itself.
+
+**Receiver private-key recovery is intentionally NOT an in-app
+feature** — confirmed as already-decided design, not re-opened. No API,
+UI, or log path in this codebase can ever derive, store, or display a
+receiver's private key; recovery is standard BIP-39/BIP-44 derivation
+(`m/44'/60'/0'/0/i`) from the operator's own mnemonic backup, in any
+standard — ideally offline — wallet tool. Documented as RUNBOOK.md
+section 8, including the exact derivation path and a match-the-displayed-
+address sanity check before trusting a derived key.
+
+**Explicit, stated gaps, not silently skipped:**
+- **The "refuse to arm against production from a non-production RPC"
+  preflight sub-requirement was skipped for v1**, per an explicit
+  AskUserQuestion decision — confirmed via direct codebase search that
+  no such concept (mainnet/testnet flag, or anything beyond the
+  unrelated `looks_like_robinhood_chain()` hostname heuristic) exists
+  anywhere in this codebase today. Inventing a new config concept under
+  this feature's own pressure was judged worse than a stated gap.
+- **No live-chain testing of `preflight.rs`/`executor.rs` has been done
+  in this session** — this environment has no funded testnet wallet or
+  live SeaDrop `minterIfNotPayer`-accepting contract to fire against.
+  Everything here is unit-tested (calldata correctness, cross-checked
+  derivation, config backcompat, secrets-never-leak) and code-reviewed,
+  not live-fire-verified — same honesty standard as every other
+  not-yet-live-tested feature in this file (e.g. gap #11).
+- **`OperatorPanel.tsx`'s pre-arm summary omits "chain"** from the
+  spec's suggested drop-name/chain/qty/delegate_count/spend/label list —
+  no chain-name field is available client-side to show honestly (only
+  `chain_id`, read live server-side per `executor.rs`, never surfaced to
+  the UI); showing something invented was judged worse than omitting it.
+
+cargo build/test/clippy: 122/122 tests passing, clean clippy under CI's
+actual `-D warnings` flags. UI: `npm run typecheck`/`npm test` (3/3
+passing)/`npm run build`/`npm audit --omit=dev --audit-level=moderate`
+(0 vulnerabilities) all clean.
