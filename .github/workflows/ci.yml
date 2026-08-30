@@ -234,6 +234,16 @@ jobs:
       - name: deploy/tests/test-diagnose-inclusion-delay.py
         run: python3 mint-sniper/deploy/tests/test-diagnose-inclusion-delay.py
 
+      # STEP 26 — real bug found live on the VPS: benchmark-token.sh's
+      # redeploy mode grabbed the "Deployer:" line's address instead of
+      # "Deployed to:"'s from forge create's stdout, and reused it as the
+      # target for both setMaxSupply and updatePublicDrop — both calls
+      # silently no-op'd against the deployer's own EOA, leaving the real
+      # contract unconfigured. See deploy/lib/parse_deployed_address.sh's
+      # header for the full root cause.
+      - name: deploy/tests/test-parse-deployed-address.sh
+        run: mint-sniper/deploy/tests/test-parse-deployed-address.sh
+
   secrets:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
