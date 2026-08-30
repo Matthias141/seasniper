@@ -244,6 +244,15 @@ jobs:
       - name: deploy/tests/test-parse-deployed-address.sh
         run: mint-sniper/deploy/tests/test-parse-deployed-address.sh
 
+      # STEP 27 — real bug found live: run-benchmark.sh's BENCHMARK_CHECK_ADDR
+      # had one hardcoded default with no way to pick up a later
+      # benchmark-token.sh redeploy's fresh address, so an operator
+      # following the documented usage literally kept silently re-checking
+      # a stale token. See deploy/lib/resolve_benchmark_address.sh's header
+      # for the full root cause and the auto-discovery fix.
+      - name: deploy/tests/test-resolve-benchmark-address.sh
+        run: mint-sniper/deploy/tests/test-resolve-benchmark-address.sh
+
   secrets:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest

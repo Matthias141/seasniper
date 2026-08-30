@@ -19,3 +19,10 @@ identity.db
 identity.db-wal
 identity.db-shm
 .session-key
+
+# STEP 27 — run-benchmark.sh's auto-discovered "last redeployed benchmark
+# token" state file (deploy/lib/resolve_benchmark_address.sh). Purely
+# operator-VPS runtime state (which testnet contract benchmark-token.sh
+# last redeployed), never something to commit — same treatment as every
+# other *.backup/runtime file in deploy/ already excluded below.
+deploy/.benchmark-token-address

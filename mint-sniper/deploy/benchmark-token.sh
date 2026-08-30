@@ -71,7 +71,22 @@ case "$MODE" in
       exit 1
     fi
 
-    echo "==> calling getPublicDrop($NFT_CONTRACT) on the SeaDrop singleton"
+    # STEP 27 — every human-readable diagnostic line below (this one
+    # included) now goes to STDERR, not stdout. Only the final machine-
+    # parseable `BENCHMARK_NFT_CONTRACT=` line (on success) stays on
+    # stdout. Real bug this fixes: run-benchmark.sh captures this
+    # command's stdout into a variable (`CHECK_OUTPUT=$(...)`) to grep
+    # that one line back out — under `set -euo pipefail`, a nonzero exit
+    # from THIS script (EXPIRED / endTime unreadable) aborted
+    # run-benchmark.sh at that exact assignment line, before it ever got
+    # to `echo "$CHECK_OUTPUT"` — so the real reason (which WAS correctly
+    # captured, just never printed) was silently lost, leaving nothing but
+    # a bare non-zero exit. Moving diagnostics to stderr means they show
+    # up on the operator's terminal live, as they happen, regardless of
+    # what any caller does with stdout — see run-benchmark.sh's own
+    # step 27 comment for the matching caller-side fix (it no longer lets
+    # `set -e` silently abort past this call either).
+    echo "==> calling getPublicDrop($NFT_CONTRACT) on the SeaDrop singleton" >&2
     # Struct order confirmed directly against seadrop's own
     # SeaDropStructs.sol (not assumed): mintPrice(uint80),
     # startTime(uint48), endTime(uint48), maxTotalMintableByWallet(uint16),
@@ -80,7 +95,7 @@ case "$MODE" in
     RESULT=$(cast call "$SEADROP_SINGLETON" \
       "getPublicDrop(address)(uint80,uint48,uint48,uint16,uint16,bool)" \
       "$NFT_CONTRACT" --rpc-url "$RPC_URL")
-    echo "$RESULT"
+    echo "$RESULT" >&2
 
     # STEP 15c FOLLOW-UP — a real bug found live on the VPS: cast's
     # DEFAULT text output annotates any integer it judges "large" with a
@@ -103,29 +118,30 @@ case "$MODE" in
     NOW=$(date +%s)
 
     if [[ -z "$END_TIME" || "$END_TIME" == "0" ]]; then
-      echo
-      echo "==> endTime is 0 or unreadable — this nft_contract likely has no"
-      echo "    public drop configured on this SeaDrop singleton at all (never"
-      echo "    deployed, or deployed against a different seadrop_address)."
-      echo "    Run: $0 redeploy"
+      echo >&2
+      echo "==> endTime is 0 or unreadable — this nft_contract likely has no" >&2
+      echo "    public drop configured on this SeaDrop singleton at all (never" >&2
+      echo "    deployed, or deployed against a different seadrop_address)." >&2
+      echo "    Run: $0 redeploy" >&2
       exit 1
     fi
 
     if (( END_TIME > NOW )); then
       REMAINING=$(( (END_TIME - NOW) / 3600 ))
-      echo
-      echo "==> STILL LIVE. endTime=$END_TIME (now=$NOW), ~${REMAINING}h remaining."
-      echo "    Use this contract address for step 15e's benchmark:"
-      echo "      $NFT_CONTRACT"
+      echo >&2
+      echo "==> STILL LIVE. endTime=$END_TIME (now=$NOW), ~${REMAINING}h remaining." >&2
+      echo "    Use this contract address for step 15e's benchmark:" >&2
+      echo "      $NFT_CONTRACT" >&2
       # STEP 15e FOLLOW-UP — machine-parseable line for run-benchmark.sh
       # to grep out, so it reuses this check's confirmed-live address
-      # instead of a second, independently-hardcoded copy of it.
+      # instead of a second, independently-hardcoded copy of it. This is
+      # the ONE line from `check` mode that stays on stdout (step 27).
       echo "BENCHMARK_NFT_CONTRACT=$NFT_CONTRACT"
     else
       EXPIRED_HOURS=$(( (NOW - END_TIME) / 3600 ))
-      echo
-      echo "==> EXPIRED. endTime=$END_TIME (now=$NOW), expired ~${EXPIRED_HOURS}h ago."
-      echo "    Run: $0 redeploy"
+      echo >&2
+      echo "==> EXPIRED. endTime=$END_TIME (now=$NOW), expired ~${EXPIRED_HOURS}h ago." >&2
+      echo "    Run: $0 redeploy" >&2
       exit 1
     fi
     ;;
@@ -209,6 +225,17 @@ case "$MODE" in
       "$SEADROP_SINGLETON" \
       "(0,$START_TIME,$END_TIME,65535,0,false)" \
       --rpc-url "$RPC_URL" --private-key "$DEPLOYER_PK"
+
+    # STEP 27 — persist the fresh address so run-benchmark.sh's own
+    # BENCHMARK_CHECK_ADDR discovery (deploy/lib/resolve_benchmark_address.sh)
+    # picks it up automatically on the next run, instead of silently
+    # re-checking a now-stale hardcoded default until an operator manually
+    # remembers to override it. Gitignored (deploy/.benchmark-token-address)
+    # — operator-VPS runtime state, never repo content.
+    echo "$NFT_CONTRACT" > "$SCRIPT_DIR/.benchmark-token-address"
+    echo "==> recorded $NFT_CONTRACT in $SCRIPT_DIR/.benchmark-token-address"
+    echo "    (run-benchmark.sh reads this automatically as its default"
+    echo "    benchmark check address from now on — no manual step needed)"
 
     echo
     echo "==> done. New benchmark token: $NFT_CONTRACT"
