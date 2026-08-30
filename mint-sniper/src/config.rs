@@ -14,6 +14,21 @@ pub struct Config {
     pub ws_rpc_url: String,
     pub http_rpc_urls: Vec<String>,
 
+    /// Optional dedicated sequencer JSON-RPC URL. Empty = unset. When set,
+    /// `fire_prepared` submits `eth_sendRawTransaction` here first, then
+    /// fans out to `http_rpc_urls` as backup. On Robinhood Chain this is
+    /// `https://sequencer.{mainnet,testnet}.chain.robinhood.com`.
+    #[serde(default)]
+    pub sequencer_http_url: String,
+
+    /// Optional WS URL used only by `inclusion::establish_block_ticker`
+    /// (post-fire receipt PUSH). Empty = use `ws_rpc_url`. Alchemy (or any
+    /// third-party) `eth_subscribe` PUSH means receipt-seen-by-this-RPC,
+    /// not sequencer-included. Do NOT point this at the Nitro feed
+    /// (`wss://feed.*.chain.robinhood.com`) — that is not an eth WS.
+    #[serde(default)]
+    pub inclusion_ws_url: String,
+
     /// STEP 14a — the configured chain's expected block time. Used ONLY
     /// to size `inclusion::wait_for_receipt`'s HTTP-polling fallback
     /// interval when the WS push path can't be established — never
@@ -86,6 +101,11 @@ pub struct Config {
     pub jitter_ms_min: u64,
     pub jitter_ms_max: u64,
     pub gas_jitter_pct: u64,
+    /// When true, fire-path jitter must be zero: `validate` fails if
+    /// `jitter_ms_max > 0` (and also if min / gas jitter are non-zero).
+    /// Default false so existing configs keep their anti-clustering jitter.
+    #[serde(default)]
+    pub race_mode: bool,
     pub wallets: Vec<WalletCfg>,
 
     /// --- copymint (step 6) — see src/copymint.rs's doc comment for the
@@ -240,7 +260,7 @@ impl Config {
     /// config.toml edited by hand and a bad PUT from the UI get the same
     /// treatment.
     pub fn validate(&self) -> Result<()> {
-        for url in std::iter::once(&self.ws_rpc_url).chain(self.http_rpc_urls.iter()) {
+        for url in self.rpc_urls_to_validate() {
             let parsed = url::Url::parse(url).with_context(|| format!("invalid RPC url: {url}"))?;
 
             // STEP 17 FINDING — alloy's `WsConnect::new()` silently parses
@@ -320,6 +340,53 @@ impl Config {
             );
         }
 
+        if self.race_mode {
+            if self.jitter_ms_max > 0 {
+                anyhow::bail!(
+                    "race_mode is set but jitter_ms_max is {} — race_mode requires jitter_ms_max = 0 \
+                     (fire-path jitter is a self-imposed delay on a ~227ms block time)",
+                    self.jitter_ms_max
+                );
+            }
+            if self.jitter_ms_min > 0 {
+                anyhow::bail!(
+                    "race_mode is set but jitter_ms_min is {} — race_mode requires jitter_ms_min = 0",
+                    self.jitter_ms_min
+                );
+            }
+            if self.gas_jitter_pct > 0 {
+                anyhow::bail!(
+                    "race_mode is set but gas_jitter_pct is {} — race_mode requires gas_jitter_pct = 0",
+                    self.gas_jitter_pct
+                );
+            }
+            // P0 follow-up 18b — a race_mode config with sequencer_http_url
+            // set but http_rpc_urls left empty (the exact shape this
+            // feature encourages: race the sequencer, treat backups as
+            // optional) used to leave inclusion confirmation structurally
+            // impossible whenever the sequencer's own connection wasn't
+            // reused for polling. That reuse is fixed in executor.rs now,
+            // but a config with BOTH left empty is still unfireable — there
+            // would be nothing to broadcast to at all — so reject that
+            // shape here rather than let it silently pass validate() and
+            // fail confusingly at fire time.
+            if self.sequencer_http_url.is_empty() && self.http_rpc_urls.is_empty() {
+                anyhow::bail!(
+                    "race_mode is set but both sequencer_http_url and http_rpc_urls are empty — \
+                     at least one broadcast target is required"
+                );
+            }
+        }
+
+        if self.looks_like_robinhood_chain() && self.block_time_ms == 12_000 {
+            anyhow::bail!(
+                "this config looks like Robinhood Chain (sequencer_http_url is set or a \
+                 chain.robinhood.com host is present) but block_time_ms is still 12000 \
+                 (the Ethereum mainnet default). Set block_time_ms to the RH block time \
+                 (227 ms) so inclusion polling is not a 12s sleep"
+            );
+        }
+
         if self.trigger_mode == "timestamp" && self.trigger_timestamp_unix != 0 {
             let now = bus::now_ts();
             // Upper bound catches the classic unit mistake (pasting a
@@ -372,6 +439,36 @@ impl Config {
         Ok(())
     }
 
+    fn rpc_urls_to_validate(&self) -> impl Iterator<Item = &String> {
+        std::iter::once(&self.ws_rpc_url)
+            .chain(self.http_rpc_urls.iter())
+            .chain(std::iter::once(&self.sequencer_http_url).filter(|u| !u.is_empty()))
+            .chain(std::iter::once(&self.inclusion_ws_url).filter(|u| !u.is_empty()))
+    }
+
+    fn looks_like_robinhood_chain(&self) -> bool {
+        let host_is_rh = |u: &str| {
+            url::Url::parse(u)
+                .ok()
+                .and_then(|p| p.host_str().map(str::to_string))
+                .map(|h| h.contains("chain.robinhood.com"))
+                .unwrap_or_else(|| u.contains("chain.robinhood.com"))
+        };
+        !self.sequencer_http_url.is_empty()
+            || host_is_rh(&self.sequencer_http_url)
+            || host_is_rh(&self.ws_rpc_url)
+            || host_is_rh(&self.inclusion_ws_url)
+            || self.http_rpc_urls.iter().any(|u| host_is_rh(u))
+    }
+
+    pub fn block_ticker_ws_url(&self) -> &str {
+        if self.inclusion_ws_url.is_empty() {
+            &self.ws_rpc_url
+        } else {
+            &self.inclusion_ws_url
+        }
+    }
+
     /// Resolves each wallet's private key from its configured env var.
     /// Fails loudly (not silently skips) if any var is unset — a missing wallet
     /// at trigger time is worse than a startup crash.
@@ -421,6 +518,8 @@ pub(crate) fn test_config() -> Config {
     Config {
             ws_rpc_url: "wss://eth-mainnet.g.alchemy.com/v2/KEY".to_string(),
             http_rpc_urls: vec!["https://eth-mainnet.g.alchemy.com/v2/KEY".to_string()],
+            sequencer_http_url: String::new(),
+            inclusion_ws_url: String::new(),
             block_time_ms: default_block_time_ms(),
             inclusion_timeout_ms: default_inclusion_timeout_ms(),
             mint_mode: default_mint_mode(),
@@ -441,6 +540,7 @@ pub(crate) fn test_config() -> Config {
             jitter_ms_min: 40,
             jitter_ms_max: 400,
             gas_jitter_pct: 8,
+            race_mode: false,
             wallets: vec![WalletCfg {
                 private_key_env: "SNIPER_PK_1".to_string(),
             }],
@@ -646,6 +746,9 @@ mod tests {
         assert!(cfg.copymint_auto_fire_free, "free copymints must default to auto-fireable");
         assert!(!cfg.copymint_auto_fire_paid, "paid copymints must default to NOT auto-fireable");
         assert_eq!(cfg.max_copymint_price_wei, 0, "paid ceiling must default to 0 (nothing fireable until raised)");
+        assert!(!cfg.race_mode, "race_mode must default to false");
+        assert!(cfg.sequencer_http_url.is_empty(), "sequencer_http_url must default to unset");
+        assert!(cfg.inclusion_ws_url.is_empty(), "inclusion_ws_url must default to unset");
     }
 
     #[test]
@@ -689,5 +792,60 @@ mod tests {
         cfg.trigger_mode = "poll_state".to_string();
         cfg.trigger_timestamp_unix = 1; // long past, would fail if checked
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_race_mode_with_nonzero_jitter_max() {
+        let mut cfg = test_config();
+        cfg.race_mode = true;
+        cfg.jitter_ms_min = 0;
+        cfg.jitter_ms_max = 400;
+        cfg.gas_jitter_pct = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("race_mode"), "{err}");
+        assert!(err.contains("jitter_ms_max"), "{err}");
+    }
+
+    #[test]
+    fn accepts_race_mode_with_zero_jitter() {
+        let mut cfg = test_config();
+        cfg.race_mode = true;
+        cfg.jitter_ms_min = 0;
+        cfg.jitter_ms_max = 0;
+        cfg.gas_jitter_pct = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_robinhood_shaped_config_with_mainnet_block_time() {
+        let mut cfg = test_config();
+        cfg.sequencer_http_url = "https://sequencer.mainnet.chain.robinhood.com".to_string();
+        cfg.block_time_ms = 12_000;
+        cfg.inclusion_timeout_ms = 30_000;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("Robinhood"), "{err}");
+        assert!(err.contains("12000"), "{err}");
+    }
+
+    #[test]
+    fn accepts_robinhood_shaped_config_with_fast_block_time() {
+        let mut cfg = test_config();
+        cfg.sequencer_http_url = "https://sequencer.mainnet.chain.robinhood.com".to_string();
+        cfg.http_rpc_urls = vec!["https://rpc.mainnet.chain.robinhood.com".to_string()];
+        cfg.block_time_ms = 227;
+        cfg.inclusion_timeout_ms = 5_000;
+        cfg.race_mode = true;
+        cfg.jitter_ms_min = 0;
+        cfg.jitter_ms_max = 0;
+        cfg.gas_jitter_pct = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn looks_like_robinhood_when_http_rpc_host_is_rh_even_without_sequencer() {
+        let mut cfg = test_config();
+        cfg.http_rpc_urls = vec!["https://rpc.mainnet.chain.robinhood.com".to_string()];
+        cfg.block_time_ms = 12_000;
+        assert!(cfg.validate().is_err());
     }
 }
