@@ -313,6 +313,14 @@ fn resolved_target_json(r: &target::ResolvedTarget, now: u64) -> serde_json::Val
         // fee_recipient isn't accepted. The UI should gate its "set as
         // active target" action on this, not just fee_recipient_ok alone.
         "settable": r.is_live(now) && r.fee_recipient_ok,
+        // STEP 29b — additional signals alongside the existing
+        // namesquatting warning; neither blocks resolution or replaces
+        // human judgment. contract_age_secs is null when it couldn't be
+        // determined — the UI must not read null as "old and safe."
+        "contract_age_secs": r.contract_age_secs,
+        "goplus_malicious": r.goplus.malicious_nft_contract,
+        "goplus_create_block_number": r.goplus.create_block_number,
+        "goplus_concerning": r.goplus.is_concerning(),
     })
 }
 
