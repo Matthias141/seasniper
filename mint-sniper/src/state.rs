@@ -68,6 +68,22 @@ pub enum ControlMsg {
         mint_calldata: Vec<u8>,
         mint_value: U256,
     },
+    /// Delegated mint mode (v1) — see `delegated/executor.rs`'s own doc
+    /// comment for the full DELEGATED_SERIAL design. No payload: the
+    /// handler re-reads `mint_execution`/`delegate_mnemonic_env`/
+    /// `delegate_count`/`nft_contract`/`fee_recipient`/
+    /// `quantity_per_wallet` fresh from `state.config` at the moment of
+    /// firing, and derives the operator + receivers fresh from the
+    /// mnemonic right there too — nothing mnemonic-derived is ever
+    /// carried over this channel or held anywhere in `AppState`. Sent
+    /// only from `api.rs`'s `/api/delegated/fire` route (step-up-gated,
+    /// same sensitivity class as `/api/arm`), after that route's own
+    /// mint_execution == "delegated" check. Routed through control_tx
+    /// like every other wallet-touching action, for the same
+    /// single-writer reason as Arm/FireNow/FireCopymint — this does NOT
+    /// call `executor::prepare_fire`/`fire_prepared` and shares no
+    /// mutable state with the parallel-EOA path.
+    FireDelegated,
 }
 
 pub struct AppState {

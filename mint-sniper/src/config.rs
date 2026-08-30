@@ -9,6 +9,29 @@ pub struct WalletCfg {
     pub private_key_env: String,
 }
 
+/// Delegated mint mode (v1) — hardcoded ceiling on `delegate_count`,
+/// confirmed with the operator directly before landing this value (not
+/// picked unilaterally). Enforced in `Config::validate()`, and mirrored
+/// in the UI's capacity indicator (`delegate_count / MAX_DELEGATES
+/// active`) — see `ui/src/components/OperatorPanel.tsx`.
+pub const MAX_DELEGATES: u32 = 200;
+
+/// Delegated mint mode (v1) — which execution path fires a mint.
+/// `Parallel` (default) is the existing, untouched N-funded-wallet race
+/// path (`wallet.rs`/`executor.rs`); `Delegated` is the new, opt-in
+/// DELEGATED_SERIAL path (`delegated/executor.rs`) — one funded operator
+/// wallet, N unfunded receiver wallets credited via SeaDrop's
+/// `minterIfNotPayer`. `#[serde(default)]` + the `#[default]` variant
+/// attribute below means every config.toml that predates this field
+/// still deserializes to `Parallel` with zero behavior change.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MintExecution {
+    #[default]
+    Parallel,
+    Delegated,
+}
+
 /// STEP 29d — a structured, read-only VIEW over `Config`'s per-chain
 /// tuning fields, grouped in one place. Per step 24d's own finding: with
 /// three chains now relevant (Ethereum, Robinhood Chain, InkChain) and
@@ -104,6 +127,34 @@ pub struct Config {
     /// or "seadrop" (fixed ISeaDrop.mintPublic ABI, see src/seadrop.rs).
     #[serde(default = "default_mint_mode")]
     pub mint_mode: String,
+
+    /// Delegated mint mode (v1) — see `MintExecution`'s own doc comment.
+    /// Flat field at the config root, matching every other field in this
+    /// struct (`mint_mode`, `trigger_mode`, etc.) — this feature's
+    /// original spec proposed a nested `[mint]`/`[mint.delegated]` TOML
+    /// table, which does not match this codebase's actual, established
+    /// convention (checked directly: `config.example.toml` has no `[mint]`
+    /// table anywhere, every field is flat at the root). Adapted to match
+    /// what's actually here rather than introducing a new nesting
+    /// pattern found nowhere else in this file.
+    #[serde(default)]
+    pub mint_execution: MintExecution,
+    /// Env var NAME holding the BIP-39 mnemonic — same name-not-value
+    /// convention as `WalletCfg::private_key_env`/`opensea_api_key_env`/
+    /// `google_oauth_client_secret_env`. Only read (via `std::env::var`)
+    /// at the moment of firing, inside `delegated::executor::
+    /// run_delegated_mint` — never stored, logged, or round-tripped to
+    /// the UI/API. Required (and validated below) only when
+    /// `mint_execution = "delegated"`.
+    #[serde(default)]
+    pub delegate_mnemonic_env: String,
+    /// How many receiver addresses to derive (HD indices `1..=delegate_count`
+    /// — index 0 is always the operator). Bounded by `MAX_DELEGATES` (200,
+    /// confirmed with the operator before being hardcoded — see
+    /// `delegated/mod.rs`), enforced in `validate()` below, not just
+    /// documented here.
+    #[serde(default)]
+    pub delegate_count: u32,
 
     pub contract_address: String,
     pub mint_fn_signature: String,
@@ -540,6 +591,37 @@ impl Config {
                 .with_context(|| format!("invalid google_oauth_redirect_url: {}", self.google_oauth_redirect_url))?;
         }
 
+        // Delegated mint mode (v1) — same "catch a bad shape at startup/
+        // save time" principle as every other check here. Only enforced
+        // when mint_execution = "delegated"; a Parallel config (the
+        // default) never even looks at delegate_mnemonic_env/
+        // delegate_count, so an existing deployment upgrading into this
+        // field's mere existence sees zero new validation constraints.
+        if self.mint_execution == MintExecution::Delegated {
+            if self.mint_mode != "seadrop" {
+                anyhow::bail!(
+                    "mint_execution = \"delegated\" requires mint_mode = \"seadrop\" — delegated \
+                     mode relies on SeaDrop's minterIfNotPayer parameter, which has no equivalent \
+                     in mint_mode = \"custom\""
+                );
+            }
+            if self.delegate_mnemonic_env.is_empty() {
+                anyhow::bail!(
+                    "mint_execution = \"delegated\" requires delegate_mnemonic_env to be set (the \
+                     name of an env var holding the BIP-39 mnemonic — see mint-sniper.env.example)"
+                );
+            }
+            if self.delegate_count == 0 {
+                anyhow::bail!("mint_execution = \"delegated\" requires delegate_count >= 1");
+            }
+            if self.delegate_count > MAX_DELEGATES {
+                anyhow::bail!(
+                    "delegate_count ({}) exceeds MAX_DELEGATES ({MAX_DELEGATES})",
+                    self.delegate_count
+                );
+            }
+        }
+
         // STEP 29a — same "catch a bad shape at startup/save time" as every
         // other check here. Empty is a deliberate, valid "check disabled"
         // shape (see clock_check_url's own doc comment) — only a
@@ -660,6 +742,9 @@ pub(crate) fn test_config() -> Config {
             block_time_ms: default_block_time_ms(),
             inclusion_timeout_ms: default_inclusion_timeout_ms(),
             mint_mode: default_mint_mode(),
+            mint_execution: MintExecution::default(),
+            delegate_mnemonic_env: String::new(),
+            delegate_count: 0,
             contract_address: "0x000000000000000000000000000000000000dEaD".to_string(),
             mint_fn_signature: "mint(uint256)".to_string(),
             mint_fn_args_template: vec!["1".to_string()],
@@ -933,6 +1018,78 @@ mod tests {
         assert_eq!(cfg.clock_check_url, default_clock_check_url(), "clock_check_url must default to the built-in check endpoint");
         assert_eq!(cfg.clock_drift_warn_ms, 1500, "clock_drift_warn_ms must default to 1500");
         assert_eq!(cfg.clock_drift_refuse_arm_ms, 0, "clock_drift_refuse_arm_ms must default to 0 (disabled) — an existing deployment must see zero behavior change on upgrade");
+        // Delegated mint mode (v1) — an old config predating this field
+        // entirely must still parse, and mint_execution must default to
+        // Parallel: the existing, untouched race path, not a mode change
+        // no operator asked for.
+        assert_eq!(cfg.mint_execution, MintExecution::Parallel, "mint_execution must default to Parallel");
+        assert!(cfg.delegate_mnemonic_env.is_empty(), "delegate_mnemonic_env must default to unset");
+        assert_eq!(cfg.delegate_count, 0, "delegate_count must default to 0");
+        assert!(cfg.validate().is_ok(), "an old, Parallel-mode config must still validate cleanly");
+    }
+
+    // --- Delegated mint mode (v1) ---
+
+    #[test]
+    fn delegated_mode_requires_mnemonic_env_and_delegate_count() {
+        let mut cfg = test_config();
+        cfg.mint_mode = "seadrop".to_string();
+        cfg.mint_execution = MintExecution::Delegated;
+        // delegate_mnemonic_env and delegate_count both still unset/0.
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("delegate_mnemonic_env"), "{err}");
+    }
+
+    #[test]
+    fn delegated_mode_requires_seadrop_mint_mode() {
+        let mut cfg = test_config();
+        cfg.mint_mode = "custom".to_string();
+        cfg.mint_execution = MintExecution::Delegated;
+        cfg.delegate_mnemonic_env = "OPERATOR_MNEMONIC".to_string();
+        cfg.delegate_count = 5;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("mint_mode"), "{err}");
+    }
+
+    #[test]
+    fn delegated_mode_rejects_zero_delegate_count() {
+        let mut cfg = test_config();
+        cfg.mint_mode = "seadrop".to_string();
+        cfg.mint_execution = MintExecution::Delegated;
+        cfg.delegate_mnemonic_env = "OPERATOR_MNEMONIC".to_string();
+        cfg.delegate_count = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn delegated_mode_rejects_delegate_count_over_max() {
+        let mut cfg = test_config();
+        cfg.mint_mode = "seadrop".to_string();
+        cfg.mint_execution = MintExecution::Delegated;
+        cfg.delegate_mnemonic_env = "OPERATOR_MNEMONIC".to_string();
+        cfg.delegate_count = MAX_DELEGATES + 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("MAX_DELEGATES") || err.contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn delegated_mode_accepts_a_well_formed_config() {
+        let mut cfg = test_config();
+        cfg.mint_mode = "seadrop".to_string();
+        cfg.mint_execution = MintExecution::Delegated;
+        cfg.delegate_mnemonic_env = "OPERATOR_MNEMONIC".to_string();
+        cfg.delegate_count = MAX_DELEGATES; // exactly at the ceiling — must be accepted, not rejected
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn parallel_mode_ignores_unset_delegated_fields_entirely() {
+        // The default MintExecution::Parallel with delegate_mnemonic_env
+        // empty and delegate_count 0 must validate cleanly — this is
+        // exactly what every existing config.toml looks like today.
+        let cfg = test_config();
+        assert_eq!(cfg.mint_execution, MintExecution::Parallel);
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

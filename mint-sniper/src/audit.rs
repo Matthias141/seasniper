@@ -151,6 +151,30 @@ pub async fn run_audit_writer(bus: EventBus, path: String) {
                     "fireable": fireable,
                 }),
             ),
+            ServerEvent::DelegatedRunStarted { delegate_count, estimated_max_spend_wei } => (
+                "delegated_run_started",
+                serde_json::json!({
+                    "delegate_count": delegate_count,
+                    "estimated_max_spend_wei": estimated_max_spend_wei,
+                }),
+            ),
+            ServerEvent::DelegatedMintResult { receiver_index, receiver_address, success, detail } => (
+                "delegated_mint_result",
+                serde_json::json!({
+                    "receiver_index": receiver_index,
+                    "receiver_address": receiver_address,
+                    "success": success,
+                    "detail": detail,
+                }),
+            ),
+            ServerEvent::DelegatedRunComplete { minted, attempted, total_cost_wei } => (
+                "delegated_run_complete",
+                serde_json::json!({
+                    "minted": minted,
+                    "attempted": attempted,
+                    "total_cost_wei": total_cost_wei,
+                }),
+            ),
             // Log/WalletUpdate/RpcHealth are routine and/or high-volume —
             // not what RUNBOOK.md's checklists need a durable record of.
             // Deliberately not persisted here; bus.rs's live feed still
