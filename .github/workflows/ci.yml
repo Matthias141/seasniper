@@ -129,7 +129,7 @@ jobs:
           ignore: RUSTSEC-2023-0071
 
   ui:
-    name: UI (typecheck, build, audit)
+    name: UI (typecheck, test, build, audit)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -149,6 +149,16 @@ jobs:
 
       - name: npm run typecheck
         run: npm run typecheck
+
+      - name: npm test
+        # Delegated mint mode (v1) — OperatorPanel.test.tsx's real,
+        # running assertion that mnemonic/private-key material never
+        # reaches any prop/state/DOM node this component can produce,
+        # mirroring api.rs's own delegated_secrets_tests. First real UI
+        # test in this project — vitest + @testing-library/react, added
+        # specifically because this requirement needed something a
+        # backend-only test suite structurally cannot cover.
+        run: npm test
 
       - name: npm run build
         run: npm run build
