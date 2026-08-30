@@ -199,6 +199,53 @@ pub struct Config {
     ///   re-registering devices right after the switch, not mid-incident.
     #[serde(default)]
     pub google_oauth_redirect_url: String,
+
+    /// --- clock drift check (step 29a) ---
+    /// `trigger_mode = "timestamp"` fires purely off the VPS's own system
+    /// clock (`watcher::run_timestamp_watcher` compares `SystemTime::now()`
+    /// against `trigger_timestamp_unix` — no RPC involved at all), so a
+    /// wrong clock silently mistimes every timestamp-mode arm with nothing
+    /// to catch it. HTTPS endpoint used to check clock accuracy at boot
+    /// and (for timestamp mode specifically) fresh at every arm — an HTTP
+    /// `Date`-header comparison, RTT-compensated, NOT true NTP. Confirmed
+    /// this is genuinely simpler and equally reliable for this purpose,
+    /// not assumed: step 24's evaluation of `seadrop-noir-bot` found the
+    /// same approach there too (their own README's "NTP" framing is
+    /// actually this same Date-header technique, confirmed by reading
+    /// their source, not their docs) — true NTP needs a UDP client and a
+    /// new protocol dependency this codebase has no other use for; a
+    /// Date header comes back on every HTTP response for free, reusing
+    /// the `reqwest`/`rustls` stack already used everywhere else here.
+    /// Empty disables the check entirely. Default is a well-known,
+    /// extremely-high-uptime Cloudflare endpoint — Date headers are sent
+    /// by every compliant HTTP server, nothing Cloudflare-specific about
+    /// the mechanism itself; this default is just a dependable choice,
+    /// override it for any other reliable HTTPS host.
+    #[serde(default = "default_clock_check_url")]
+    pub clock_check_url: String,
+    /// Absolute drift (either direction, in ms) at or above this logs a
+    /// loud warning via BOTH `bus::log` and `tracing::warn!` — this
+    /// project's established "both, not either" standard from step 17's
+    /// finding (`bus::log` alone never reaches `journalctl`). 1500ms,
+    /// matching seadrop-noir-bot's own threshold — confirmed the same
+    /// reasoning applies here, not copied blindly: it sits comfortably
+    /// above the Date header's own ~1-second inherent quantization error,
+    /// so this doesn't fire on measurement noise alone.
+    #[serde(default = "default_clock_drift_warn_ms")]
+    pub clock_drift_warn_ms: u64,
+    /// STEP 29a — config-gated hard stop. If `trigger_mode = "timestamp"`
+    /// and a FRESH drift measurement taken at arm time is at or above this
+    /// many ms, refuse to arm at all (log why via both channels, never
+    /// spawn the watcher, never flip `armed` to true) instead of only
+    /// warning. Defaults to 0 = disabled, on purpose: this is a genuine
+    /// hard-failure mode, and an existing deployment upgrading into this
+    /// feature must see zero behavior change until an operator explicitly
+    /// opts in by setting this. Only meaningful for
+    /// `trigger_mode = "timestamp"` — the other trigger modes react to
+    /// real on-chain state over RPC, not the local clock, so a drifted
+    /// clock doesn't threaten their correctness the same way.
+    #[serde(default)]
+    pub clock_drift_refuse_arm_ms: u64,
 }
 
 fn default_mint_mode() -> String {
@@ -206,6 +253,12 @@ fn default_mint_mode() -> String {
 }
 fn default_quantity() -> u64 {
     1
+}
+fn default_clock_check_url() -> String {
+    "https://cloudflare.com/cdn-cgi/trace".to_string()
+}
+fn default_clock_drift_warn_ms() -> u64 {
+    1500
 }
 fn default_copymint_auto_fire_free() -> bool {
     true
@@ -436,6 +489,15 @@ impl Config {
                 .with_context(|| format!("invalid google_oauth_redirect_url: {}", self.google_oauth_redirect_url))?;
         }
 
+        // STEP 29a — same "catch a bad shape at startup/save time" as every
+        // other check here. Empty is a deliberate, valid "check disabled"
+        // shape (see clock_check_url's own doc comment) — only a
+        // non-empty-but-unparseable value is rejected.
+        if !self.clock_check_url.is_empty() {
+            url::Url::parse(&self.clock_check_url)
+                .with_context(|| format!("invalid clock_check_url: {}", self.clock_check_url))?;
+        }
+
         Ok(())
     }
 
@@ -552,6 +614,9 @@ pub(crate) fn test_config() -> Config {
             google_oauth_client_id: String::new(),
             google_oauth_client_secret_env: String::new(),
             google_oauth_redirect_url: String::new(),
+            clock_check_url: default_clock_check_url(),
+            clock_drift_warn_ms: default_clock_drift_warn_ms(),
+            clock_drift_refuse_arm_ms: 0,
         }
     }
 
@@ -749,6 +814,24 @@ mod tests {
         assert!(!cfg.race_mode, "race_mode must default to false");
         assert!(cfg.sequencer_http_url.is_empty(), "sequencer_http_url must default to unset");
         assert!(cfg.inclusion_ws_url.is_empty(), "inclusion_ws_url must default to unset");
+        // STEP 29a
+        assert_eq!(cfg.clock_check_url, default_clock_check_url(), "clock_check_url must default to the built-in check endpoint");
+        assert_eq!(cfg.clock_drift_warn_ms, 1500, "clock_drift_warn_ms must default to 1500");
+        assert_eq!(cfg.clock_drift_refuse_arm_ms, 0, "clock_drift_refuse_arm_ms must default to 0 (disabled) — an existing deployment must see zero behavior change on upgrade");
+    }
+
+    #[test]
+    fn rejects_malformed_clock_check_url() {
+        let mut cfg = test_config();
+        cfg.clock_check_url = "not a url at all".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn empty_clock_check_url_is_valid_and_means_disabled() {
+        let mut cfg = test_config();
+        cfg.clock_check_url = String::new();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

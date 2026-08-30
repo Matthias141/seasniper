@@ -14,6 +14,7 @@ mod config;
 mod copymint;
 mod db;
 mod executor;
+mod goplus;
 mod identity;
 mod inclusion;
 mod opensea;
@@ -54,6 +55,15 @@ async fn main() -> Result<()> {
     // call sites, and why a separate file rather than reusing tracing's
     // stdout output.
     tokio::spawn(audit::run_audit_writer(event_bus.clone(), AUDIT_LOG_PATH.to_string()));
+
+    // STEP 29a — checked once at boot, informationally, for every
+    // deployment (not just trigger_mode = "timestamp" ones — cheap, and
+    // worth knowing about regardless). A fresh, arm-time-gating re-check
+    // happens separately inside control_loop's Arm handler, scoped to
+    // timestamp mode specifically — see that call site's own comment for
+    // why a boot-time-only snapshot isn't good enough for the actual
+    // refusal decision on a long-running process.
+    log_clock_drift_check(&cfg.clock_check_url, cfg.clock_drift_warn_ms, &event_bus).await;
 
     // admin_watch_target is only used by mempool_watch (see
     // watcher::run_mempool_watcher's doc comment for why it's not always
@@ -355,6 +365,133 @@ async fn rpc_health_poll_loop(state: SharedState, http_rpc_urls: Vec<String>) {
     }
 }
 
+/// STEP 29a — parses an RFC 7231 IMF-fixdate HTTP `Date` header value (the
+/// only format a compliant HTTP response is ever allowed to emit for this
+/// header — RFC 9110 §5.6.7: "a sender MUST NOT generate" the two older,
+/// obsolete formats), e.g. `"Sun, 06 Nov 1994 08:49:37 GMT"` -> Unix
+/// timestamp `784111777`. Hand-rolled rather than pulling in a date crate
+/// (`chrono`/`time`/`httpdate`) specifically for this one fixed, guaranteed
+/// format — this project's own "don't add infrastructure the workload
+/// doesn't need" convention (see CLAUDE.md's CMS section) applies just as
+/// well to a dependency as to a deploy-tooling choice. `days_from_civil`
+/// below is Howard Hinnant's well-known proleptic-Gregorian-calendar
+/// algorithm (the same one widely-used C++/date-library implementations
+/// use) — exact, not an approximation, and independently verified against
+/// this exact RFC 7231 example both by hand and in this file's own test.
+fn parse_http_date(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 6 || parts[5] != "GMT" {
+        return None;
+    }
+    let day: i64 = parts[1].parse().ok()?;
+    let month: i64 = match parts[2] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = parts[3].parse().ok()?;
+    let time_parts: Vec<&str> = parts[4].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: i64 = time_parts[0].parse().ok()?;
+    let minute: i64 = time_parts[1].parse().ok()?;
+    let second: i64 = time_parts[2].parse().ok()?;
+
+    let days = days_from_civil(year, month, day);
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// STEP 29a — measures system clock drift via an HTTP `Date`-header
+/// comparison against a reliable HTTPS endpoint, RTT-compensated (the
+/// server's `Date` header is generated roughly halfway through the round
+/// trip, not at receive time — adding half the measured RTT to the
+/// send-time local timestamp before comparing corrects for that, same
+/// technique `seadrop-noir-bot`'s equivalent check uses, confirmed by
+/// reading its source directly — step 24). Returns the measured drift in
+/// milliseconds (local clock minus true time; positive = local clock is
+/// AHEAD), or `None` if the check itself failed (network error, malformed
+/// response, missing/unparseable `Date` header) — treated as non-fatal at
+/// every call site: an unreachable check endpoint says nothing about
+/// whether the VPS's own clock is actually wrong.
+async fn measure_clock_drift_ms(check_url: &str) -> Option<i64> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let sent_at = std::time::SystemTime::now();
+    let resp = client.head(check_url).send().await.ok()?;
+    let rtt = sent_at.elapsed().ok()?;
+
+    let date_header = resp.headers().get(reqwest::header::DATE)?.to_str().ok()?;
+    let server_unix = parse_http_date(date_header)?;
+
+    let local_unix_at_send = sent_at.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs_f64();
+    let compensated_local_unix = local_unix_at_send + rtt.as_secs_f64() / 2.0;
+
+    Some(((compensated_local_unix - server_unix as f64) * 1000.0).round() as i64)
+}
+
+/// STEP 29a — the boot-time (and, for a fresh timestamp-mode arm-time
+/// re-check, reusable) drift measurement + dual-channel logging. Never
+/// itself refuses anything — that decision (config-gated,
+/// `clock_drift_refuse_arm_ms`) lives at the one call site in
+/// `control_loop` that actually needs to act on it, right before a
+/// timestamp-mode watcher would spawn; this function's job is purely
+/// "measure once, log clearly," reused identically by both call sites so
+/// the boot-time log and an arm-time log always mean the same thing.
+async fn log_clock_drift_check(check_url: &str, warn_threshold_ms: u64, bus: &bus::EventBus) -> Option<i64> {
+    if check_url.is_empty() {
+        return None;
+    }
+    match measure_clock_drift_ms(check_url).await {
+        Some(drift_ms) => {
+            if drift_ms.unsigned_abs() >= warn_threshold_ms {
+                let msg = format!(
+                    "system clock drift measured at {drift_ms}ms vs {check_url} — \
+                     trigger_mode = \"timestamp\" timing will be off by roughly this much; \
+                     consider running ntpd/chronyd or correcting the VPS clock"
+                );
+                tracing::warn!(drift_ms, "{msg}");
+                bus::log(bus, "warn", msg);
+            } else {
+                info!(drift_ms, %check_url, "clock drift check: within tolerance");
+            }
+            Some(drift_ms)
+        }
+        None => {
+            let msg = format!(
+                "clock drift check against {check_url} failed (network/parse error) — \
+                 could not verify system clock accuracy; trigger_mode = \"timestamp\" \
+                 timing accuracy is unverified"
+            );
+            tracing::warn!("{msg}");
+            bus::log(bus, "warn", msg);
+            None
+        }
+    }
+}
+
 /// Spawns a watcher future, and if it ever completes with an `Err`, surfaces
 /// that loudly (bus log + auto-disarm) instead of leaving the control panel
 /// showing ARMED while the watcher has silently died.
@@ -497,6 +634,45 @@ async fn control_loop(
                     continue;
                 }
                 let cfg = state.config.read().await.clone();
+
+                // STEP 29a — config-gated hard stop, checked BEFORE any of
+                // the connection warming below or `state.armed.store(true,
+                // ...)` — refusing to arm must mean armed genuinely never
+                // becomes true, not "briefly true then flipped back."
+                // Re-measures fresh here rather than reusing main()'s
+                // boot-time snapshot, on purpose: this codebase's own
+                // established principle (getPublicDrop, target.rs's
+                // resolve-then-set) is "always re-verify fresh before an
+                // action with real consequences, never trust an earlier
+                // read" — a process can run for days, and a clock that was
+                // fine at boot can drift into the refuse threshold long
+                // before anyone restarts it. Scoped to trigger_mode =
+                // "timestamp" only: the other trigger modes react to real
+                // on-chain state over RPC, not the local clock, so a
+                // drifted clock doesn't threaten their correctness the same
+                // way. `clock_drift_refuse_arm_ms == 0` (the default) means
+                // this whole block is a no-op — see that field's own doc
+                // comment for why an existing deployment must see zero
+                // behavior change on upgrade.
+                if cfg.trigger_mode == "timestamp" && cfg.clock_drift_refuse_arm_ms > 0 {
+                    if let Some(drift_ms) =
+                        log_clock_drift_check(&cfg.clock_check_url, cfg.clock_drift_warn_ms, &state.bus).await
+                    {
+                        if drift_ms.unsigned_abs() >= cfg.clock_drift_refuse_arm_ms {
+                            bus::log(
+                                &state.bus,
+                                "error",
+                                format!(
+                                    "REFUSING TO ARM: trigger_mode = \"timestamp\" with system clock drift \
+                                     {drift_ms}ms, at or above clock_drift_refuse_arm_ms ({}) — fix the VPS \
+                                     clock (ntpd/chronyd) or raise/disable this threshold before arming",
+                                    cfg.clock_drift_refuse_arm_ms
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
 
                 // Connection warming happens first and synchronously, before
                 // the watcher spawns or the UI sees "armed" — so every
@@ -1201,5 +1377,44 @@ mod tests {
              expected {EXPECTED_TOTAL_CALL_SITES}) — a call site was added or removed \
              within an already-known file; audit it the same way"
         );
+    }
+
+    // --- STEP 29a: parse_http_date / days_from_civil ---
+
+    #[test]
+    fn parses_rfc_7231s_own_worked_example() {
+        // The exact example RFC 7231/9110 uses for the IMF-fixdate format,
+        // independently verified by hand against the known Unix timestamp
+        // (784111777) — not just "the code agrees with itself."
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784111777));
+    }
+
+    #[test]
+    fn parses_unix_epoch_itself() {
+        assert_eq!(parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"), Some(0));
+    }
+
+    #[test]
+    fn parses_a_recent_realistic_date() {
+        // 2026-08-30 16:00:00 GMT — a real, independently-computed
+        // timestamp (not backed into from the parser itself).
+        assert_eq!(parse_http_date("Sun, 30 Aug 2026 16:00:00 GMT"), Some(1788105600));
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert_eq!(parse_http_date(""), None);
+        assert_eq!(parse_http_date("not a date"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nov 1994 08:49:37 UTC"), None); // wrong TZ token — HTTP dates are always GMT
+        assert_eq!(parse_http_date("Sun, XX Nov 1994 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun, 06 Nvx 1994 08:49:37 GMT"), None); // bad month name
+    }
+
+    #[test]
+    fn days_from_civil_matches_known_reference_points() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0, "the epoch itself");
+        assert_eq!(days_from_civil(1969, 12, 31), -1, "one day before the epoch");
+        assert_eq!(days_from_civil(2000, 2, 29), 11016, "a leap day, independently computed");
+        assert_eq!(days_from_civil(1994, 11, 6), 9075, "matches this file's own RFC 7231 test case");
     }
 }
