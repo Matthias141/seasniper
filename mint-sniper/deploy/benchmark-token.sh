@@ -52,6 +52,7 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${1:-}"
 SEADROP_SINGLETON="0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"  # SEADROP_1_0_MAINNET in seadrop.rs — same CREATE2 address on every EVM chain it's deployed to, confirmed working on Robinhood Chain testnet in step 14b
 SEADROP_REPO="https://github.com/ProjectOpenSea/seadrop.git"
@@ -167,11 +168,27 @@ case "$MODE" in
       --broadcast \
       --constructor-args "mint-sniper-bench" "MSB" "[$SEADROP_SINGLETON]")
     echo "$DEPLOY_OUT"
-    NFT_CONTRACT=$(echo "$DEPLOY_OUT" | grep -oE '0x[a-fA-F0-9]{40}' | head -1)
-    if [[ -z "$NFT_CONTRACT" ]]; then
-      echo "could not parse the deployed contract address out of forge's output above — check it manually" >&2
+    # STEP 26 — real bug found live on the VPS: this used to grep
+    # forge create's ENTIRE stdout for the first 0x[a-fA-F0-9]{40} match,
+    # which captured the "Deployer: 0x..." line's address (forge prints
+    # it BEFORE "Deployed to: 0x...") instead of the actual deployed
+    # contract. Confirmed live against two real on-chain transaction
+    # pairs: the misparsed address was reused as the target for BOTH
+    # setMaxSupply and updatePublicDrop below (same $NFT_CONTRACT
+    # variable), so both calls silently landed on the deployer's own EOA
+    # — a self-send that succeeds trivially and configures nothing.
+    # getPublicDrop against the REAL contract address (read from the
+    # forge-create transaction's own receipt.contractAddress — the actual
+    # ground truth, never a script's own stdout summary) confirmed it:
+    # all-zero PublicDrop, never configured. Fixed by extracting this
+    # into deploy/lib/parse_deployed_address.sh, matching specifically
+    # the "Deployed to:" line — see that file's own doc comment, and
+    # deploy/tests/test-parse-deployed-address.sh for the regression test
+    # against a real-shaped fixture.
+    NFT_CONTRACT=$(echo "$DEPLOY_OUT" | "$SCRIPT_DIR/lib/parse_deployed_address.sh") || {
+      echo "could not find a 'Deployed to: 0x...' line in forge's output above — check it manually" >&2
       exit 1
-    fi
+    }
     echo "==> deployed at $NFT_CONTRACT"
 
     echo "==> setMaxSupply(1000) — comfortably above any planned benchmark attempt count"
