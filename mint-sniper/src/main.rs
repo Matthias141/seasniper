@@ -472,6 +472,7 @@ async fn control_loop(
     // cleared on Disarm and after firing so a stale connection list can
     // never be paired with a fresh prepare, or vice versa.
     let mut warmed_providers: Vec<executor::HttpProvider> = Vec::new();
+    let mut warmed_sequencer: Option<executor::HttpProvider> = None;
     let mut prepared_fire: Option<executor::PreparedFire> = None;
     // STEP 14a — established at Arm time, same lifecycle as
     // warmed_providers and for the same reason: establishing a WS
@@ -502,11 +503,22 @@ async fn control_loop(
                 // endpoint has had its TCP/TLS handshake done at least once
                 // before we're relying on it, not at broadcast time.
                 warmed_providers = executor::warm_connections(&cfg, &state.bus).await;
+                // Same arm-time-not-fire-time warming as the line above, for
+                // the optional sequencer_http_url — see warm_sequencer's own
+                // doc comment. `None` when unset, same "unavailable, fall
+                // back" shape as block_ticker below.
+                warmed_sequencer = executor::warm_sequencer(&cfg, &state.bus).await;
                 // STEP 14a — same "pay this cost now, not at fire time"
                 // principle as the line above. See block_ticker's own
                 // declaration comment for why this can't be deferred to
                 // fire_prepared itself.
-                block_ticker = inclusion::establish_block_ticker(&cfg.ws_rpc_url).await;
+                // inclusion_ws_url, when set, is the PUSH socket for this;
+                // empty falls back to ws_rpc_url (see
+                // Config::block_ticker_ws_url). Do NOT point this at the
+                // Nitro feed (wss://feed.*.chain.robinhood.com) — see
+                // inclusion.rs's own doc comment for why that's not a
+                // drop-in eth WS.
+                block_ticker = inclusion::establish_block_ticker(cfg.block_ticker_ws_url()).await;
                 // STEP 15d — this is the one line 14a's own doc comment
                 // points to as proof PUSH engaged rather than falling back
                 // to POLL, but per step 17's finding, `bus::log` alone
@@ -760,6 +772,7 @@ async fn control_loop(
                         prepared_fire = Some(executor::PreparedFire {
                             wallets: prepared_wallets,
                             providers: warmed_providers.clone(),
+                            sequencer: warmed_sequencer.clone(),
                         });
                     }
                     Err(e) => {
@@ -788,6 +801,7 @@ async fn control_loop(
                 }
                 prepared_fire = None;
                 warmed_providers.clear();
+                warmed_sequencer = None;
                 block_ticker = None; // drops the watch::Sender's clone; the ticker task exits once every receiver is gone
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
@@ -812,7 +826,7 @@ async fn control_loop(
                     // one place next_nonce advances (see prepare_fire's doc
                     // comment for why it doesn't advance on its own).
                     advance_nonces(&mut wallets, &pf.wallets);
-                    executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, &state.bus, trigger_detected_at, block_ticker.clone()).await
+                    executor::fire_prepared(&cfg, &pf.wallets, &pf.providers, pf.sequencer.as_ref(), &state.bus, trigger_detected_at, block_ticker.clone()).await
                 } else {
                     // Manual fire (UI "Fire Now") without a prior arm, or a
                     // prepare that failed above — fall back to signing right
@@ -825,10 +839,13 @@ async fn control_loop(
                         "warn",
                         "firing without a prior prepare — signing now, this will be slower",
                     );
-                    let providers = if warmed_providers.is_empty() {
-                        executor::warm_connections(&cfg, &state.bus).await
+                    let (providers, sequencer) = if warmed_providers.is_empty() {
+                        (
+                            executor::warm_connections(&cfg, &state.bus).await,
+                            executor::warm_sequencer(&cfg, &state.bus).await,
+                        )
                     } else {
-                        warmed_providers.clone()
+                        (warmed_providers.clone(), warmed_sequencer.clone())
                     };
                     // STEP 14a — reuse an already-established arm-time
                     // ticker if one exists (matches warmed_providers'
@@ -839,7 +856,7 @@ async fn control_loop(
                     let ticker_for_fire = if block_ticker.is_some() {
                         block_ticker.clone()
                     } else {
-                        inclusion::establish_block_ticker(&cfg.ws_rpc_url).await
+                        inclusion::establish_block_ticker(cfg.block_ticker_ws_url()).await
                     };
                     match executor::prepare_fire(
                         &cfg,
@@ -854,7 +871,7 @@ async fn control_loop(
                     {
                         Ok(w) => {
                             advance_nonces(&mut wallets, &w);
-                            executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at, ticker_for_fire).await
+                            executor::fire_prepared(&cfg, &w, &providers, sequencer.as_ref(), &state.bus, trigger_detected_at, ticker_for_fire).await
                         }
                         Err(e) => Err(e),
                     }
@@ -879,6 +896,7 @@ async fn control_loop(
                 }
                 prepared_fire = None;
                 warmed_providers.clear();
+                warmed_sequencer = None;
                 block_ticker = None;
                 state.armed.store(false, Ordering::Relaxed);
                 let _ = state.bus.send(bus::ServerEvent::ArmedState { armed: false });
@@ -899,17 +917,20 @@ async fn control_loop(
                 let cfg = state.config.read().await.clone();
                 bus::log(&state.bus, "warn", format!("FIRING copymint opportunity: contract {copy_contract:#x}"));
 
-                let providers = if warmed_providers.is_empty() {
-                    executor::warm_connections(&cfg, &state.bus).await
+                let (providers, sequencer) = if warmed_providers.is_empty() {
+                    (
+                        executor::warm_connections(&cfg, &state.bus).await,
+                        executor::warm_sequencer(&cfg, &state.bus).await,
+                    )
                 } else {
-                    warmed_providers.clone()
+                    (warmed_providers.clone(), warmed_sequencer.clone())
                 };
                 // STEP 14a — same reuse-if-armed, establish-fresh-if-not
                 // logic as FireNow's fallback path above.
                 let ticker_for_fire = if block_ticker.is_some() {
                     block_ticker.clone()
                 } else {
-                    inclusion::establish_block_ticker(&cfg.ws_rpc_url).await
+                    inclusion::establish_block_ticker(cfg.block_ticker_ws_url()).await
                 };
 
                 match executor::prepare_fire(
@@ -925,7 +946,7 @@ async fn control_loop(
                 {
                     Ok(w) => {
                         advance_nonces(&mut wallets, &w);
-                        if let Err(e) = executor::fire_prepared(&cfg, &w, &providers, &state.bus, trigger_detected_at, ticker_for_fire).await {
+                        if let Err(e) = executor::fire_prepared(&cfg, &w, &providers, sequencer.as_ref(), &state.bus, trigger_detected_at, ticker_for_fire).await {
                             bus::log(&state.bus, "error", format!("copymint fire sequence error: {e:#}"));
                         }
                     }
@@ -949,6 +970,7 @@ async fn control_loop(
                 }
                 prepared_fire = None;
                 warmed_providers.clear();
+                warmed_sequencer = None;
                 block_ticker = None; // same conservative "treat like a re-arm" cleanup warmed_providers already gets
                 let was_armed = state.armed.swap(false, Ordering::Relaxed);
                 if was_armed {
