@@ -9,6 +9,51 @@ pub struct WalletCfg {
     pub private_key_env: String,
 }
 
+/// STEP 29d — a structured, read-only VIEW over `Config`'s per-chain
+/// tuning fields, grouped in one place. Per step 24d's own finding: with
+/// three chains now relevant (Ethereum, Robinhood Chain, InkChain) and
+/// `looks_like_robinhood_chain()` already a symptom of these fields being
+/// scattered across the flat `Config` struct with no single "here's what
+/// differs for this chain" location, the risk of a future chain addition
+/// missing a needed value (forgetting `block_time_ms`, the exact class of
+/// bug `looks_like_robinhood_chain()`'s own `validate()` check exists to
+/// catch after the fact) only grows with each chain added.
+///
+/// **Deliberately NOT a chain_id-keyed registry/lookup table** — 24d's
+/// original sketch described resolving one "from `chain_id` at
+/// `validate()` time," but `chain_id` is never trusted from config
+/// anywhere in this codebase (confirmed live per-instance via
+/// `executor.rs`'s `get_chain_id()` call — step 13b/22c's own explicit,
+/// hard-won finding) and `validate()` is synchronous, called from both
+/// `Config::load` and every `PUT /api/config` — making it resolve a
+/// profile from a live RPC call would be a real, risky architecture
+/// change to code that gates every config write, and defeats the whole
+/// "never trust a config-provided chain_id" principle if `chain_id` were
+/// instead added back as a plain config field just to make this lookup
+/// synchronous. This struct is intentionally the smaller, genuinely safe
+/// piece of that idea instead: existing flat `Config` fields, unchanged
+/// in `config.toml`'s schema (zero behavior change for any existing
+/// deployment — confirmed by every existing `Config::validate()` test
+/// still passing unmodified), grouped into one coherent, self-documenting
+/// struct via `Config::chain_profile()`. A genuinely chain-id-keyed
+/// registry remains a real, larger follow-up if ever needed, not
+/// something this step attempts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainProfile {
+    pub block_time_ms: u64,
+    pub inclusion_timeout_ms: u64,
+    pub race_mode: bool,
+    /// `None` when unset — mirrors `Config::sequencer_http_url`'s own
+    /// "empty string means unset" convention, just typed as `Option` here
+    /// since a profile is meant to be read, not round-tripped to TOML.
+    pub sequencer_http_url: Option<String>,
+    pub jitter_ms_min: u64,
+    pub jitter_ms_max: u64,
+    pub gas_jitter_pct: u64,
+    pub priority_fee_multiplier: f64,
+    pub max_priority_fee_gwei_cap: f64,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub ws_rpc_url: String,
@@ -431,7 +476,13 @@ impl Config {
             }
         }
 
-        if self.looks_like_robinhood_chain() && self.block_time_ms == 12_000 {
+        // STEP 29d — reads block_time_ms via chain_profile() rather than
+        // the flat field directly, as a real (not just documented) use
+        // site proving the accessor is wired in, not dead code. Identical
+        // value either way — chain_profile().block_time_ms is defined as
+        // exactly self.block_time_ms, see chain_profile()'s own doc
+        // comment and this file's round-trip test.
+        if self.looks_like_robinhood_chain() && self.chain_profile().block_time_ms == 12_000 {
             anyhow::bail!(
                 "this config looks like Robinhood Chain (sequencer_http_url is set or a \
                  chain.robinhood.com host is present) but block_time_ms is still 12000 \
@@ -521,6 +572,30 @@ impl Config {
             || host_is_rh(&self.ws_rpc_url)
             || host_is_rh(&self.inclusion_ws_url)
             || self.http_rpc_urls.iter().any(|u| host_is_rh(u))
+    }
+
+    /// STEP 29d — see `ChainProfile`'s own doc comment for the full
+    /// reasoning. Pure grouping, zero transformation: every field here is
+    /// a direct copy of an existing `Config` field, so this cannot change
+    /// what any existing caller observes — proven by
+    /// `chain_profile_round_trips_every_field` in this file's own tests,
+    /// not just asserted in a comment.
+    pub fn chain_profile(&self) -> ChainProfile {
+        ChainProfile {
+            block_time_ms: self.block_time_ms,
+            inclusion_timeout_ms: self.inclusion_timeout_ms,
+            race_mode: self.race_mode,
+            sequencer_http_url: if self.sequencer_http_url.is_empty() {
+                None
+            } else {
+                Some(self.sequencer_http_url.clone())
+            },
+            jitter_ms_min: self.jitter_ms_min,
+            jitter_ms_max: self.jitter_ms_max,
+            gas_jitter_pct: self.gas_jitter_pct,
+            priority_fee_multiplier: self.priority_fee_multiplier,
+            max_priority_fee_gwei_cap: self.max_priority_fee_gwei_cap,
+        }
     }
 
     pub fn block_ticker_ws_url(&self) -> &str {
@@ -627,6 +702,46 @@ mod tests {
     #[test]
     fn accepts_a_valid_config() {
         assert!(test_config().validate().is_ok());
+    }
+
+    // --- STEP 29d: ChainProfile ---
+
+    #[test]
+    fn chain_profile_round_trips_every_field() {
+        // Proves chain_profile() is a pure grouping with zero
+        // transformation — every field matches the source Config field
+        // exactly, for a config with every relevant field set to a
+        // distinct, non-default value (so a copy-paste mistake between
+        // two similarly-named fields, e.g. jitter_ms_min vs.
+        // jitter_ms_max, would actually fail this test).
+        let mut cfg = test_config();
+        cfg.block_time_ms = 227;
+        cfg.inclusion_timeout_ms = 9_999;
+        cfg.race_mode = false; // kept false: race_mode=true requires jitter fields at 0, which would collide with the distinct-values goal above
+        cfg.sequencer_http_url = "https://sequencer.testnet.chain.robinhood.com".to_string();
+        cfg.jitter_ms_min = 11;
+        cfg.jitter_ms_max = 222;
+        cfg.gas_jitter_pct = 3;
+        cfg.priority_fee_multiplier = 7.5;
+        cfg.max_priority_fee_gwei_cap = 20.0;
+
+        let profile = cfg.chain_profile();
+        assert_eq!(profile.block_time_ms, cfg.block_time_ms);
+        assert_eq!(profile.inclusion_timeout_ms, cfg.inclusion_timeout_ms);
+        assert_eq!(profile.race_mode, cfg.race_mode);
+        assert_eq!(profile.sequencer_http_url, Some(cfg.sequencer_http_url.clone()));
+        assert_eq!(profile.jitter_ms_min, cfg.jitter_ms_min);
+        assert_eq!(profile.jitter_ms_max, cfg.jitter_ms_max);
+        assert_eq!(profile.gas_jitter_pct, cfg.gas_jitter_pct);
+        assert_eq!(profile.priority_fee_multiplier, cfg.priority_fee_multiplier);
+        assert_eq!(profile.max_priority_fee_gwei_cap, cfg.max_priority_fee_gwei_cap);
+    }
+
+    #[test]
+    fn chain_profile_reports_unset_sequencer_url_as_none() {
+        let cfg = test_config();
+        assert!(cfg.sequencer_http_url.is_empty(), "precondition: test_config() must default to unset");
+        assert_eq!(cfg.chain_profile().sequencer_http_url, None);
     }
 
     #[test]
