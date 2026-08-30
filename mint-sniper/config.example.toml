@@ -237,3 +237,36 @@ max_copymint_price_wei = 0
 google_oauth_client_id = ""             # e.g. "123-abc.apps.googleusercontent.com" — NOT a secret, from Google Cloud Console
 google_oauth_client_secret_env = ""     # env var NAME (not the value) holding the OAuth Client Secret, e.g. "GOOGLE_OAUTH_CLIENT_SECRET"
 google_oauth_redirect_url = ""          # must exactly match a Redirect URI registered on the OAuth client, e.g. "https://sniper.your-tailnet.ts.net:4117/auth/google/callback"
+
+# --- Delegated mint mode (v1, DELEGATED_SERIAL) — an opt-in second
+# execution path alongside the default parallel-EOA one above. One funded
+# OPERATOR wallet pays gas + mint price; N unfunded RECEIVER wallets are
+# credited via SeaDrop's minterIfNotPayer. Ships as operator -> N
+# SEQUENTIAL mintPublic calls, never a single batched transaction — see
+# CLAUDE.md and src/delegated/mod.rs's doc comment before assuming
+# otherwise. Flat fields here, not a nested [mint]/[mint.delegated] TOML
+# table — this codebase has no [mint] table anywhere, so this follows the
+# same flat-root convention every other field on this page already uses,
+# a deliberate deviation from this feature's original spec (which
+# proposed nesting) to match the codebase's real, established shape.
+# Leave mint_execution unset/"parallel" (the default) to leave this
+# entirely off — an existing config.toml missing these three fields still
+# parses and validates unchanged.
+mint_execution = "parallel"       # "parallel" (default, untouched race path) | "delegated"
+
+# --- delegated-mode-only fields below, ignored when mint_execution = "parallel" ---
+# Only relevant with mint_mode = "seadrop" — Config::validate() rejects
+# mint_execution = "delegated" paired with mint_mode = "custom".
+delegate_mnemonic_env = ""        # env var NAME (not the value) holding a single BIP-39 mnemonic — see deploy/mint-sniper.env.example's OPERATOR_MNEMONIC entry
+delegate_count = 25               # number of RECEIVER wallets to derive (indices 1..=N); index 0 is always the OPERATOR. Hard ceiling: MAX_DELEGATES = 200 (config.rs)
+
+# Wallet derivation: standard BIP-44 path m/44'/60'/0'/0/i from the one
+# mnemonic above. Index 0 = operator (the only funded wallet, the only
+# signer). Indices 1..delegate_count = receivers, derived fresh in memory
+# at fire time only — never written to disk individually, never logged,
+# never returned by any API/UI response as anything but a public address.
+# Receiver private keys are NEVER derivable or displayed anywhere in this
+# app by design (no "reveal private key" feature exists or should be
+# added) — recovery is standard BIP-39/BIP-44 derivation from your own
+# mnemonic backup in any offline wallet tool. See RUNBOOK.md's
+# "Delegated mint mode" section for the exact recovery procedure.
