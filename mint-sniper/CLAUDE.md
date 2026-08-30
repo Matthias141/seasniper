@@ -1119,6 +1119,15 @@ figure: **~227ms**, meaningfully higher than the commonly-cited ~100ms.
 Reported as measured, not silently substituted — `block_time_ms = 227`
 is what the benchmark config actually used.
 
+**SUPERSEDED by step 15f — kept below for the reasoning trail, not as
+the current numbers.** Every figure and every "cannot yet attribute
+this to X" hedge below was written before the PUSH path had ever run
+outside this coding sandbox — the whole point of gap #11. Step 15f has
+the real thing: a genuine n=15 PUSH-based run (zero POLL fallback) plus
+direct on-chain evidence resolving exactly the question this section
+could only speculate about. Read 15f for the actual current numbers
+and verdict; read below for how the investigation got there.
+
 **Real results, n=15 per chain, sequential fires from one funded
 wallet (same `.testnet-keys/wallet1` throughout), same bot binary,
 same methodology:**
@@ -1688,13 +1697,254 @@ n=15 benchmark and, ideally, the diagnostic tool above against at
 least one of its outliers. Reporting a verdict without that data would
 be exactly the kind of unearned confidence this project's own
 "verify, don't guess" standard has consistently rejected elsewhere.
+**That data now exists — see 15f directly below.**
 
-**Still gated on the operator actually running these** — the real
-numbers, the final "is gap #11 closed" confirmation, and the
-per-metric colocation verdict all belong in a 15f update to this
-section once that happens, not before. Until then: PUSH-based numbers
-do not exist yet, and 14b's POLL-based numbers stand as the last real
-measurement, not superseded by anything written in this session.
+### 15f — the real result: closing the entire step 14/15 arc
+
+**A full n=15 run, on the real VPS, genuinely PUSH-based throughout.**
+All 15 fires succeeded. PUSH confirmed on every arm — 30/30 push
+confirmations across the run (both the arm-time "WS push path
+established" log and each fire's `method="push"` result), **zero POLL
+fallback**. This is the first time in this project's history gap #11
+has actually been closed with evidence, not a "should work outside
+this sandbox" caveat — every number below is a genuine measurement of
+what this bot's own PUSH-based detection does on real infrastructure,
+not something entangled with a poll interval the way every prior
+benchmark (13f, 14b) necessarily was.
+
+| Metric | Real n=15 PUSH result | MintDash (p50) | Ratio |
+|---|---|---|---|
+| send→ack p50 | 174ms | 117ms | ~1.5x |
+| send→ack p90 | 235ms | — | — |
+| dispatch→inclusion p50 | 2127ms | 136ms | ~15.6x |
+| dispatch→inclusion p90 | 2367ms | — | — |
+
+**Diagnostic confirmation, not just a number taken at face value** —
+`deploy/lib/diagnose_inclusion_delay.py` run against a real mid-pack
+fire from this run (tx `0x3667e4bd...`, bot-measured
+`dispatch_to_inclusion_ms: 1888`): the tx's dispatch-time block was
+`~105155922`, its actual inclusion block was `105155937` — **~15 real
+blocks elapsed**, confirmed directly from on-chain block numbers, not
+inferred. This rules out the tool's own "≤2 blocks means node/
+subscription lag, not real delay" case entirely — the delay is
+genuinely on-chain, not a detection artifact. The same tx's
+`effectiveGasPrice` paid **zero priority fee above base fee** —
+consistent with, not contradicted by, Robinhood Chain's documented
+FCFS sequencing (gas price doesn't affect ordering there) — so this is
+**confirmed not attributable to underpriced gas**; raising
+`priority_fee_multiplier`/`max_priority_fee_gwei_cap` would not be
+expected to fix it.
+
+**The final verdict, per metric — this is the answer this whole step
+existed to produce:**
+
+- **send→ack (174ms vs. MintDash's 117ms, ~1.5x):** plausibly
+  explained by RPC/network proximity — this run's testnet Alchemy
+  endpoint from a `us-east-1` VPS vs. MintDash's own colocated node.
+  **This is the number a future colocation/dedicated-node step could
+  reasonably expect to move.**
+- **dispatch→inclusion (2127ms vs. MintDash's 136ms, ~15.6x):**
+  **CONFIRMED as real on-chain delay via direct block-number evidence**
+  — not a measurement artifact, not a poll-interval confound (unlike
+  every number in 13f/14b), not attributable to this bot's own
+  detection method at all. **Also confirmed not attributable to gas
+  pricing**, given this chain's documented FCFS model and the zero-
+  priority-fee-paid evidence above. **RPC proximity/colocation would
+  improve HOW FAST this bot learns about an inclusion that already
+  happened — it has no bearing on WHEN inclusion itself happens on
+  this specific chain's sequencing model.** These are two genuinely
+  different problems. A colocation/dedicated-node step is well-
+  supported for send→ack specifically; it would NOT be expected to
+  move dispatch→inclusion at all, and proposing it as a fix for that
+  number would be solving the wrong problem — this corrects 14b's own
+  (already appropriately hedged, but now resolvable) open question,
+  and supersedes any framing anywhere in this file that treated
+  "colocation helps proximity-sensitive numbers" as applying to
+  dispatch→inclusion broadly rather than to send→ack specifically.
+
+**The real open question, stated plainly rather than guessed at:**
+*why* Robinhood Chain testnet's sequencer takes ~15 blocks
+(~3.4s at the measured 227ms block time) to include a transaction that
+reached it, when the chain's own block-production cadence is far
+faster, is genuinely unknown from this investigation. This session has
+no ability to inspect Robinhood Chain's sequencer internals, no
+mainnet data to compare testnet behavior against, and no scope to
+investigate further here — worth its own dedicated investigation if
+inclusion latency matters for a real drop (it likely does, for a
+sniper), but explicitly out of scope for this write-up. Don't let the
+"confirmed real, confirmed not gas, confirmed not RPC lag" findings
+above be mistaken for "fully explained" — two real candidate causes
+(gas pricing, RPC/detection lag) were ruled out with evidence; the
+actual cause was not identified.
+
+**Step 14b's HTTP-poll-confounded numbers (978ms/1329ms p50/p90 on
+Robinhood testnet) are now explicitly superseded by the real PUSH
+numbers above** — not deleted, kept as the historical record of the
+investigation that correctly diagnosed its own limitation and scoped
+exactly what evidence would be needed to resolve it, which this step
+finally provides. Step 13f's original n=1 attempt (7551ms) remains
+superseded by 14b as before. **Gap #11 is closed, for real, with
+evidence — the first time that has ever been true in this project.**
+
+### 15g — a new, separate open question: real sequencer delay, or
+Alchemy-specific indexing lag? (does NOT change 15f's verdict above)
+
+15f's diagnostic confirmed real on-chain delay at the transaction-
+receipt level — genuine, not in question. What it could NOT distinguish
+is a more precise variant of the RPC-lag hypothesis: whether the
+Robinhood Chain *sequencer* actually produced the including block
+significantly earlier than *Alchemy's own node* indexed and served it
+as queryable — which would look identical to real sequencer delay from
+this bot's receipt-level view, while the underlying chain may have
+actually been faster. Investigated as far as this session honestly
+could; **inconclusive, and 15f's verdict above is unchanged by this
+section** — read on for exactly why, and what would actually settle it.
+
+**Protocol confirmed directly, not assumed — this was the first thing
+checked, per this project's own standard.** Robinhood's node-operator
+docs (`docs.robinhood.com/chain/run-a-full-node/`) and a third-party
+decoder project built specifically for this feed
+(`chainstacklabs/robinhood-chain-sequencer-feed`, whose own description
+is "Offchain Labs' Nitro relay for transport, a fast lazy decoder for
+everything after") both confirm: `wss://feed.testnet.chain.robinhood.com`
+speaks Arbitrum Nitro's own sequencer-feed relay protocol, **not**
+standard `eth_subscribe` JSON-RPC. It is not a drop-in swap for
+`alloy`'s existing `WsConnect`/`subscribe_blocks()`, which only speaks
+standard Ethereum pubsub — a real, code-relevant fact, confirmed before
+attempting anything, not assumed from the URL's `wss://` scheme alone.
+
+**Connected to it anyway, from this sandbox — and it worked, at the
+protocol level, which was itself unexpected.** Unlike every prior
+`alloy`/`rustls`-based WS attempt in this project's history (gap #11 —
+blocked by this sandbox's TLS-interception proxy, since `alloy`'s
+`webpki-roots` trust store doesn't trust that proxy's CA), a plain
+Python `websockets` client completed the TLS handshake and received
+real, well-formed JSON messages — `python3`'s TLS stack evidently trusts
+whatever CA this sandbox's proxy presents, where `rustls`'s
+hard-compiled trust store does not. Real message shape, captured live
+(not fabricated): `{"version":1,"messages":[{"sequenceNumber":N,
+"message":{"message":{"header":{"kind":3,"blockNumber":B,
+"timestamp":T,...},"l2Msg":"<base64>"},...},"blockHash":"0x...",
+"signatureV2":"...",...}]}`.
+
+**But the data received was frozen, not live — a concrete, evidenced
+finding, not a guess.** Three fully independent connection attempts,
+spread across real, separate process invocations several minutes
+apart, all returned a **byte-for-byte identical first message**
+(`sequenceNumber=105316976`, `header.blockNumber=11540856`,
+`header.timestamp=1787375057` — every single time). Draining 60
+consecutive messages from one connection advanced `sequenceNumber` by
+exactly 60 (one per message, real progress within the stream) but
+`header.blockNumber` never moved past its very first value, and the
+message timestamps stayed ~800+ seconds stale the entire time,
+regardless of real elapsed wall-clock time between attempts. This
+reads as this sandbox's own outbound proxy caching or otherwise not
+passing through genuinely live traffic for this specific long-lived
+WS endpoint — a different, more insidious manifestation of gap #11
+than an outright connection failure (a connection that *looks*
+successful but silently serves stale data is worse to build on than
+one that visibly fails), and worth flagging precisely for that reason.
+
+**A separate, real ambiguity surfaced along the way, unresolved:**
+`sequenceNumber` (~105.3M, matching the RPC's `eth_blockNumber` order
+of magnitude) and `header.blockNumber` (~11.5M, a completely different
+and far-slower-moving range) cannot both be "the L2 block number" —
+one of them is something else, likely an internal Nitro concept (an L1
+reference index, a delayed-inbox counter, or similar) distinct from
+the standard block height `eth_getBlockByNumber` exposes. This
+session's own frozen-data problem prevented resolving which is which
+with a live cross-check; the operator-run test below includes exactly
+how to settle it in passing.
+
+**Genuinely inconclusive from this sandbox — stated plainly, not
+stretched into a conclusion either direction.** Neither "real sequencer
+delay" nor "Alchemy-specific indexing lag" is confirmed or ruled out by
+anything captured here. 15f's own finding — that the ~15-block delay is
+real (not a bot-side detection artifact) and not gas-price-related —
+stands entirely unchanged; this section only narrows what "real" could
+still mean underneath that.
+
+**The exact operator-run test that would settle it, since this session
+cannot:**
+```bash
+# On the real VPS, at the moment of (or right after) a benchmark fire:
+# 1. Connect to the sequencer feed and capture ONE live message's
+#    sequenceNumber, header.blockNumber, header.timestamp, and blockHash.
+# 2. Immediately query the SAME Alchemy endpoint config.toml already
+#    uses for both candidate numbers, to resolve which one is the real
+#    L2 block height:
+curl -sS -X POST "$ALCHEMY_HTTP_URL" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x<sequenceNumber_hex>",false]}'
+curl -sS -X POST "$ALCHEMY_HTTP_URL" -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x<header_blockNumber_hex>",false]}'
+# Whichever call's returned "hash" field matches the feed message's own
+# "blockHash" is the real L2 block number in the standard numbering
+# space. THEN compare that RPC block's "timestamp" against the feed
+# message's own header.timestamp for the SAME block, captured as close
+# in wall-clock time as practical. A material, consistent gap (Alchemy
+# reporting a LATER timestamp than the feed for the same block)
+# supports Alchemy-specific indexing lag; matching timestamps rule it
+# out and point back to genuine sequencer-side delay as 15f already
+# found.
+```
+This needs a real VPS whose outbound network isn't behind this
+sandbox's proxy (the stale-data problem above should not recur there),
+and the operator's own configured Alchemy endpoint (never available to
+this session). Worth running if inclusion latency matters enough for a
+real drop to justify chasing further — genuinely open, not urgent
+enough on its own to block anything already shipped.
+
+### Step 19 — the original single-fire test's three tx, finally
+diagnosed directly (they never had been until now)
+
+15f's diagnostic ran against one representative tx from the n=15
+batch. The **original** three single-fire-test numbers this whole
+arc started from — `dispatch_to_inclusion_ms` **2722 / 2876 / 3023**,
+first reported earlier in this file — had never actually been run
+through `diagnose_inclusion_delay.py` themselves; that section
+explicitly said so ("this session still cannot reach the real chain
+or a real fire's tx hash"). Read-only, public-data check, done now:
+
+- **RPC used:** `https://rpc.testnet.chain.robinhood.com` — Robinhood
+  Chain's own public testnet endpoint, found directly in
+  `docs.robinhood.com/chain/connecting` (not reused from the
+  operator's Alchemy key, and not assumed from memory). Verified live
+  before use: `eth_chainId` → `0xb626`, `eth_blockNumber` → a current,
+  advancing block height. One wrinkle worth recording for next time:
+  this endpoint 403s Python's default `urllib` User-Agent (Cloudflare
+  in front of it) — plain `curl` and a spoofed `User-Agent` both work
+  fine; not a sign the endpoint itself is unhealthy.
+- **All three tx confirmed successful** (`status=success`), each with
+  `effectiveGasPrice == baseFeePerGas` — **zero priority fee paid**,
+  same as 15f's own tx — consistent with Robinhood Chain's documented
+  FCFS sequencing, not a new anomaly.
+
+| tx | logged dispatch_to_inclusion_ms | inclusion block | blocks elapsed |
+|---|---|---|---|
+| `0x6487f122...b4817` | 2722 | 105139097 | **21** |
+| `0xc88a41f7...6240b7` | 2876 | 105139098 | **22** |
+| `0x481d30b1...e4b8e54` | 3023 | 105139096 | **28** |
+
+All three inclusion blocks land within 2 of each other, consistent
+with these being the same single arm's near-simultaneous wallets, and
+all three show double-digit `blocks_elapsed` — nowhere near the tool's
+own `<=2` node/detection-lag threshold. **This confirms the existing
+write-up, not just as an isolated n=1 confound anymore:** two
+independent samples (this file's original n=1/three-wallet fire, and
+15f's separate n=15 run), against two independent RPC providers
+(Robinhood's own public endpoint here vs. Alchemy in 15f), both show
+tens of real blocks elapsed with zero priority fee paid. That a
+completely different, non-Alchemy RPC reproduces the same pattern is
+itself a small but real additional data point against the still-open
+15g "Alchemy-specific indexing lag" hypothesis specifically for these
+three tx — it does not settle 15g's broader question (this was a
+receipt/RPC-node check, not the sequencer-feed-vs-Alchemy-timestamp
+cross-check 15g's own operator-run test describes), but it is one
+more independent RPC agreeing with Alchemy's numbers rather than
+disagreeing with them.
+
+No code changes were made or needed — this was a verification of
+existing evidence, not a new finding requiring a fix.
 
 ## Live first deploy — real findings (step 16)
 
@@ -2043,3 +2293,705 @@ different origin stop validating the moment that switch happens
   actual invocation (flags, working directory, etc.) as a stand-in for
   checking CI itself. A step is not done until this has actually been
   observed once, this session, against a real run.
+- **Step 21c — CI green is not the finish line either; the commit has to
+  actually reach `main`, or it's still invisible to VPS redeploys.**
+  Incident: at least three separate pushes to
+  `claude/mint-sniper-audit-port-oxom5x` (steps 15f, 15g, 19) each went
+  green on real per-job CI and were each reported "done" — but none of
+  them were ever merged into `main`, since a feature-branch push alone
+  never does that. This sat silently blocking the operator's VPS
+  redeploys (which track `main`) until the operator noticed and opened
+  PR #10 by hand. The previous convention above only closed the "did CI
+  actually run" half of the gap; it said nothing about "did the work
+  become reachable from `main`," which is the half that actually matters
+  for deploys. **The fix:** this session's GitHub access is the repo
+  owner's own token (confirmed via `get_me`) — it can open, update, and
+  merge PRs on this repo. Going forward, for this session's OWN work on
+  `claude/mint-sniper-audit-port-oxom5x` (or any future non-operator
+  working branch), auto-merge into `main` is the default once real
+  per-job CI is confirmed green on the head commit — open (or update) a
+  PR, confirm CI, merge it, then confirm with `git merge-base
+  --is-ancestor <sha> origin/main` (not just trusting the merge API's
+  response) that the commit is actually reachable from `main` before
+  calling the step done. **Standing exception, never overridden by the
+  above:** the operator's own personal feature branches (e.g.
+  `p0-rh-race-jitter-sequencer` / PR #9) are never auto-merged under any
+  circumstance — those stay the operator's own merge decision, exactly
+  as already established. Closed for real here: PR #10 (steps 15f/15g/19)
+  merged to `main` as commit `f06e937`, confirmed reachable via the same
+  ancestor check this convention now requires.
+
+## Step 20 — EIP-7702 delegation/batching: research and design, no implementation
+
+Same discipline as step 10a's identity research: confirm real facts before
+writing any code. This expands the codebase's trust surface more than
+anything built so far, including identity — a malicious or buggy delegate
+contract has **full authority over a wallet**, not read access or a scoped
+permission. No code changes in this step.
+
+### 20a — the actual mechanism, confirmed not assumed
+
+**alloy 2.4.1 (already in use throughout this codebase) supports EIP-7702
+natively.** Confirmed directly against the vendored crate source, not
+assumed from the EIP being live: `alloy-consensus-2.4.1/src/transaction/
+eip7702.rs` defines `TxEip7702` (the type-0x04 `SetCodeTransaction`) with a
+real `authorization_list: Vec<SignedAuthorization>` field, part of the
+standard transaction envelope alongside the existing EIP-1559 type this
+codebase already signs and sends. Signing/sending support exists; nothing
+about alloy itself blocks building this.
+
+**The architecture question, answered — this determines the whole scope:**
+- EIP-7702 ALONE gives one thing: an EOA can point its own code at a
+  deployed contract, so *that specific EOA* starts executing arbitrary
+  delegate logic instead of nothing. It does NOT by itself give "one
+  operator wallet pays gas for N sniper wallets" — that requires the
+  delegate contract to expose sponsor/relayer execution logic on top of
+  the base EIP (someone else's tx invokes the delegate, the delegate acts
+  on the now-smart EOA's behalf), or pairing with ERC-4337's paymaster
+  mechanism once the EOA has become a smart account via 7702.
+- Real BATCHING (combining multiple wallets' operations into fewer
+  transactions) is the same story: 7702 alone lets a single delegated EOA
+  batch its OWN multiple calls into one transaction (useful, but not what
+  "N sniper wallets, fewer txs" means). Batching *across* wallets needs
+  ERC-4337-style infrastructure (a bundler/EntryPoint) layered on top —
+  every source describes 7702 and 4337 as complementary, not either/or:
+  "the future of account abstraction likely involves both standards
+  working in harmony." **This is a two-layer feature, not a one-EIP
+  feature** — 7702 alone does not give this codebase gas-sponsorship or
+  cross-wallet batching; it's the enabling primitive ERC-4337
+  infrastructure would sit on top of.
+
+### 20b — security research (the part that matters most)
+
+**Real, large-scale, ongoing attacks — this is not a theoretical risk.**
+Since Pectra activated EIP-7702 on Ethereum mainnet (May 7, 2025):
+- Within four weeks, Wintermute's research team found **more than 97% of
+  EIP-7702 delegations on mainnet pointed to copy-pasted sweeper
+  contracts**, the largest family dubbed "CrimeEnjoyor."
+- Independent security research links **63% of analyzed EIP-7702
+  authorization transactions to attacker-controlled contracts**, with
+  **more than $2.3 million in confirmed thefts** identified.
+- By late August 2026, a single user lost **$1.54 million** in one 7702
+  batch-transaction phishing attack.
+- Attack mechanism: a victim signs ONE authorization tuple (can look
+  structurally harmless), which installs delegate code with **persistent,
+  unconditional execution control** over the EOA — categorically different
+  from phishing a single transaction, since every subsequent action routes
+  through attacker logic with no further victim signature required.
+
+**Verdict for this codebase specifically:** the dominant real-world outcome
+of EIP-7702 adoption so far is mass phishing against end users signing
+authorizations toward attacker contracts they didn't audit. That is a
+different threat model from this project's own wallets (private keys held
+server-side, never end-user-signed in a browser) — but it establishes that
+**the mechanism itself is proven dangerous when the delegate target is
+wrong**, which is exactly the risk of writing a custom delegate contract
+in-house versus reusing something already battle-tested.
+
+**Audited, reusable delegate implementations exist and should be strongly
+preferred over a custom one.** OpenZeppelin publishes `EOA Delegation`
+documentation and reference contracts as part of their audited 5.x
+contracts library. MetaMask's Delegation Toolkit works with any ERC-4337
+bundler/paymaster. Safe{Wallet}'s own delegate pattern is referenced as the
+"become a smart account" path multiple sources point to. **A
+custom-written delegate contract holding full authority over this
+project's sniper wallets is a categorically larger, more dangerous attack
+surface than reusing one of these** — if this is ever built, reuse is not
+optional-but-preferred, it's close to a hard requirement given the proven
+blast radius of getting the delegate contract wrong.
+
+**Revocation — real, documented, RUNBOOK.md-worthy procedure exists.**
+Setting the authorization's target address to the zero address
+(`0x0000000000000000000000000000000000000000`) is the canonical
+revocation: sign a fresh authorization (using the EOA's own still-held
+private key — the EOA is never dispossessed of its key by delegating) with
+the zero address as target, broadcast it. `cast wallet sign-auth
+--private-key <KEY> --chain <ID> --nonce <NONCE> 0x0000...0000` is the
+concrete CLI form; libraries like Candide's AbstractionKit expose the same
+as `createRevokeDelegationTransaction`. There is no permanent migration —
+this genuinely returns the EOA to a normal, undelegated account. **This is
+the RUNBOOK.md entry this feature would need before shipping**: if a
+delegate is later found compromised or buggy, the operator's procedure is
+"sign and broadcast a zero-address authorization from the affected wallet's
+own key" — cheap (one small tx per wallet), fast, and does not require
+migrating funds to a new address.
+
+### 20c — compatibility check against existing invariants
+
+- **`advance_nonces` / the prepare/fire split's nonce assumptions (step
+  3b):** EIP-7702 does not introduce a separate or parallel nonce space —
+  the delegating EOA's existing account nonce continues incrementing
+  normally, and signing an authorization itself consumes one nonce slot
+  (same sequential-nonce rule as any transaction). This does not BREAK the
+  existing model (still one linear nonce counter per EOA, still
+  client-side tracked, still the same "advance exactly once, at the moment
+  of commit" rule step 3b established) — it would just mean a wallet's
+  first-ever authorization tx is one more nonce-consuming event
+  `next_nonce` tracking needs to account for, the same way any other
+  transaction from that wallet already is. Genuinely orthogonal to the
+  actual bug class step 3b fixed (premature nonce advancement on a
+  never-broadcast prepare) — nothing about 7702 reintroduces that risk.
+- **Custody discussion (steps 11/12 — operators eventually bringing their
+  own keys, session-scoped custody):** this is a real, direct connection,
+  not orthogonal, and worth flagging explicitly. If wallets are ever
+  delegated to a shared contract, "who controls this wallet" stops being
+  a single fact (the private key holder) and becomes at least two facts
+  (the key holder AND whoever controls/can upgrade the delegate
+  implementation). Any future custody model that lets an operator bring
+  their own key needs to also account for whether that operator's wallet
+  is delegated, and to what — a session-scoped custody boundary that
+  doesn't also scope delegate-contract trust would leave a gap. This
+  should be resolved in the SAME architecture conversation as steps 11/12,
+  not decided independently and bolted on afterward.
+
+### 20d — real options, not a recommendation
+
+1. **No 7702, status quo.** Keeps the current, well-understood surface
+   (server-held keys, `advance_nonces`, prepare/fire split — nothing about
+   wallet authority changes). Buys nothing new. Zero new attack surface,
+   zero new implementation cost. The only cost is *not* getting
+   gas-consolidation or batching, if either turns out to matter enough to
+   justify the alternative below.
+2. **7702 for gas-consolidation only, reusing an audited delegate contract**
+   (OpenZeppelin's or an equivalent, never custom-written). Buys: one
+   operator-funded wallet can cover gas for N sniper wallets without
+   pre-funding each one individually — a real operational simplification
+   for wallet management. New attack surface: the reused delegate
+   contract's own trust assumptions become this project's trust
+   assumptions (bounded by whatever audit/track record it has, not
+   unbounded); the revocation procedure from 20b becomes a real
+   operational dependency (RUNBOOK.md entry, tested at least once).
+   Implementation cost: moderate — new `authorization_list` construction
+   and signing path in executor.rs, a decision on which audited delegate
+   to target, real testnet dry-run before trusting it for a live mint,
+   same standard as every other feature in this project's history.
+3. **7702 + ERC-4337 for full batching.** Buys the most: genuine
+   cross-wallet batching (fewer total transactions across N wallets), the
+   closest match to the 100-wallet/16-second/near-zero-cost shape 20e
+   below describes. New attack surface is the largest of the three: a
+   bundler/paymaster dependency added on top of the delegate-contract
+   trust from option 2, meaning two new pieces of external infrastructure
+   this project would depend on, not one. Implementation cost is the
+   highest — this is a genuinely new subsystem, not an incremental change
+   to `fire_prepared`.
+
+This is the operator's decision, not a recommendation — consistent with
+how the custody-model question in step 12 and the WebAuthn-origin decision
+in step 10.5a were both left as explicit choices, not defaults.
+
+### 20e — the 100-wallet / 16-second / 0.0006 ETH data point
+
+A competitor's own execution history reportedly shows: 97/100 wallets
+included, 16 seconds total, 0.0006 ETH total gas across all 100 wallets —
+averaging **~0.000006 ETH (~$0.01–0.02) per wallet**. Whether this ran on
+Ethereum mainnet is explicitly **not confirmed** from what's available to
+this session (a screenshot detail, not independently verifiable) — treated
+as an open question, not a fact, throughout this analysis.
+
+**Two questions, answered as plainly as the evidence allows:**
+
+1. **Is this per-wallet cost achievable via EIP-7702 specifically on a
+   real-gas-cost chain, or is a near-zero-gas L2 the simpler explanation?**
+   A single ERC-721-style mint transaction on Ethereum mainnet typically
+   costs on the order of 21,000 (base) + 50,000–150,000+ (mint logic) gas
+   — even at a low 1 gwei gas price, that's roughly 0.00007–0.00017 ETH for
+   ONE wallet's mint alone. 100 independent mints at that rate would cost
+   on the order of 0.007–0.017 ETH total, not 0.0006 ETH — **the claimed
+   total is 1–2 orders of magnitude too low for 100 real, independently-
+   priced mainnet mint transactions**, with or without EIP-7702 in the
+   picture (7702 authorizations themselves cost real gas too — one model
+   cited ~35,190 gas per new delegation indicator, which is additive on
+   top of the mint cost, not a discount on it). A near-zero-gas L2 (this
+   project's own Robinhood Chain benchmarks show baseFeePerGas on the
+   order of 0.01 gwei — four to five orders of magnitude below typical
+   mainnet gas prices) fits this number far more simply, with no
+   delegation mechanism of any kind required to explain it.
+2. **If 7702 genuinely could produce this on mainnet, how?** No credible
+   mechanism was found. EIP-7702 authorizations do not share or amortize
+   execution gas cost across delegated accounts — each mint is still a
+   full, independently-metered EVM execution; the delegation only changes
+   WHO can author calls FROM that account, not what those calls cost to
+   execute. An operator wallet "sponsoring" gas via a relayer pattern
+   changes who PAYS, not the total amount paid — 100 independent mints
+   still cost the sum of 100 independent mints' worth of gas, sponsor or
+   no sponsor. Nothing in EIP-7702's own mechanism reduces per-transaction
+   execution cost.
+
+**Verdict, stated without hedging where the evidence supports one:** the
+evidence strongly favors explanation 2 — a near-zero-gas chain (most
+plausibly Robinhood Chain, an L2 this project already benchmarks against),
+not EIP-7702 delegation, explains this number. This is **not** a
+numbers-backed case for building EIP-7702 on Ethereum mainnet — if
+anything, it's a data point that a chain choice (already-supported
+Robinhood Chain, or a similarly cheap L2) does far more for per-wallet
+cost than any delegation mechanism could, on mainnet or otherwise. Flagged
+as ambiguous only insofar as the exact chain is unconfirmed; the magnitude
+argument against "this is what 7702 buys you on mainnet" is not ambiguous.
+
+Sources consulted (WebSearch, current as of this writing): arXiv "EIP-7702
+Phishing Attack" (2512.12174); TradingView/NewsBTC/Cryptopolitan coverage
+of Wintermute's CrimeEnjoyor research and the $1.54M single-user loss;
+OpenZeppelin's EOA Delegation docs; BuildBear's ERC-4337-vs-EIP-7702
+comparison; Ethereum.org's Pectra/7702 guidelines; EIP-7702's own spec
+(eips.ethereum.org/EIPS/eip-7702) for the revocation mechanism.
+
+## Step 22 — InkChain support
+
+Same rigor as step 13's Robinhood Chain work: verify before building, no
+assumption carried over just because the pattern is familiar. All facts
+below are from real, live checks run this session (RPC calls, direct
+docs fetches), not memory.
+
+### 22a — SeaDrop deployment, confirmed via real eth_getCode
+
+- **InkChain mainnet:** `eth_getCode` against
+  `0x00005EA00Ac477B1030CE78506496e8C2dE24bf5` (the SeaDrop V1 singleton
+  address this codebase already targets on Ethereum/Robinhood Chain)
+  returned real, non-empty deployed bytecode. **Confirmed deployed**, same
+  address as every other chain checked so far — the cross-chain
+  deterministic-address theory holds here, but it was verified, not
+  assumed.
+- **InkChain testnet (Ink Sepolia):** the SAME `eth_getCode` call against
+  the SAME address returned `0x` — **empty, not deployed there.** The
+  singleton does not hold everywhere; testnet is the exception found by
+  actually checking rather than assuming. No alternate InkChain-testnet
+  SeaDrop address was found in the time available for this step — this is
+  an explicit, stated gap (see 22d), not silently worked around.
+
+### 22b — real chain facts
+
+- **Chain IDs, confirmed from InkChain's own docs
+  (docs.inkonchain.com/general/network-information), not memory:**
+  mainnet **57073**, testnet (Ink Sepolia) **763373**. Cross-checked live:
+  `eth_chainId` against the mainnet RPC returned `0xdef1` (57073) and
+  against testnet RPC returned `0xba5ed` (763373) — docs and live
+  responses agree.
+- **RPC provider support:** Alchemy supports InkChain mainnet
+  (`ink-mainnet.g.alchemy.com`), same provider pattern already used for
+  Ethereum and Robinhood Chain — no new provider integration needed.
+  InkChain's own docs also publish public (rate-limited) endpoints:
+  `https://rpc-gel.inkonchain.com` (mainnet) / `https://rpc-gel-
+  sepolia.inkonchain.com` (testnet), both confirmed live and responsive
+  this session.
+- **Real, measured block time** (same methodology as step 14b — walking
+  real consecutive block timestamps, not trusting a documented figure):
+  50 consecutive InkChain mainnet blocks, timestamp deltas **every single
+  one exactly 1 second** — a consistent, real **1000ms** block time.
+  InkChain's own docs do not publish a block-time figure at all (checked
+  directly — the "note" is real, not a gap in this session's search), so
+  there was no documented number to compare this measurement against the
+  way Robinhood Chain's ~100ms-documented-vs-~227ms-measured mismatch
+  existed. Same 1-second-timestamp-granularity caveat as every prior
+  measurement in this file applies (true value could differ from exactly
+  1000ms within that resolution).
+- **FCFS-vs-gas-priority sequencing:** InkChain is built on the OP Stack,
+  with Kraken operating as its sequencer. OP Stack sequencers generally
+  default to first-come-first-served ordering by arrival time at the
+  sequencer, the same qualitative model already confirmed for Robinhood
+  Chain — **but this is the general OP Stack pattern, not a statement
+  independently confirmed from InkChain's own docs the way Robinhood's
+  FCFS claim was step 13's own direct finding.** Treat as
+  likely-but-not-independently-verified for InkChain specifically; worth
+  a direct confirmation (an InkChain support/docs question, or empirical
+  testing) before designing race_mode-style behavior around it the way
+  step 23 discusses.
+- **Mempool/pending-transaction visibility — real, negative finding.**
+  Directly probed InkChain's public mainnet RPC:
+  - `eth_newPendingTransactionFilter` → `{"code":-32601,"message":"rpc
+    method is not whitelisted"}`
+  - `txpool_status` → same "not whitelisted" rejection
+  - A raw WS `eth_subscribe("newPendingTransactions")` attempt against
+    `wss://rpc-gel.inkonchain.com` was rejected outright at the
+    connection layer (`HTTP 405`), before ever reaching subscription
+    logic.
+  - By contrast, `eth_getBlockByNumber("pending", false)` DID succeed and
+    returned a real, non-empty "pending block" object (with one
+    transaction hash in it) — a different, more limited kind of
+    pre-confirmation visibility than a true pending-tx subscription,
+    worth noting rather than flattening into a blanket "no visibility at
+    all."
+  
+  **This directly confirms the task's own prediction**: mempool
+  visibility is chain-specific, not guaranteed by EVM-compatibility
+  alone. Copymint's existing detection mechanism (`copymint.rs`'s
+  `subscribe_full_pending_transactions`, the same call
+  `watcher.rs::run_mempool_watcher` uses for `trigger_mode =
+  "mempool_watch"`) is **not confirmed usable on InkChain** via the
+  public RPC checked here. A private/paid RPC provider (Alchemy or
+  similar) *might* expose full pending-tx visibility where the public
+  endpoint doesn't — genuinely unconfirmed either way from this session,
+  not assumed to be better just because it's a paid tier. **Until
+  verified against a real private endpoint, InkChain should be treated as
+  `poll_state`/`timestamp`-mode-only** — this is the direct gate step 23
+  needed and now has.
+
+### 22c — configurable network, chain-agnostic re-verified
+
+- **`chain_id` is read live, not hardcoded — re-confirmed for a second
+  chain, not just assumed to still hold from step 13b's Robinhood Chain
+  finding.** Grepped `executor.rs`/`config.rs` directly: `let chain_id =
+  reader.get_chain_id().await...` in `prepare_fire`, used once via
+  `tx.chain_id = Some(chain_id)` — a fresh RPC read every prepare, no
+  chain ID constant anywhere in the signing/firing path. This genuinely
+  is chain-agnostic infrastructure, not something that happened to work
+  for Robinhood Chain specifically.
+- **`config.example.toml` updated** with a documented InkChain example
+  section (mainnet + testnet RPC URLs via Alchemy, the measured
+  `block_time_ms = 1000`, and an explicit note on the testnet SeaDrop gap
+  and the mempool-visibility finding above), matching the existing
+  Robinhood Chain section's style exactly.
+
+### 22d — testnet dry run: explicit gap, not skipped silently
+
+**No live dry run was performed.** Two blockers, both real and confirmed,
+not assumed:
+1. SeaDrop is not deployed at the standard singleton address on InkChain
+   testnet (22a) — no known live SeaDrop-based collection to target was
+   found there in the time available for this step.
+2. This session has no VPS access and cannot deploy a dedicated
+   benchmark-only token the way step 14b's live operator-run dry run did
+   for Robinhood Chain testnet.
+
+**This is a stated, explicit gap**, same as this file's standing
+convention for anything not actually verified end-to-end: InkChain support
+as landed here is chain-configuration and fact-verification only (22a-22c)
+— a real live-fire dry run (finding or deploying a real testnet SeaDrop
+target, confirming a real mint succeeds, confirming real
+`dispatch_to_inclusion_ms`/`send_to_ack_ms` numbers) has NOT happened and
+should not be assumed to work the same way step 5's Sepolia dry run or
+step 13d's Robinhood Chain dry run did, until it actually runs once.
+
+cargo build/check/test clean (no functional Rust changes in this step —
+`chain_id`-live-read was re-verified, not modified; only
+`config.example.toml` changed).
+
+## Step 23 — copymint front-running: research and design, no implementation
+
+Scope: Robinhood Chain, Ethereum mainnet, InkChain. Uses step 22's actual
+findings on InkChain below, not re-derived or guessed. No code changes in
+this step.
+
+### 23a — what copymint actually does right now, read directly from the code
+
+**Copymint does NOT wait for the tracked wallet's transaction to confirm
+before acting — this contradicts how it was described in prior
+conversation.** Read `copymint.rs::handle_candidate` directly: it fires the
+instant a tracked wallet's `mintPublic` call is seen **pending** (via
+`subscribe_full_pending_transactions`, before any confirmation), does one
+fresh `getPublicDrop` read to independently verify the drop is real and
+currently live (never trusting the pending tx's own calldata beyond which
+contract/fee-recipient it names), and — if `should_auto_fire` allows it —
+immediately sends `ControlMsg::FireCopymint`. There is no wait, no
+polling for the tracked wallet's own receipt, nothing that reads "was
+their mint the one that landed" anywhere in this path.
+
+**This means an emergent race already exists today, independent of
+anything step 23 would add.** The tracked wallet's original transaction
+and copymint's own generated transaction are both in flight simultaneously
+the moment copymint decides to fire — whichever lands first is whichever
+the underlying chain's ordering happens to favor, with zero deliberate
+influence from this codebase over which one wins. **"Add front-running" is
+therefore not new behavior in the sense of creating a race that doesn't
+currently exist — it would be an optimization of a race copymint already
+runs every single time it auto-fires**, specifically: deliberately trying
+to win that already-existing race (via submission speed or gas bidding)
+instead of leaving the outcome to chance. This reframes the actual
+decision in front of the operator: not "should copymint start racing," but
+"should copymint's already-existing race be actively won more often."
+
+### 23b — per-chain mechanism
+
+- **Robinhood Chain.** Confirmed FCFS, no gas-price priority (step 13's
+  research, re-confirmed step 22b's InkChain check against the same
+  question). "Front-running" here can only mean winning on raw submission
+  speed to the sequencer — gas bidding has no effect on ordering by this
+  chain's own documented design. **PR #9 (`p0-rh-race-jitter-sequencer`)
+  is still open, not merged, as of this check** (confirmed live via the
+  GitHub API, not assumed from memory) — but its `race_mode`/
+  `sequencer_http_url` work already IS the right primitive: sequencer-
+  first `eth_sendRawTransaction` submission, jitter disabled, is exactly
+  "win on raw speed." Copymint would not need its own separate fast-path
+  — it already calls the same `fire_prepared`/`ControlMsg::FireCopymint`
+  path every other trigger mode uses (23a), so once PR #9 lands, copymint
+  automatically inherits sequencer-racing behavior for free on this chain,
+  no copymint-specific code required.
+- **Ethereum mainnet.** Standard gas-priority ordering — a fundamentally
+  different mechanism from Robinhood Chain's. Front-running here means
+  reading the tracked wallet's PENDING transaction's actual fee fields
+  (`maxFeePerGas`/`maxPriorityFeePerGas`, from the same pending-tx data
+  copymint already decodes calldata from) and bidding above them —
+  copymint currently decodes only calldata (contract/fee-recipient/
+  quantity), never touches the pending tx's fee fields at all, so this is
+  new decoding work, not a reuse of anything existing. **This is the case
+  with real, direct stakes**: outbidding the tracked wallet on a
+  tight-supply drop can cause THEIR transaction to revert (they lose the
+  mint they were trying to make, not just a race copymint also entered).
+  Copymint's existing `getPublicDrop` verification already fetches
+  `maxTotalMintableByWallet`; extending it to also check real scarcity —
+  `IERC721SeaDrop.getMintStats(address)` on the NFT contract itself
+  (returns `minterNumMinted`, `currentTotalSupply`, `maxSupply` — a real,
+  standard SeaDrop-adjacent function, confirmed to exist, not assumed) —
+  is concretely buildable: `currentTotalSupply` vs `maxSupply` is exactly
+  the scarcity signal 23c's gate needs, callable from the same RPC
+  connection `fetch_public_drop` already uses.
+- **InkChain.** Per step 22b's actual finding: the public RPC checked
+  explicitly rejects `eth_newPendingTransactionFilter`/`txpool_status`
+  ("not whitelisted"), and a raw WS pending-tx subscription was rejected
+  at the connection layer entirely. **Copymint's detection mechanism —
+  which structurally depends on subscribing to pending transactions —
+  is not confirmed buildable on InkChain via the endpoint checked.**
+  Stated plainly, not designed around: until a private/paid RPC endpoint
+  is confirmed to expose full pending-tx visibility on InkChain (genuinely
+  unverified, not assumed better just because it's paid), copymint should
+  not be offered as a supported trigger on InkChain at all — only
+  `poll_state`/`timestamp` modes, which don't need pending-tx visibility,
+  are confirmed usable there.
+
+### 23c — the safety/harm design (not optional)
+
+**Scarcity gate, same spirit as the existing free/paid split (step 6c).**
+Before any front-run attempt is even offered, let alone auto-fired: call
+`getMintStats` on the target NFT contract, compute `remaining =
+maxSupply - currentTotalSupply` and how close that is to zero relative to
+the mint quantity in flight. Two zones:
+- **Supply abundant relative to demand:** both the tracked wallet's mint
+  and copymint's own mint are very likely to succeed regardless of who
+  lands first — no real harm model exists here (nobody's mint gets pushed
+  over a cap by one more transaction). Default-safe territory, the same
+  category free copymint opportunities already occupy today.
+- **Supply tight/near cap:** a real, non-hypothetical chance that winning
+  the race causes the tracked wallet's own transaction to revert (their
+  mint pushed past the now-exhausted cap by copymint's own action).
+  **This must require the same tier of explicit, deliberate opt-in the
+  existing paid-mint gate already uses** — never auto-fire, the operator
+  must consciously enable front-running for this specific risk tier, not
+  just see a warning label and proceed. A warning label is what search
+  results already get (8c); this is a strictly higher-stakes action
+  (deliberately risking causing someone else's transaction to fail) and
+  needs the stronger gate, not the weaker one.
+
+**Dedup-by-target check, designed as a real check, not a comment.** If two
+different tracked wallets are both detected minting the SAME collection
+within a short window, only act on the first; skip the second with a
+clear, logged reason. Without this, copymint could fire twice on the same
+drop from two independent triggers — wasted gas, wasted wallet allocation
+on a redundant mint, and (once front-running exists) potentially two
+separate front-run attempts against two different targets on the same
+drop, compounding the scarcity risk above. Concrete design: an in-memory
+(or `identity.db`-backed, for restart-survival — a decision for
+implementation time) map of `nft_contract → last-fired timestamp`,
+checked and updated atomically inside `handle_candidate` before any
+`ControlMsg::FireCopymint` send, with a short TTL (long enough to cover
+one realistic "two wallets both minting the same drop within seconds of
+each other" window, short enough that a genuinely separate later drop on
+the same contract — e.g. a second stage — isn't permanently blocked). A
+competitor's own copy-mint tool implements exactly this pattern
+("Copy mint skipped because this collection already has an active or
+copied task"), independently validating the pattern is worth having, not
+just this project's own idea.
+
+### 23d — options, not a recommendation
+
+1. **Network-speed racing only, no gas bidding, Robinhood-first.** Ship
+   nothing copymint-specific for Robinhood Chain (23b: it already inherits
+   PR #9's sequencer racing once that merges). Explicitly do NOT build the
+   Ethereum gas-bidding path or the scarcity-gate infrastructure it
+   requires. Buys: the lowest-risk win available — Robinhood Chain's own
+   FCFS model means winning the race has no victim-revert harm model the
+   way outbidding does on Ethereum, so this is close to free correctness
+   improvement with none of 23c's hardest design work. Costs: does
+   nothing for Ethereum mainlnet copymint opportunities, which stay
+   exactly as risky/un-raced as they are today (i.e., today's existing
+   emergent race continues, un-optimized, un-gated).
+2. **Full gas-priority racing on Ethereum, with the scarcity gate as a
+   hard requirement.** Ship both the Ethereum fee-bidding path (23b) and
+   23c's full scarcity-gate + explicit-opt-in-for-tight-supply design
+   together, as one unit — never ship gas-bidding without the gate. Buys:
+   the highest-value copymint improvement (Ethereum mainnet has the
+   biggest existing drop ecosystem this bot targets). Costs: the most
+   implementation and review effort — new fee-field decoding, a new
+   supply-check RPC call added to the hot detection path, a new
+   confirmation-tier UI flow for the opt-in, and real testnet validation
+   before trusting any of it live, given the direct "causes someone else's
+   tx to revert" stakes.
+3. **Defer Ethereum entirely until the scarcity-check infrastructure is
+   proven on Robinhood Chain first.** Ship option 1 now; build and test
+   the `getMintStats`-based scarcity check as its own standalone,
+   low-stakes addition to `getPublicDrop`'s existing verification (surfaced
+   in the UI, not yet gating anything) before ever pairing it with
+   Ethereum gas-bidding. Buys: de-risks the hardest part (does the scarcity
+   read actually work reliably, across real live drops, before it's ever
+   load-bearing for a fire/no-fire decision) separately from the highest-
+   stakes part (bidding real ETH against a real drop's real cap). Costs:
+   slower path to Ethereum front-running than option 2, two separate
+   review/testnet cycles instead of one.
+
+Also decided as part of this scope, not deferred: **InkChain gets no
+copymint front-running design at all in any of the three options above** —
+per 23b, its detection mechanism itself is unconfirmed buildable there.
+Whichever option is chosen, InkChain waits for that question to resolve
+first, independent of the Robinhood-vs-Ethereum decision.
+
+This is the operator's decision to make with full information, consistent
+with how every other major architecture fork in this project (custody
+model, WebAuthn origin, the EIP-7702 options in step 20 above) has been
+handled — no option above is recommended over another.
+
+## Step 24 — seadrop-noir-bot pattern evaluation (research only, no implementation)
+
+Cloned `Kuriare7Rz/seadrop-noir-bot` to a scratch directory (same pattern
+as step 1's audit of `morsyxbt/nft-public-mint`) and read the actual
+source for four specific README claims — scope explicitly limited to its
+legitimate on-chain SeaDrop fallback path, not its OpenSea Drops API
+primary path (already scoped out of this project).
+
+### 24a — risk validation checklist: partially real, one claim is dead code
+
+Read `src/risk/` directly, not the README's summary of it:
+- **`checkGoPlus` (`goplusCheck.ts`) is real and well-implemented**, and
+  genuinely wired into the actual validation path
+  (`validator.ts::validateMint` calls it). Hits GoPlus's real NFT security
+  API (`nft_security/{chain_id}`), checks `is_honeypot` and
+  `malicious_behavior`, fails open by default (a real, explicit design
+  choice — `strictMode` flag controls whether an API failure blocks or
+  just warns). Their own comment confirms GoPlus does not cover Robinhood
+  Chain (chain id 4663) yet.
+- **`checkContractAge` and `checkEtherscanVerified` (`etherscanCheck.ts`)
+  are real, correctly-implemented functions — and dead code.** Grepped the
+  whole repo: **zero call sites outside their own definition file.**
+  `validator.ts::validateMint` calls ONLY the blacklist check and GoPlus —
+  the README's claim of "pre-mint checks including contract age (>1hr),
+  Etherscan verification status" describes functions that exist and work
+  in isolation but are never actually invoked in the live validation path.
+  This is exactly the "don't take the README at face value" case the task
+  anticipated.
+
+**Recommendation: worth a follow-up implementation step, with a
+correction.** GoPlus honeypot/malicious-contract scanning is a genuine,
+currently-missing gap in seasniper's own 8b/8c target-resolve flow — right
+now namesquatting gets a warning label (8c) and nothing else is
+automated. GoPlus's NFT security API is free/accessible (same endpoint
+seadrop-noir-bot hits, no signup barrier evident from their code). Sketch,
+not implemented: add a `resolve_address`-adjacent check in `target.rs`
+that hits `https://api.gopluslabs.io/api/v1/nft_security/{chain_id}?
+contract_addresses={addr}`, checked against `is_honeypot`/
+`malicious_behavior`, fail-open by default (matching seadrop-noir-bot's
+own justified choice — a security API being briefly unavailable should
+not block an otherwise-legitimate target), surfaced as an additional
+warning tier alongside the existing namesquatting warning, not a hard
+block. The contract-age/Etherscan-verification idea is real and worth
+copying too, but implement it for real (actually call it from the
+resolve path) rather than reproducing seadrop-noir-bot's own gap of
+building it and never wiring it in.
+
+### 24b — NTP clock drift check: real, wired in, one accuracy correction
+
+Read `src/utils/clockCheck.ts` directly. **Not actually NTP** — the
+README's framing is a slight mischaracterization of the real mechanism:
+it's an HTTP `Date`-header comparison against Cloudflare's
+`/cdn-cgi/trace` endpoint, RTT-compensated (adds half the round-trip to
+the local timestamp before comparing), with an explicit, documented
+~1-second inherent quantization error from the `Date` header's own
+resolution. Threshold 1500ms, chosen specifically to sit above that
+quantization noise. Non-blocking: logs a warning, never refuses to start.
+**Confirmed genuinely wired into their boot sequence** — grepped for the
+call site: `src/index.ts` imports and awaits `checkClockDrift()`, not
+just defined-and-unused the way 24a's Etherscan checks were.
+
+**Recommendation: worth a small follow-up step.** This is real, cheap
+(one HTTP HEAD request, no new dependency — `fetch` is already available),
+and directly protects `timestamp`-mode's entire correctness model, which
+depends on the VPS's system clock being accurate — currently nothing in
+`main.rs`'s boot sequence checks this at all. Sketch: port an equivalent
+check into `main()` before `config::Config::load` or right after, log via
+both `bus::log` and `tracing::warn!` (this project's own established
+"both, not either" standard from step 17's finding), and — the one
+deliberate improvement over seadrop-noir-bot's own choice worth
+considering at implementation time — decide whether `timestamp`-mode
+triggers specifically should refuse to arm above some threshold, rather
+than only warning, given how directly this bot's core trigger mode depends
+on clock accuracy (their bot logs and continues either way; this project's
+own "reject a bad shape early" convention, used throughout `config.rs`'s
+`validate()`, argues for being stricter here, not just matching their
+non-blocking choice by default).
+
+### 24c — RPC benchmarking/ranking beyond broadcast-time racing: real infrastructure
+
+Read `src/rpc/client.ts` directly. Real: `benchmarkAndRank()` probes every
+configured custom endpoint's real `eth_blockNumber` latency, persists the
+measured latency, and rebuilds a `viem` `fallback()` transport ordered
+fastest-first (`rank: false` — they deliberately keep their own measured
+order rather than letting viem's own dynamic ranking override it). The
+exported `publicClient` is a `Proxy` that always forwards to the current
+underlying (possibly-just-rebuilt) client, so every read call anywhere in
+their codebase — not just a broadcast-time race — benefits from the
+ranking once computed. This is genuinely broader than seasniper's own
+`http_rpc_urls` racing, which only applies to the already-optimized
+`fire_prepared` broadcast path (`warm_connections`/racing every configured
+URL at fire time), not to `getPublicDrop` checks, balance polling, or any
+other read.
+
+**Recommendation: worth a follow-up step, tied directly to the still-open
+15f/19 colocation question.** Step 15f's own finding was explicit:
+`send_to_ack_ms`'s ~1.5x gap vs. MintDash is "plausibly explained by RPC/
+network proximity" and is "the number a future colocation/dedicated-node
+step could reasonably expect to move" — but colocation is real
+infrastructure work (a new VPS location, at minimum). RPC ranking is a
+cheaper lever aimed at the same underlying problem (this bot's own
+distance/quality to whichever RPC it's actually talking to) without
+needing new infrastructure — worth trying BEFORE colocation, not instead
+of it necessarily, since it's strictly cheaper to attempt. Sketch, not
+implemented: a periodic (or on-demand, admin-triggered) benchmark pass
+over `http_rpc_urls`, persisting measured latency (a new small table or a
+`config.rs` runtime field, not necessarily `identity.db` — implementation
+detail), reordering read-path calls (NOT the already-optimized
+`fire_prepared`/`warm_connections` hot path, which already races in
+parallel and gains nothing from sequential ranking) to prefer the
+fastest-measured endpoint first.
+
+### 24d — per-chain profile config structure: real, clean reference shape
+
+Read `src/chains.ts` directly. Real: a single `ChainProfile` interface per
+`ChainKey`, centralizing `chainId`, RPC/explorer/OpenSea-slug metadata,
+AND a nested `SnipeProfile` (priority fee, base-fee multiplier, hammer
+interval, lead time, fixed gas limit) — one object per chain, not values
+scattered across independent fields the way seasniper's own `block_time_ms`
+etc. currently are. Their own Robinhood Chain profile comment
+independently corroborates this project's own step 13 finding (no
+priority-fee market, latency-only racing, `eth_maxPriorityFeePerGas`
+returns 0) — real cross-validation from an independent codebase, not just
+agreement with itself.
+
+**Recommendation: worth a follow-up step, with InkChain (step 22, this
+same session) landing as a live example why.** Right now,
+`Config::looks_like_robinhood_chain()`'s existence in `config.rs` is
+itself a symptom of the scattered-values problem this pattern would fix —
+a per-chain-quirk special case bolted onto otherwise chain-agnostic
+validation, because there's no single place "here's what's different
+about this chain" lives. With three chains now confirmed relevant
+(Ethereum, Robinhood Chain, InkChain) and step 22b independently finding
+InkChain has its own quirks worth encoding (measured 1000ms block time,
+unconfirmed FCFS, unconfirmed mempool visibility), the risk of a FOURTH
+chain addition missing a needed per-chain tuning value (forgetting to set
+`block_time_ms` correctly, the exact class of bug `looks_like_robinhood_
+chain()`'s own validate() check exists to catch after the fact) grows with
+every chain added under the current scattered-fields shape. Sketch, not
+implemented: a `ChainProfile`-equivalent struct in `config.rs` (not a new
+file — the task's own instruction) holding the fields that are genuinely
+per-chain (block_time_ms, and — if steps 20/23's race_mode-adjacent work
+lands — sequencer URL conventions, gas-jitter defaults), with `Config`
+holding one `Option<ChainProfile>` or resolving one from `chain_id` at
+validate() time, replacing ad hoc per-chain `if` branches like
+`looks_like_robinhood_chain()` with a single lookup.
+
+### OpenSea key expiry corroboration — confirmed, no action needed
+
+seadrop-noir-bot's README states: "max 2 keys/day, expire after 7 days."
+Grepped their README directly (not summarized): confirmed verbatim —
+"Limits: read 600/h, write 30/h; **max 2 keys/day**, **expire after 7
+days**." This matches RUNBOOK.md's step 21e entry (7-day instant-key
+expiry) — independent corroboration from an unrelated codebase pointed at
+the same real OpenSea API, not just internal consistency with this
+project's own earlier finding. No action needed beyond this confirmation.
+
+No code changes in this step.

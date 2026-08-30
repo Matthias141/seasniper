@@ -171,6 +171,36 @@ private_key_env = "SNIPER_PK_3"
 # lagged head — don't use it as the RH race trigger.
 # trigger_mode = "timestamp"
 
+# --- InkChain (step 22) — SeaDrop's singleton is confirmed deployed at
+# the same address as above on InkChain MAINNET (real eth_getCode call,
+# not assumed from the cross-chain deterministic-address theory) — it is
+# NOT deployed at that address on InkChain testnet as of step 22's
+# check, so a live testnet dry run needs a different, project-supplied
+# SeaDrop address if one exists. chain_id is read live at prepare time
+# (executor.rs), never hardcoded, same as every other chain here. See
+# CLAUDE.md's "InkChain support" section before relying on this for a
+# real mint, not just this comment — in particular its mempool-
+# visibility finding, which affects whether trigger_mode =
+# "mempool_watch" / copymint can be used on this chain at all.
+#
+# Mainnet (chain id 57073):
+# ws_rpc_url = "wss://ink-mainnet.g.alchemy.com/v2/YOUR_KEY"
+# http_rpc_urls = ["https://ink-mainnet.g.alchemy.com/v2/YOUR_KEY"]
+#
+# Testnet / Ink Sepolia (chain id 763373) — SeaDrop not confirmed
+# deployed here as of step 22; treat as an explorer-only sanity check,
+# not a dry-run target, until that's resolved:
+# ws_rpc_url = "wss://ink-sepolia.g.alchemy.com/v2/YOUR_KEY"
+# http_rpc_urls = ["https://ink-sepolia.g.alchemy.com/v2/YOUR_KEY"]
+# Explorer: https://explorer-sepolia.inkonchain.com
+#
+# STEP 22b — InkChain's real block time, measured the same way as
+# Robinhood Chain's (50 consecutive mainnet block timestamps, not the
+# documented figure — InkChain's own docs don't publish one at all):
+# a consistent 1000ms per block. See CLAUDE.md's step 22 section for
+# the measurement and its 1-second-timestamp-granularity caveat.
+# block_time_ms = 1000
+
 # --- Copymint (step 6) — watch tracked wallets for SeaDrop mintPublic
 # activity and mint the same collection ourselves. SeaDrop-only, always
 # runs in the background independent of trigger_mode/armed state above —
