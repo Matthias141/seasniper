@@ -2995,3 +2995,123 @@ the same real OpenSea API, not just internal consistency with this
 project's own earlier finding. No action needed beyond this confirmation.
 
 No code changes in this step.
+
+## Step 26 — benchmark-token.sh redeploy grabbed the wrong address
+
+Real bug found live: `redeploy` mode successfully deployed and configured
+a fresh contract on-chain (two real `forge create` + `updatePublicDrop`
+transaction pairs, both `status: 1`) but reported the wrong address as
+"the deployed contract" both times, and neither address showed a live
+public drop when checked. Root cause, confirmed directly against the two
+real transactions: `forge create`'s stdout prints `Deployer: 0x...`
+BEFORE `Deployed to: 0x...`, and the old parsing
+(`grep -oE '0x[a-fA-F0-9]{40}' | head -1`) grabbed the first match —
+the deployer's own EOA, not the contract. That misparsed address was then
+reused as the target for BOTH `setMaxSupply` and `updatePublicDrop`, so
+both calls silently no-op'd against the deployer's own EOA (an EOA has no
+code to revert against) — the real contract was never actually
+configured, not just misreported.
+
+Fixed by extracting the parsing into `deploy/lib/parse_deployed_address.sh`
+(strictly matches the `Deployed to:` line, hard-fails if it's absent
+rather than falling back to a guess), with a regression test
+(`deploy/tests/test-parse-deployed-address.sh`) built from tonight's real
+addresses, confirmed to actually catch the original bug (reverting the
+fix reproduces the exact live failure) before confirming the fix passes.
+Wired into CI. **Explicit gap, not silently skipped:** the actual live
+re-deploy re-verification (confirming the script's own printed address
+matches what `getPublicDrop` independently reports as live, end-to-end
+on the real chain) has not been performed — this session has no funded
+Robinhood Chain testnet deployer wallet independent of the operator.
+
+## Step 27 — run-benchmark.sh's silent failure between the liveness check and restore
+
+Real bug found live: `run-benchmark.sh` failed with a bare non-zero exit
+and zero diagnostic output between "confirming the benchmark token is
+live" and its own config-restore step. Manually running the identical
+`benchmark-token.sh check` command with the same RPC URL and the same
+genuinely-live step 26 benchmark token
+(`0x118fafd8511a04Df686e848425253c838B3a1a94`) succeeded cleanly — so
+neither the token nor the check logic itself was broken; something in
+how `run-benchmark.sh` invoked that check internally was.
+
+**Two real, compounding bugs, both confirmed by reading the code
+directly, not guessed:**
+
+1. **Stale hardcoded address, no discovery mechanism.**
+   `BENCHMARK_CHECK_ADDR` had exactly one hardcoded default — step 14b's
+   *original* benchmark token (`0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9`)
+   — with nothing that picked up a later `benchmark-token.sh redeploy`'s
+   fresh address automatically, and the variable isn't even mentioned in
+   `run-benchmark.sh`'s own "Usage:" example (only in the Prerequisites
+   section below it). An operator following the documented usage
+   literally, after step 26's redeploy replaced the token, would silently
+   re-check the stale original address every run.
+2. **The failure that address-check produced was then swallowed
+   entirely.** `CHECK_OUTPUT=$(RPC_URL=... benchmark-token.sh check ...)`
+   is a plain variable assignment under `set -euo pipefail` — bash
+   propagates a failed command substitution's exit status to the
+   assignment itself, so when the check failed (EXPIRED, given bug #1),
+   `run-benchmark.sh` aborted immediately at that exact line, before
+   `echo "$CHECK_OUTPUT"` ever ran. The real reason WAS captured into the
+   variable — it just never reached the terminal. `cleanup()`'s own
+   "exiting non-zero — see messages above" text was actively wrong in
+   this specific failure mode, since there were no messages above to see.
+   (Ruled out, with reasoning: an env-var-scoping/sudo-stripping issue for
+   `TESTNET_HTTP_RPC_URL` — the script's own `${TESTNET_HTTP_RPC_URL:?...}`
+   guard would have failed loudly at the top of the script, long before
+   "confirming the benchmark token is live" ever prints, if that var were
+   genuinely unset; it wasn't.)
+
+**Fixed, both bugs, plus the general silent-failure problem:**
+
+- **Discovery, not just documentation.** `benchmark-token.sh redeploy`
+  now writes its fresh address to a gitignored state file
+  (`deploy/.benchmark-token-address`) on success.
+  `deploy/lib/resolve_benchmark_address.sh` resolves
+  `BENCHMARK_CHECK_ADDR` with real precedence — an explicit env override,
+  then that state file, then the original hardcoded fallback — so a
+  redeploy's address is picked up automatically on the next
+  `run-benchmark.sh` run with no manual copy-paste step to forget.
+  `run-benchmark.sh` now also prints which address it resolved and from
+  which source, before the check runs.
+- **No more silent swallowing, at both ends.** `benchmark-token.sh
+  check`'s human-readable diagnostics (STILL LIVE / EXPIRED / endTime
+  unreadable) now go to stderr — they show up live, as they happen,
+  regardless of what any caller does with stdout; only the
+  machine-parseable `BENCHMARK_NFT_CONTRACT=` line stays on stdout.
+  `run-benchmark.sh` no longer lets `set -e` silently abort past the
+  check call either — it explicitly captures the real exit status and
+  reports it plainly before deciding what to do next.
+- Audited every other failure path in `run-benchmark.sh` against the
+  "every failure prints the real reason" standard (`RUNBOOK.md`-grade,
+  same bar as `benchmark-token.sh`'s cast-bracket fix and step 17's WS
+  error-wrapping) — every other exit point already complied; this
+  check-liveness step was the only real gap.
+
+**Verified, precisely — what could be tested here, and what couldn't.**
+`deploy/lib/resolve_benchmark_address.sh` is fully unit-testable without
+a live chain (`deploy/tests/test-resolve-benchmark-address.sh`, 4
+assertions: hardcoded fallback, state-file auto-discovery, env override
+always wins, a garbage state file degrades safely) — confirmed it
+actually catches the original bug by manually reproducing the old,
+state-file-blind logic against the same fixture and showing it resolves
+to the stale address. The silent-swallow fix was verified by simulating
+both the old (stdout-diagnostics, no exit-status capture — reproduces a
+completely silent, zero-output non-zero exit, exactly the live symptom)
+and new (stderr diagnostics + explicit status capture — real reason
+visible) invocation shapes side by side. Wired into CI's `deploy-scripts`
+job. **What was NOT verified, stated plainly, same honesty standard as
+step 26's closing note:** this session has no live VPS or funded testnet
+wallet independent of the operator, so the actual end-to-end
+`run-benchmark.sh` orchestration (state-file write on a real redeploy,
+auto-discovery on the next real run, the full swap/fire/restore cycle)
+has not been re-run live. Operator verification: run
+`benchmark-token.sh redeploy`, confirm
+`deploy/.benchmark-token-address` now holds the new address, then run
+`run-benchmark.sh` with no `BENCHMARK_CHECK_ADDR` override and confirm
+its own printed "using benchmark token address: ... (source: state-file)"
+line names that same address.
+
+cargo build/check/test: no Rust changes in either step 26 or step 27 —
+both are `deploy/*.sh` fixes only.

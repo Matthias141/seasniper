@@ -37,10 +37,16 @@
 #        TESTNET_WS_RPC_URL   - e.g. wss://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY
 #        TESTNET_HTTP_RPC_URL - e.g. https://robinhood-testnet.g.alchemy.com/v2/YOUR_KEY
 #      Optional:
-#        BENCHMARK_CHECK_ADDR - defaults to step 14b's original token
-#                                (0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9);
-#                                override if you've redeployed via
-#                                benchmark-token.sh redeploy
+#        BENCHMARK_CHECK_ADDR - STEP 27: usually don't need to set this by
+#                                hand anymore. Auto-discovered via
+#                                deploy/lib/resolve_benchmark_address.sh:
+#                                this env var (if set) > the state file
+#                                `benchmark-token.sh redeploy` now writes
+#                                automatically on success
+#                                (deploy/.benchmark-token-address) > step
+#                                14b's original hardcoded token as a last-
+#                                resort fallback. Set this explicitly only
+#                                to deliberately override both of those.
 #        MIN_BALANCE_ETH      - default 0.01, the per-wallet threshold
 #                                the pre-flight balance gate enforces
 #                                (mint price is 0 on the benchmark drop
@@ -102,7 +108,20 @@ INTER_FIRE_DELAY_SECS="${INTER_FIRE_DELAY_SECS:-3}"
 FIRE_TIMEOUT_SECS="${FIRE_TIMEOUT_SECS:-40}"  # generous over inclusion_timeout_ms's 30000ms default
 HEALTH_TIMEOUT_SECS="${HEALTH_TIMEOUT_SECS:-30}"
 MIN_BALANCE_ETH="${MIN_BALANCE_ETH:-0.01}"
-BENCHMARK_CHECK_ADDR="${BENCHMARK_CHECK_ADDR:-0xf926f5B2e0b760807f032e0C4fC8876c2FF245C9}"
+
+# STEP 27 — real bug found live: BENCHMARK_CHECK_ADDR used to have a single
+# hardcoded default (step 14b's original benchmark token) with no mechanism
+# to pick up a later `benchmark-token.sh redeploy`'s fresh address, and
+# wasn't even mentioned in this script's own "Usage:" example above — an
+# operator following that example literally would silently re-check a
+# STALE address every run. Resolved via deploy/lib/resolve_benchmark_address.sh
+# instead: env override > the state file `benchmark-token.sh redeploy` now
+# writes on success > the original hardcoded fallback. See that script's own
+# header comment for the full precedence and reasoning.
+RESOLVED_BENCHMARK_ADDR=$("$SCRIPT_DIR/lib/resolve_benchmark_address.sh" \
+  "$SCRIPT_DIR/.benchmark-token-address" "${BENCHMARK_CHECK_ADDR:-}")
+BENCHMARK_CHECK_ADDR="${RESOLVED_BENCHMARK_ADDR%% *}"
+BENCHMARK_CHECK_ADDR_SOURCE="${RESOLVED_BENCHMARK_ADDR#* }"
 
 TESTNET_WS_RPC_URL="${TESTNET_WS_RPC_URL:?set TESTNET_WS_RPC_URL to your Robinhood Chain testnet wss:// Alchemy URL first}"
 TESTNET_HTTP_RPC_URL="${TESTNET_HTTP_RPC_URL:?set TESTNET_HTTP_RPC_URL to your Robinhood Chain testnet https:// Alchemy URL first}"
@@ -229,14 +248,44 @@ trap cleanup EXIT
 
 # --- 2. confirm the benchmark token and swap config.toml to testnet ---
 echo
+echo "==> using benchmark token address: $BENCHMARK_CHECK_ADDR (source: $BENCHMARK_CHECK_ADDR_SOURCE)"
 echo "==> confirming the benchmark token is live"
+# STEP 27 — real silent-failure bug found live: benchmark-token.sh's own
+# diagnostic text (STILL LIVE / EXPIRED / endTime-unreadable, WHY the check
+# failed) used to print on stdout, which this line captures into a
+# variable. Under `set -euo pipefail`, a plain `VAR=$(cmd)` assignment
+# propagates cmd's own exit status — so when benchmark-token.sh exited
+# non-zero (e.g. EXPIRED), THIS SCRIPT aborted immediately at this exact
+# line, before the `echo "$CHECK_OUTPUT"` below ever ran. The real reason
+# WAS captured into CHECK_OUTPUT, it just never got printed anywhere —
+# a completely silent, bare non-zero exit, with cleanup()'s own "see
+# messages above" text pointing at messages that were never shown.
+#
+# Fixed two ways, not just one: (1) benchmark-token.sh's own diagnostics
+# now go to stderr (see its step 27 comment), so they show up live on the
+# terminal as they happen regardless of what happens to stdout here; (2)
+# this script no longer lets `set -e` silently abort past this call at
+# all — it explicitly disables -e for just this one command, captures the
+# real exit status, and reports it plainly before deciding what to do
+# next, the same "surface the real reason, don't swallow it" standard
+# already applied to benchmark-token.sh's cast-bracket fix and the step 17
+# WS-connect error wrapping.
+set +e
 CHECK_OUTPUT=$(RPC_URL="$TESTNET_HTTP_RPC_URL" "$SCRIPT_DIR/benchmark-token.sh" check "$BENCHMARK_CHECK_ADDR")
+CHECK_STATUS=$?
+set -e
+if [[ "$CHECK_STATUS" -ne 0 ]]; then
+  echo "==> benchmark-token.sh check exited $CHECK_STATUS — see the diagnostic output" >&2
+  echo "    above (now printed to stderr, live, as it happened) for the real reason." >&2
+fi
 echo "$CHECK_OUTPUT"
 NFT_CONTRACT=$(echo "$CHECK_OUTPUT" | grep '^BENCHMARK_NFT_CONTRACT=' | cut -d= -f2)
 if [[ -z "$NFT_CONTRACT" ]]; then
-  echo "could not confirm a live benchmark token — see output above. If EXPIRED, run" >&2
-  echo "'./benchmark-token.sh redeploy' first, then re-run this script with" >&2
-  echo "BENCHMARK_CHECK_ADDR set to the new address." >&2
+  echo "could not confirm a live benchmark token against $BENCHMARK_CHECK_ADDR (source:" >&2
+  echo "$BENCHMARK_CHECK_ADDR_SOURCE) — see the diagnostic output above for why. If" >&2
+  echo "EXPIRED, run './benchmark-token.sh redeploy' — it now auto-records the fresh" >&2
+  echo "address for this script to pick up next time, no BENCHMARK_CHECK_ADDR override" >&2
+  echo "needed (see deploy/lib/resolve_benchmark_address.sh)." >&2
   exit 1
 fi
 

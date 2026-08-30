@@ -31,8 +31,15 @@ FAILURES=0
 
 run_check() {
   local addr="$1"
+  # STEP 27 — benchmark-token.sh's `check` mode now sends its
+  # human-readable diagnostics (STILL LIVE / EXPIRED / unreadable, etc.)
+  # to stderr, keeping only the machine-parseable BENCHMARK_NFT_CONTRACT=
+  # line on stdout (see that script's own step 27 comment for why — a
+  # caller capturing just stdout was silently losing the real failure
+  # reason). Merge both streams here so this test still sees everything a
+  # human running this directly in a terminal would.
   PATH="$FAKE_BIN_DIR:$PATH" RPC_URL="http://fake-rpc.invalid" \
-    bash "$TARGET" check "$addr"
+    bash "$TARGET" check "$addr" 2>&1
 }
 
 assert_contains() {
