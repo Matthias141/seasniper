@@ -2038,6 +2038,179 @@ cargo build/test (136/136)/clippy --all-targets -- -D warnings clean.
 All 10 `deploy/tests/*` pass. `npm run typecheck`/`test` (3/3)/`build`
 clean.
 
+**Step 28 (final close, corrected) — the real n=100 run happened; a real
+gap in what it can prove was found before drawing a conclusion from it,
+and closed for the NEXT run rather than papered over on this one.**
+
+28c's live n=100 run (`RACE_MODE_BENCHMARK=true FIRE_COUNT=100
+./run-benchmark.sh`) happened and produced real numbers, larger-sample
+and consistent in shape with the n=15 figures immediately above (169ms/
+385ms) — a bigger sample of the same regime, not a contradiction:
+
+| Metric | n=100 (this run) | n=15 (28a-28d, above) |
+|---|---|---|
+| send→ack p50 | 214ms | 169ms |
+| send→ack p90 | 286ms | 320ms |
+| send→ack p99 | 414ms | — |
+| send→ack mean | 219ms | — |
+| dispatch→inclusion p50 | 462ms | 385ms |
+| dispatch→inclusion p90 | 540ms | 434ms |
+| dispatch→inclusion p99 | 731ms | — |
+| dispatch→inclusion mean | 440ms | — |
+
+The n=15 figures are **not superseded by these** in the usual sense —
+they're the same regime at a smaller, lower-confidence sample size; the
+n=100 numbers are the more statistically reliable read of the same
+underlying behavior, not a different finding.
+
+**But journalctl from this n=100 run surfaced a real evidentiary gap,
+correctly flagged rather than argued past:** every single logged
+`send_to_ack` winner across all 100 fires was the Alchemy testnet RPC —
+the sequencer never won a single logged ack. Read at face value, that
+looks like "sequencer racing isn't helping on this path." **It cannot
+actually be read that way yet**, because prior to this section, only the
+WINNING provider's ack ever got logged per fire (`classify_ack_source`,
+28a above, records `ack_source`/`acked_url` for the ack that won —
+nothing for the providers that didn't). A sequencer that raced fairly
+and lost on latency, and a sequencer that was silently never in the race
+at all (unwarmed, misconfigured, erroring before ever reaching the
+network) are **indistinguishable in that evidence** — same "sequencer
+never appears as the winner" signature, two completely different bugs,
+two completely different fixes. Concluding "sequencer racing doesn't
+help" from this data alone would have been the exact kind of
+unsupported-but-plausible-sounding claim this project's standing rule
+exists to prevent.
+
+**28a (this round) — the actual missing instrumentation, added.**
+`fire_prepared` (`executor.rs`) now logs **every** broadcast target's own
+send attempt at send time — `url`, `ok` (bool), and `latency_ms` —
+regardless of which one (if any) ends up being the winning ack:
+- The sequencer's own attempt logs `"sequencer send attempt"` on both its
+  success and failure branches (previously: success was logged, but
+  failure only logged a bare error with no `latency_ms`/`ok` field, and
+  a `None` sequencer — never warmed/configured for this fire — produced
+  **no log line explaining why** it was absent from the race at all).
+  That last case is now explicit: `"no sequencer for this fire —
+  sequencer_http_url is empty or unparseable (warm_sequencer never
+  produced a provider at Arm time); broadcasting to backup RPCs only"`.
+- Each backup RPC's own attempt logs `"backup RPC send attempt"` with the
+  same `url`/`ok`/`latency_ms` fields on both success and failure —
+  previously, a backup's SEND failure was completely silent per-attempt,
+  only surfacing in an aggregated error string if literally every backup
+  failed too.
+
+This is pure logging on results already being computed on the hot fire
+path — no new RPC calls, no new `.await` points, nothing added to
+`fire_prepared`'s actual critical-path work. Confirmed via `cargo build
+--all-targets`/`cargo test` (140/140, up from 136 — 4 new config tests
+below)/`cargo clippy --all-targets -- -D warnings`, all clean; the
+existing `sequencer_ack_only_with_no_backup_rpc_resolves_to_real_inclusion`
+test (which exercises `fire_prepared`'s sequencer-present path directly)
+still passes unmodified, confirming this was a pure logging addition with
+no functional change.
+
+**28b — verified directly against the code, not assumed, all four:**
+1. **Is `sequencer_http_url` actually in the concurrent broadcast list at
+   fire time?** Yes, confirmed by tracing the real call path, not
+   inferred from config alone: `main.rs` calls `executor::warm_sequencer`
+   unconditionally at Arm time, stores the result, and threads it into
+   every one of the three `fire_prepared` call sites as
+   `sequencer.as_ref()`. Inside `fire_prepared`, `sequencer_url =
+   cfg.sequencer_http_url.clone()` is raced via `tokio::join!` against the
+   backup RPCs in `sequencer_fut`/`backup_fut` — genuinely concurrent, not
+   sequential fallback.
+2. **Does the sequencer connection warm successfully at Arm time?**
+   `warm_sequencer` already logs its real outcome distinctly, checked
+   directly rather than assuming the function merely being called means
+   anything: `"sequencer connection warmed: {url}"` (info) on a real
+   success OR the endpoint's expected `-32601` write-only response (both
+   count as a real warm — see the function's own doc comment for why a
+   JSON-RPC error response still proves the TCP/TLS handshake and request
+   parsing succeeded), vs. `"sequencer warm failed for {url} (will still
+   be used, just cold): {e}"` (warn) only on a genuine transport-level
+   failure (DNS/connection/TLS/timeout). `warm_sequencer` returns `Some`
+   even after a warm failure (only `None` on an empty or unparseable
+   URL) — so under this project's forced-race_mode benchmark config, a
+   `None` sequencer at fire time should be rare, not the expected case;
+   this is inference pending 28c's real re-run, not yet confirmed by log
+   evidence.
+3. **`wss://`/`feed.*` rejection on `sequencer_http_url`.** Did not
+   already exist — `rpc_urls_to_validate()` ran `sequencer_http_url`
+   through the same generic `url::Url::parse` + userinfo check as every
+   other RPC URL, with no scheme or host check specific to it. Added in
+   `Config::validate()` (`config.rs`): a non-empty `sequencer_http_url`
+   must parse with scheme `http`/`https` (never `ws`/`wss` — the
+   sequencer is a submit-only JSON-RPC HTTP endpoint, confirmed by
+   `warm_sequencer`'s own doc comment, which lists every method the real
+   endpoint answers, all HTTP JSON-RPC, no WS), and its host must not
+   start with `feed.` (the Nitro feed, `inclusion_ws_url`'s own doc
+   comment already warns "is not an eth WS" and is a different-purpose
+   receipt-streaming endpoint entirely — an easy mix-up since both are
+   Robinhood Chain URLs configured near each other). 4 new unit tests
+   (`rejects_wss_sequencer_http_url`, `rejects_feed_host_sequencer_http_url`,
+   `accepts_real_sequencer_http_url`,
+   `empty_sequencer_http_url_is_still_a_valid_unset_shape`).
+4. **Do prepare-time reads (`estimateGas`/`chainId`/gas price) stay off
+   the sequencer connection?** Confirmed yes, by tracing the code, not
+   assumed: `prepare_fire` (`executor.rs`) takes `providers: &[HttpProvider]`
+   only — no sequencer parameter exists on its signature at all — and
+   reads via `providers.first()`. Those providers come exclusively from
+   `warm_connections`, which builds strictly from `cfg.http_rpc_urls` in
+   order; `warm_sequencer`'s `Option<HttpProvider>` is a structurally
+   separate value never passed into `prepare_fire` anywhere in `main.rs`.
+   `providers.first()` is therefore always `http_rpc_urls[0]`, never the
+   sequencer, by construction — not just by convention.
+
+**The sequencer-racing-effectiveness question remains OPEN — deliberately
+not settled here.** 28a's instrumentation exists now; it has not yet been
+exercised against a real run. The n=100 numbers above and the "sequencer
+never won a logged ack" observation both predate this instrumentation —
+neither confirms nor rules out "the sequencer was racing and losing" vs.
+"the sequencer was silently absent/erroring." **Do not read this section
+as "confirmed not the cause"; that framing is exactly what a prior
+version of this task got wrong and this rewrite corrects.**
+
+**28c handoff — a small live re-run, operator-run, not this session's to
+execute.** Once a deploy carrying this section's `executor.rs`/
+`config.rs` changes is live: a handful of fires (not another n=100) is
+enough. For each fire, `journalctl` should now show one `"sequencer send
+attempt"` or `"no sequencer for this fire"` line, plus one `"backup RPC
+send attempt"` line per configured backup RPC — every configured target
+accounted for, win or lose. Two possible real findings, and only one of
+the two is the "worth investigating further" case:
+- **The sequencer shows up with a real `ok=true`/`ok=false` and
+  `latency_ms` entry on every attempt, genuinely racing and genuinely
+  losing on latency every time:** a real, confirmed finding — sequencer
+  racing isn't currently helping on this testnet path. Worth its own
+  separate investigation into why (network path from this VPS, sequencer
+  warm-connection reliability, or the testnet sequencer simply being
+  slower than the backup RPC) — **don't speculate which without
+  evidence**, exactly as this task specified.
+- **The sequencer never appears in the logs at all, or appears with
+  `ok=false` on every single attempt (a real send failure, not a fair
+  loss):** a different, simpler bug — something in warm/config/
+  connectivity, not a racing-strategy question — fix it, then re-run for
+  a real performance comparison once it is actually racing.
+
+**Restated once more, because it's directly adjacent to this question and
+must not be conflated with it:** the original ~2127ms
+`dispatch_to_inclusion_ms` baseline (15f, several steps before this one)
+is confirmed genuine on-chain delay — step 19's
+`diagnose_inclusion_delay.py` read real on-chain receipt `blockNumber`s
+(chain-consensus data, independent of any single RPC provider's own
+notification timing) and found 21, 22, and 28 real blocks elapsed on the
+three checked transactions. **Not** Alchemy RPC head-notification lag,
+**not** a measurement artifact. This is unrelated to whether sequencer
+racing is currently winning any sends — a genuine on-chain delay and an
+unraced/losing sequencer are two different, independently-true facts —
+but it is restated here again so it cannot be mistaken for a competing
+explanation of anything in this section.
+
+cargo build/test (140/140, up from 136 — the 4 new `config::tests`
+above)/clippy --all-targets -- -D warnings clean. All 10
+`deploy/tests/*` pass (unmodified by this round — no deploy script
+changes this time). No UI changes this round.
+
 ### 15g — a new, separate open question: real sequencer delay, or
 Alchemy-specific indexing lag? (does NOT change 15f's verdict above)
 
