@@ -387,7 +387,27 @@ echo "==> race_mode / sequencer_http_url as the bot is ACTUALLY running (GET /ap
 echo "    read post-swap-restart — this is what this run's numbers should be attributed to,"
 echo "    not assumed from the swap script, which never touches either field):"
 RUNTIME_CONFIG=$(curl -sS -H "Authorization: Bearer $API_TOKEN" "$BOT_URL/api/config")
-echo "$RUNTIME_CONFIG" | jq '{race_mode, sequencer_http_url}'
+RACE_MODE_REPORT=$(echo "$RUNTIME_CONFIG" | jq '{race_mode, sequencer_http_url}')
+echo "$RACE_MODE_REPORT"
+
+# STEP 28a FOLLOW-UP — real gap found investigating a prior benchmark's
+# unexplained 5.5x dispatch_to_inclusion improvement: this report used
+# to reach only the operator's own terminal, which for that specific
+# run was never captured or saved — leaving the actual cause (PR #9's
+# sequencer racing actually engaging, vs. ordinary testnet-condition
+# drift) permanently unconfirmable after the fact, discovered only when
+# trying to write the result up. Persisted to a durable file now (in
+# addition to, not instead of, the stdout line above) so a FUTURE run's
+# evidence survives even if the terminal scrollback doesn't.
+RACE_MODE_REPORT_FILE="$BOT_DIR/last-benchmark-race-mode-report.txt"
+{
+  echo "run started (UTC): $(date -u +%FT%TZ)"
+  echo "fire count: $N"
+  echo "$RACE_MODE_REPORT"
+} > "$RACE_MODE_REPORT_FILE"
+chown "$SERVICE_USER:$SERVICE_USER" "$RACE_MODE_REPORT_FILE" 2>/dev/null || true
+echo "==> saved to $RACE_MODE_REPORT_FILE — paste this alongside the p50/p90/p99"
+echo "    numbers when writing up a result. Don't rely on terminal scrollback."
 
 # balance_poll_loop refreshes wallet balances every 15s (main.rs) — give
 # it time to complete at least one real cycle against the NEW network
