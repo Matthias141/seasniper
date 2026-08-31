@@ -1893,6 +1893,59 @@ cargo build/check/test: no Rust changes — `run-benchmark.sh`'s new
 `GET /api/config` report is a read-only addition to an existing
 deploy-only script.
 
+**Step 28 (resend) — re-checked directly, still genuinely unconfirmed;
+one wrong hypothesis explicitly ruled out; the evidence-capture gap
+that caused this fixed.** Re-read `swap_config_to_testnet.py` fresh
+(not assumed unchanged from memory): still confirmed to touch only its
+original seven fields (`ws_rpc_url`, `http_rpc_urls`, `mint_mode`,
+`nft_contract`, `fee_recipient`, `quantity_per_wallet`,
+`block_time_ms`) — `race_mode`/`sequencer_http_url` are untouched, by
+design, exactly as this section already found. Asked the operator
+directly whether either piece of evidence this section's own "Fixed"
+paragraph made possible — the `GET /api/config` report line, or
+`journalctl` output — was captured for the specific run that produced
+169ms/385ms. **Neither was.** The cause of the ~5.5x
+`dispatch_to_inclusion_ms` improvement therefore remains exactly as
+unconfirmed as this section already stated — this is a re-check that
+found no new evidence, not a new finding, and the two possibilities
+below stand exactly as they were: PR #9's sequencer racing actually
+engaging, or ordinary testnet-condition drift on a shared public
+testnet. **Do not credit PR #9 for this improvement without the
+follow-up run below actually happening.**
+
+**One specific wrong hypothesis, explicitly ruled out so it doesn't
+resurface:** the OLD, now-superseded ~2127ms `dispatch_to_inclusion_ms`
+figure (15f's own PUSH-confirmed number, the one this run improved on)
+is **not** explainable as Alchemy RPC head-notification lag or any
+other "the chain was actually faster, our RPC just told us late"
+mechanism. This was already directly tested and disproven, not
+theorized: step 19's `diagnose_inclusion_delay.py` run against three
+real transactions from that original result read each one's actual
+on-chain receipt `blockNumber` — chain-consensus data, independent of
+any single RPC provider's own notification timing — against the
+dispatch-time block, and found 21, 22, and 28 real blocks elapsed
+respectively, all far above the tool's own `<=2 blocks` node/detection-
+lag threshold. That number reflects genuine on-chain delay. (15g,
+immediately below, investigates a real but *different*, still-
+open question — not whether the delay is genuine, which is settled, but
+whether the Robinhood Chain sequencer's own block-production timing
+might differ from when Alchemy's node specifically indexed and served a
+block it already agreed happened — and reaches no conclusion either
+way. Do not conflate the two: 15g leaves open a subtler mechanism
+question about a genuine, already-confirmed delay; it does not reopen
+whether the delay itself was real.)
+
+**Fixed — the actual gap that made this unconfirmable.** The `GET
+/api/config` report this section's original "Fixed" paragraph added
+only ever reached the operator's own terminal — for the one run that
+mattered, that scrollback wasn't saved. `run-benchmark.sh` now also
+writes that same report (plus a UTC timestamp and the fire count) to a
+durable file, `$BOT_DIR/last-benchmark-race-mode-report.txt`, on every
+run — surviving a closed terminal, a disconnected SSH session, or
+simply forgetting to scroll up. The script also prints the file's path
+and an explicit reminder to paste it into any future write-up, rather
+than trusting scrollback.
+
 ### 15g — a new, separate open question: real sequencer delay, or
 Alchemy-specific indexing lag? (does NOT change 15f's verdict above)
 
