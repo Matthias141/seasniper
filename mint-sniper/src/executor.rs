@@ -304,23 +304,51 @@ pub async fn fire_prepared(
             let trigger_to_dispatch_ms = dispatch_started.saturating_duration_since(trigger_detected_at).as_millis() as u64;
             let prepare_age_ms = dispatch_started.saturating_duration_since(prepared_at).as_millis() as u64;
 
+            // STEP 28 (final) — every broadcast target's own attempt is
+            // logged here, immediately, regardless of whether it ends up
+            // being the wallet's "winning" ack — not just whichever URL
+            // `prefer_sequencer_ack` later picks. This is the actual
+            // missing instrumentation a prior benchmark's journalctl
+            // review couldn't answer from: without a real per-attempt
+            // record, a sequencer that was silently absent (never
+            // configured/warmed for this fire) looks IDENTICAL in the
+            // logs to one that raced fairly and lost on latency — two
+            // different bugs needing two different fixes, and no way to
+            // tell them apart after the fact without this. Pure logging
+            // added to results already being computed on the hot path —
+            // no new RPC calls, no new awaits, nothing that could slow
+            // fire_prepared down.
+            if sequencer.is_none() {
+                info!(
+                    %address,
+                    "no sequencer for this fire — sequencer_http_url is empty or unparseable \
+                     (warm_sequencer never produced a provider at Arm time); broadcasting to \
+                     backup RPCs only"
+                );
+            }
+
             let sequencer_fut = async {
                 if let Some(seq) = sequencer.as_ref() {
+                    let attempt_started = std::time::Instant::now();
                     match seq.send_raw_transaction(raw_tx.as_ref()).await {
                         Ok(_) => {
                             let ms = dispatch_started.elapsed().as_millis() as u64;
                             info!(
                                 url = %config::redact_rpc_url(&sequencer_url),
                                 send_to_ack_ms = ms,
-                                "sequencer acked send_raw_transaction"
+                                latency_ms = attempt_started.elapsed().as_millis() as u64,
+                                ok = true,
+                                "sequencer send attempt"
                             );
                             Some((ms, sequencer_url.clone()))
                         }
                         Err(e) => {
                             warn!(
                                 url = %config::redact_rpc_url(&sequencer_url),
+                                latency_ms = attempt_started.elapsed().as_millis() as u64,
+                                ok = false,
                                 error = %e,
-                                "sequencer send_raw_transaction failed; fanning out to backup RPCs"
+                                "sequencer send attempt; fanning out to backup RPCs"
                             );
                             None
                         }
@@ -337,12 +365,24 @@ pub async fn fire_prepared(
                     let url = backup_urls.get(i).cloned().unwrap_or_else(|| format!("rpc[{i}]"));
                     async move {
                         let result: Result<SendAttemptOutcome, anyhow::Error> = async {
-                            let _pending = provider.send_raw_transaction(raw_tx.as_ref()).await?;
+                            let attempt_started = std::time::Instant::now();
+                            if let Err(e) = provider.send_raw_transaction(raw_tx.as_ref()).await {
+                                warn!(
+                                    url = %config::redact_rpc_url(&url),
+                                    latency_ms = attempt_started.elapsed().as_millis() as u64,
+                                    ok = false,
+                                    error = %e,
+                                    "backup RPC send attempt"
+                                );
+                                return Err(e.into());
+                            }
                             let send_to_ack_ms = dispatch_started.elapsed().as_millis() as u64;
                             info!(
                                 url = %config::redact_rpc_url(&url),
                                 send_to_ack_ms,
-                                "backup RPC acked send_raw_transaction"
+                                latency_ms = attempt_started.elapsed().as_millis() as u64,
+                                ok = true,
+                                "backup RPC send attempt"
                             );
                             match crate::inclusion::wait_for_receipt(
                                 provider,

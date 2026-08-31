@@ -444,6 +444,45 @@ impl Config {
             }
         }
 
+        // STEP 28 (final close, corrected) 28b — sequencer_http_url is a
+        // submit-only JSON-RPC HTTP endpoint (see this field's own doc
+        // comment and warm_sequencer's — eth_sendRawTransaction /
+        // eth_sendRawTransactionConditional only). It is never a WS/feed
+        // URL: `inclusion_ws_url`'s own doc comment already warns that the
+        // Nitro feed (`wss://feed.*.chain.robinhood.com`) "is not an eth
+        // WS" and exists for a completely different purpose (receipt
+        // streaming, not tx submission). A `wss://` or `feed.*`-host value
+        // pasted into sequencer_http_url by mistake (an easy mix-up, since
+        // both are Robinhood Chain URLs configured near each other) would
+        // previously pass this function's generic `url::Url::parse` check
+        // — a well-formed URL, just pointed at the wrong endpoint — and
+        // only fail confusingly at fire time. Reject it here instead.
+        if !self.sequencer_http_url.is_empty() {
+            let parsed = url::Url::parse(&self.sequencer_http_url)
+                .with_context(|| format!("invalid sequencer_http_url: {}", self.sequencer_http_url))?;
+            if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                anyhow::bail!(
+                    "sequencer_http_url ({}) must be http:// or https:// — the sequencer is a \
+                     submit-only JSON-RPC HTTP endpoint (eth_sendRawTransaction), never a \
+                     WebSocket URL",
+                    self.sequencer_http_url
+                );
+            }
+            let host_is_feed = parsed
+                .host_str()
+                .map(|h| h.starts_with("feed."))
+                .unwrap_or(false);
+            if host_is_feed {
+                anyhow::bail!(
+                    "sequencer_http_url ({}) looks like a Nitro feed host (feed.*) — that is a \
+                     receipt-streaming endpoint, not the submit-only sequencer. Use \
+                     https://sequencer.{{mainnet,testnet}}.chain.robinhood.com instead, and put \
+                     any feed URL in inclusion_ws_url",
+                    self.sequencer_http_url
+                );
+            }
+        }
+
         if self.wallets.is_empty() {
             anyhow::bail!("wallets list is empty — at least one wallet is required");
         }
@@ -1159,6 +1198,46 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("race_mode"), "{err}");
         assert!(err.contains("jitter_ms_max"), "{err}");
+    }
+
+    // STEP 28 (final close, corrected) 28b — sequencer_http_url is a
+    // submit-only HTTP endpoint; a wss:// or feed.* URL pasted in by
+    // mistake used to pass validate() as a plain well-formed URL and only
+    // fail confusingly at fire time. These confirm the new rejection.
+    #[test]
+    fn rejects_wss_sequencer_http_url() {
+        let mut cfg = test_config();
+        cfg.sequencer_http_url = "wss://sequencer.testnet.chain.robinhood.com".to_string();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("sequencer_http_url"), "{err}");
+        assert!(err.contains("http"), "{err}");
+    }
+
+    #[test]
+    fn rejects_feed_host_sequencer_http_url() {
+        let mut cfg = test_config();
+        cfg.sequencer_http_url = "https://feed.testnet.chain.robinhood.com".to_string();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("sequencer_http_url"), "{err}");
+        assert!(err.contains("feed"), "{err}");
+    }
+
+    #[test]
+    fn accepts_real_sequencer_http_url() {
+        let mut cfg = test_config();
+        cfg.sequencer_http_url = "https://sequencer.testnet.chain.robinhood.com".to_string();
+        // looks_like_robinhood_chain() is true once sequencer_http_url is
+        // set — needs the RH block time too, or this hits the unrelated
+        // "still 12000" check instead of exercising the sequencer check.
+        cfg.block_time_ms = 227;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_sequencer_http_url_is_still_a_valid_unset_shape() {
+        let mut cfg = test_config();
+        cfg.sequencer_http_url = String::new();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
