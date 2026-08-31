@@ -3731,3 +3731,68 @@ this session's badges visually inconsistent with the ones next to them.
 
 cargo build/test (132/132)/clippy clean (no Rust changes this
 sub-step). npm run typecheck/test (3/3)/build clean.
+
+## Step 32 — run-benchmark.sh prepared for a real n=100 run
+
+Script-only work (no Rust changes) getting `deploy/run-benchmark.sh`
+ready for a real n=100 benchmark run — actually running it is still the
+operator's own live action against the real VPS, same as every prior
+benchmark; this step is prep, not a live result.
+
+**32a — FIRE_COUNT env var.** `N="${1:-${FIRE_COUNT:-15}}"` — the
+existing positional arg still wins if given (nothing that already calls
+this script positionally changes behavior), `FIRE_COUNT` is the new
+easier-to-remember way to set it, and 15 remains the final fallback for
+anyone who sets neither. The loop, per-fire progress line, and summary
+line already read `$N` throughout (confirmed by re-reading the whole
+script, not assumed) — the only real gap was the missing env var itself
+plus a few doc-comment/section-header references that said "15+" as if
+it were fixed (prerequisite #4's step-up-auth caveat, the "n=15+ fires"
+section header, the file's own opening comment) — updated to describe
+N generically.
+
+**32b — percentile math re-verified at n=100, and made independently
+testable.** The `pct()` function that used to live as an inline heredoc
+in `run-benchmark.sh` is standard linear-interpolation percentile math
+with no assumption baked in for any specific sample size (confirmed by
+direct inspection — it operates on `sorted(values)` and `len(s)`
+generically) — but it had never actually been exercised at anything but
+n=15 in practice. Pulled out into `deploy/lib/summarize_results.py`
+(same "independently testable, no drift between what's tested and what
+actually runs" reasoning as `find_mint_result.sh`/
+`check_wallet_balances.py`), with `deploy/tests/test-summarize-results.py`
+directly importing and unit-testing `percentile()`/`mean()`/
+`summarize()` against n=100 synthetic data (including an order-
+independence check — shuffled input gives the same percentiles as
+sorted — and a real CLI-level pass through the actual script with a
+100-record file), plus the existing small-n cases. All passing.
+
+**32c — p99 and mean added to the summary, additive.** `format_metric_line()`
+now prints `p50=... p90=... p99=... mean=...` for both `send_to_ack_ms`
+and `dispatch_to_inclusion_ms` — the existing p50/p90 fields are
+unchanged in position and format, nothing removed.
+
+**32d — pre-flight sizing warning.** If `N` is above 20 (a plain
+constant, `FIRE_COUNT_WARN_THRESHOLD`), the script now prints a rough
+total-ETH estimate before the balance gate runs: `N × 0.00002 ETH`. The
+per-fire figure is deliberately rounded well above the ~0.0000012 ETH
+the underlying arithmetic actually works out to (21,000 base + 50,000–
+150,000+ mint-logic gas × Robinhood Chain testnet's own measured
+~0.01 gwei baseFeePerGas, zero priority fee typically paid — both real,
+sourced figures already in this file's step 14b/15f/20e sections, not
+invented for this step) — deliberately conservative so the warning
+doesn't understate real cost. Explicitly framed as a heads-up, not a
+replacement for the existing hard-stop balance gate, which still runs
+regardless.
+
+Two new test files, both wired into CI's `deploy-scripts` job:
+`deploy/tests/test-summarize-results.py` (32b/32c, above) and
+`deploy/tests/test-fire-count-resolution.sh` (32a's N-precedence logic
+and 32d's threshold/rough-total arithmetic, tested by replicating the
+exact expressions `run-benchmark.sh` uses against scratch values — same
+pattern `test-config-backup-restore.sh` already established for logic
+inside a script that itself needs root/systemd/a real bot and can't run
+directly in CI).
+
+cargo build clean (no Rust changes). All 10 `deploy/tests/*` pass
+(8 pre-existing + 2 new).

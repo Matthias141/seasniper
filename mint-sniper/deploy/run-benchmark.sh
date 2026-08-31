@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# STEP 15e — fires the bot n=15+ times against the step 15c benchmark
-# token and prints a clean p50/p90 summary, same methodology as step
-# 14b (send->ack and dispatch->inclusion, both from real mint_result
-# events, not simulated). Same handoff pattern as every deploy/*.sh
-# script: the OPERATOR runs this on the real VPS, this session never
-# does.
+# STEP 15e — fires the bot N times (default 15, configurable — STEP
+# 32a's FIRE_COUNT env var/positional arg) against the step 15c
+# benchmark token and prints a clean p50/p90/p99/mean summary (p99 and
+# mean added in STEP 32c, additive alongside the original p50/p90),
+# same methodology as step 14b (send->ack and dispatch->inclusion, both
+# from real mint_result events, not simulated). Same handoff pattern as
+# every deploy/*.sh script: the OPERATOR runs this on the real VPS,
+# this session never does.
 #
 # STEP 15e FOLLOW-UP — confirmed live on the real VPS: the original
 # version of this script assumed config.toml was ALREADY pointed at
@@ -50,9 +52,17 @@
 #        MIN_BALANCE_ETH      - default 0.01, the per-wallet threshold
 #                                the pre-flight balance gate enforces
 #                                (mint price is 0 on the benchmark drop
-#                                — this only needs to cover gas for
-#                                15+ fires, 0.01 is a deliberately
-#                                generous default, not a tight one)
+#                                — this only needs to cover gas. 0.01 is
+#                                a deliberately generous default for the
+#                                original n=15 default, not a tight one
+#                                — STEP 32d prints its own rough
+#                                per-run gas-cost estimate above the
+#                                balance gate when FIRE_COUNT is set
+#                                high enough that 0.01 may not be
+#                                generous anymore)
+#        FIRE_COUNT           - STEP 32a: default 15 (same as the N
+#                                positional arg's own default) — see
+#                                "Usage:" above for how the two combine
 #        SERVICE_NAME          - default "mint-sniper"
 #        SERVICE_USER           - default "mint-sniper"
 #
@@ -76,9 +86,10 @@
 #      request (auth.rs::require_step_up) — a real 6-digit code from
 #      your authenticator app, valid ~30s and single-use. THIS SCRIPT
 #      CANNOT AUTOMATE THAT LOOP — a human has to be present typing in a
-#      fresh code before each of the 15+ arms, which defeats the point
-#      of an unattended benchmark run. If identity is enabled on this
-#      instance, either benchmark against a second, identity-disabled
+#      fresh code before each of the N arms (N per FIRE_COUNT/the
+#      positional arg — only gets more impractical as N grows), which
+#      defeats the point of an unattended benchmark run. If identity is
+#      enabled on this instance, either benchmark against a second, identity-disabled
 #      instance/config, or accept that this script needs to be run
 #      interactively with you supplying step-up codes on request (not
 #      implemented here — flagged, not silently worked around).
@@ -86,9 +97,16 @@
 # Usage:
 #   sudo TESTNET_WS_RPC_URL=... TESTNET_HTTP_RPC_URL=... \
 #     ./run-benchmark.sh [N] [BOT_DIR]
-#     N        - number of fires, default 15 (14b's own n)
+#     N        - number of fires. Positional arg (if given) wins; else
+#                FIRE_COUNT env var (if set); else 15 (14b's own n,
+#                unchanged default for anyone who doesn't set either).
 #     BOT_DIR  - the bot's WorkingDirectory, default /opt/mint-sniper
 #                (must contain config.toml, audit.log, .sniper-token)
+#
+#   STEP 32a — FIRE_COUNT env var, for a real n=100 run without having
+#   to remember the positional-arg form:
+#     sudo TESTNET_WS_RPC_URL=... TESTNET_HTTP_RPC_URL=... FIRE_COUNT=100 \
+#       ./run-benchmark.sh
 
 set -euo pipefail
 
@@ -99,7 +117,15 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-N="${1:-15}"
+# STEP 32a — FIRE_COUNT env var added alongside the pre-existing
+# positional arg, not instead of it: the positional arg (if given)
+# still wins, matching this script's own prior "Usage:" documentation
+# and any existing invocation that already passes N positionally.
+# FIRE_COUNT is the new, easier-to-remember way to set it (especially
+# alongside the other env vars this script already reads); the final
+# fallback is still 15, so anyone who sets neither sees identical
+# behavior to before this step.
+N="${1:-${FIRE_COUNT:-15}}"
 BOT_DIR="${2:-/opt/mint-sniper}"
 SERVICE_NAME="${SERVICE_NAME:-mint-sniper}"
 SERVICE_USER="${SERVICE_USER:-mint-sniper}"
@@ -108,6 +134,34 @@ INTER_FIRE_DELAY_SECS="${INTER_FIRE_DELAY_SECS:-3}"
 FIRE_TIMEOUT_SECS="${FIRE_TIMEOUT_SECS:-40}"  # generous over inclusion_timeout_ms's 30000ms default
 HEALTH_TIMEOUT_SECS="${HEALTH_TIMEOUT_SECS:-30}"
 MIN_BALANCE_ETH="${MIN_BALANCE_ETH:-0.01}"
+
+# STEP 32d — a large run failing 60% of the way through because a
+# wallet ran dry wastes real wall-clock time; the balance gate below
+# still catches genuine insufficiency before firing starts, but this is
+# a heads-up BEFORE that gate runs, not a replacement for it. Rough,
+# deliberately conservative estimate, not a precise quote: the
+# benchmark drop's mint price is 0 (gas only), Robinhood Chain testnet's
+# own measured baseFeePerGas is on the order of 0.01 gwei with zero
+# priority fee typically paid (CLAUDE.md step 14b/15f), and a
+# mintPublic-shaped call runs roughly 21,000 (base) + 50,000-150,000+
+# (mint logic) gas (CLAUDE.md step 20e's own sourced range) — so
+# 0.00002 ETH/fire is intentionally rounded well above the ~0.0000012
+# ETH that arithmetic actually works out to, to avoid understating it.
+ROUGH_GAS_COST_PER_FIRE_ETH="0.00002"
+FIRE_COUNT_WARN_THRESHOLD=20
+if (( N > FIRE_COUNT_WARN_THRESHOLD )); then
+  ROUGH_TOTAL_ETH=$(python3 -c "print(f'{${N} * ${ROUGH_GAS_COST_PER_FIRE_ETH}:.5f}')")
+  echo "==> NOTE: FIRE_COUNT=$N is above $FIRE_COUNT_WARN_THRESHOLD. At a rough,"
+  echo "    deliberately conservative ~$ROUGH_GAS_COST_PER_FIRE_ETH ETH/fire on Robinhood Chain"
+  echo "    testnet (gas only — this benchmark drop is free), expect roughly"
+  echo "    ~$ROUGH_TOTAL_ETH ETH consumed in total across all configured wallets"
+  echo "    for $N fires. This is a rough order-of-magnitude estimate, not a"
+  echo "    quote — confirm your wallet(s) have comfortably more than this"
+  echo "    before proceeding (the balance gate below still hard-stops on"
+  echo "    genuine insufficiency, but catching a likely shortfall now beats"
+  echo "    a run failing partway through)."
+  echo
+fi
 
 # STEP 27 — real bug found live: BENCHMARK_CHECK_ADDR used to have a single
 # hardcoded default (step 14b's original benchmark token) with no mechanism
@@ -377,7 +431,7 @@ if [[ -n "$UNDERFUNDED" ]]; then
 fi
 echo "==> balance gate passed — all configured wallets have >= $MIN_BALANCE_ETH ETH on testnet"
 
-# --- 4. the actual n=15+ fires ---
+# --- 4. the actual N fires (default 15, STEP 32a's FIRE_COUNT/N) ---
 echo
 echo "==> starting $N fires against $NFT_CONTRACT"
 echo "    (config.toml's mint_mode=seadrop forces trigger_mode=timestamp"
@@ -451,56 +505,13 @@ fi
 
 echo
 echo "==> summary (n=$(wc -l < "$RESULTS_FILE") successful fires out of $N attempted)"
-python3 - "$RESULTS_FILE" <<'PYEOF'
-import json, sys
-
-path = sys.argv[1]
-send_ack = []
-dispatch_incl = []
-successes = 0
-total = 0
-
-with open(path) as f:
-    for line in f:
-        line = line.strip()
-        if not line:
-            continue
-        total += 1
-        # STEP 15e FOLLOW-UP — same bug as the jq extraction above:
-        # AuditRecord flattens `detail` onto the top-level record
-        # (audit.rs's `#[serde(flatten)] detail: serde_json::Value`),
-        # so success/send_to_ack_ms/dispatch_to_inclusion_ms are
-        # top-level keys, not nested under a "detail" object.
-        rec = json.loads(line)
-        if rec.get("success"):
-            successes += 1
-        sa = rec.get("send_to_ack_ms")
-        di = rec.get("dispatch_to_inclusion_ms")
-        if sa is not None:
-            send_ack.append(sa)
-        if di is not None:
-            dispatch_incl.append(di)
-
-def pct(values, p):
-    if not values:
-        return None
-    s = sorted(values)
-    k = (len(s) - 1) * (p / 100)
-    f = int(k)
-    c = min(f + 1, len(s) - 1)
-    if f == c:
-        return s[f]
-    return s[f] + (s[c] - s[f]) * (k - f)
-
-print(f"successes: {successes}/{total}")
-for label, values in (("send_to_ack_ms", send_ack), ("dispatch_to_inclusion_ms", dispatch_incl)):
-    p50 = pct(values, 50)
-    p90 = pct(values, 90)
-    if p50 is None:
-        print(f"{label}: no data")
-    else:
-        print(f"{label}: p50={p50:.0f}ms p90={p90:.0f}ms (n={len(values)})")
-PYEOF
+# STEP 32b/32c — the percentile/mean math itself now lives in
+# deploy/lib/summarize_results.py, pulled out of this inline heredoc so
+# it's independently unit-testable (deploy/tests/test-summarize-results.py,
+# including a real n=100 case — this used to only ever be exercised at
+# n=15). Also where p99 and a plain mean were added alongside the
+# existing p50/p90 — additive, nothing removed.
+python3 "$SCRIPT_DIR/lib/summarize_results.py" "$RESULTS_FILE"
 
 echo
 echo "==> Paste the p50/p90 numbers above into CLAUDE.md's step 15f section,"
