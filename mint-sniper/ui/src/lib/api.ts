@@ -1,6 +1,7 @@
 import type {
   AuthSession,
   Config,
+  CopymintEligibilityReport,
   DelegatedPreflightResult,
   DelegatedStatus,
   ResolvedTarget,
@@ -188,6 +189,18 @@ export const api = {
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ query }),
     }).then((r) => json<SearchHit[]>(r)),
+
+  // step 31b — read-only pre-fire "check eligibility" action, never
+  // step-up gated (nothing is committed, same reasoning as resolveTarget).
+  // Never trusts a client-cached price/state either — the backend re-reads
+  // getPublicDrop + getMintStats live for every call. See api.rs's
+  // post_copymint_eligibility / copymint::check_eligibility.
+  checkCopymintEligibility: (nftContract: string) =>
+    fetch('/api/copymint/eligibility', {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ nft_contract: nftContract }),
+    }).then((r) => json<CopymintEligibilityReport>(r)),
 
   // --- delegated mint mode (v1, DELEGATED_SERIAL) ---
   // status/preflight are both read-only — see api.rs's own doc comments

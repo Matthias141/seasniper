@@ -5,25 +5,52 @@
 }
 
 html,
-body,
 #root {
   height: 100%;
 }
 
-/* STEP 16 — body's own overflow-x: hidden below does not reliably stop
-   horizontal scroll caused by a too-wide descendant on real mobile
-   Safari/Chrome (confirmed live on an actual iPhone, not just a
-   resized desktop window, which can hide this) — the html element
-   itself is the actual scrolling container in that case. Both, not
-   either, as the real defense-in-depth backstop; the underlying fixes
-   are still in each component (StatusBar, TargetResolver's .row) —
-   this is a safety net, not a substitute for fixing what's actually
-   too wide. */
+/* STEP 16 — html's own overflow-x: hidden is the one confirmed live on
+   a real iPhone (not just a resized desktop window, which can hide
+   this) to be the actual horizontal-scroll-blocking element on real
+   mobile Safari/Chrome, hence being set here too, not just on body
+   below. Both, not either, as the real defense-in-depth backstop; the
+   underlying fixes are still in each component (StatusBar,
+   TargetResolver's .row) — this is a safety net, not a substitute for
+   fixing what's actually too wide. */
 html {
   overflow-x: hidden;
 }
 
+/* STEP 31c — `body { height: 100% }` used to live here too, alongside
+   overflow-x: hidden below. That combination is a real, confirmed-live
+   bug, not a hypothetical: per the CSS Overflow spec's computed-value
+   correction rule, setting overflow-x to anything other than `visible`
+   while overflow-y stays at its default forces overflow-y to compute as
+   `auto` — on BOTH html and body, since both set overflow-x: hidden. A
+   `height: 100%` body (fixed to the viewport height) with real content
+   taller than that, plus a corrected `overflow-y: auto`, becomes its
+   OWN independent scrolling box nested inside html's — two disagreeing
+   scroll containers instead of one. Confirmed live via Playwright, not
+   assumed: getComputedStyle showed both html and body computing
+   overflow-y: auto; document.body.scrollTop was a large, nonzero,
+   unrequested value on initial page load with window.scrollY still 0;
+   main's getBoundingClientRect().top was hundreds of pixels NEGATIVE
+   despite that. This session's own new components (step 30/31) were
+   what made total page content tall enough for the two independently-
+   scrolling boxes to visibly disagree in practice — real content sat in
+   the DOM, fully populated and correctly styled, but was not reliably
+   reachable by a normal page-level scroll. `min-height: 100%` (matching
+   .shell's own existing pattern in App.module.css, not a new
+   convention) fixes it: body's height now tracks its real content
+   instead of being clamped to the viewport, so it never has its own
+   overflow to independently scroll — html alone becomes the single
+   real scrolling container. Re-verified after this change (same
+   Playwright harness): getBoundingClientRect() reports the correct
+   position again, AND horizontal overflow is still fully prevented —
+   this does not touch, weaken, or remove either of the real
+   overflow-x: hidden declarations step 16 verified live. */
 body {
+  min-height: 100%;
   margin: 0;
   background: var(--color-surface-0);
   color: var(--color-text-primary);

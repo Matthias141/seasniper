@@ -95,6 +95,39 @@ export interface OfficialLinks {
   project_url: string | null;
 }
 
+// --- copymint (step 6) UX: structured skip reasons + eligibility (31b) ---
+// Mirrors copymint.rs's CopymintSkipReason exactly — a real, named code
+// per skip, not a free-text log line, so the UI can render a specific
+// card/badge and (where one exists) a concrete next step instead of
+// expecting an operator to parse a log line.
+export type CopymintSkipReason =
+  | { code: 'drop_lookup_failed'; detail: string }
+  | { code: 'not_currently_live'; start_time: number; end_time: number; now: number }
+  | { code: 'exceeds_price_ceiling'; total_value_wei: string; ceiling_wei: string }
+  | { code: 'calldata_encoding_failed'; detail: string };
+
+export interface CopymintWalletEligibility {
+  address: string;
+  already_minted: number;
+  eligible: boolean;
+}
+
+// GET-once-per-click response for the "check eligibility" action —
+// see api.rs's post_copymint_eligibility / copymint::check_eligibility.
+// A live, real-time estimate (getPublicDrop + getMintStats, never
+// cached), not a guarantee — on-chain execution order at fire time is
+// what actually decides which wallets land.
+export interface CopymintEligibilityReport {
+  nft_contract: string;
+  max_per_wallet: number;
+  current_total_supply: number;
+  max_supply: number;
+  remaining_supply: number;
+  eligible_count: number;
+  total_count: number;
+  wallets: CopymintWalletEligibility[];
+}
+
 export interface SearchHit {
   slug: string;
   name: string;
@@ -150,6 +183,13 @@ export type ServerEvent =
       quantity: number;
       is_free: boolean;
       fireable: boolean;
+    }
+  | {
+      type: 'copymint_skipped';
+      tracked_wallet: string;
+      nft_contract: string;
+      reason: CopymintSkipReason;
+      actionable_hint: string | null;
     }
   | { type: 'snapshot'; armed: boolean; wallets: WalletStatus[] }
   // --- delegated mint mode (v1, DELEGATED_SERIAL) --- see bus.rs's

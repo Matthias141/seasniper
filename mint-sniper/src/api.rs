@@ -77,6 +77,7 @@ pub fn router(state: SharedState, google_oauth_redirect_url: &str) -> Router {
         .route("/api/abort", post(post_abort))
         .route("/api/trigger", post(post_trigger))
         .route("/api/copymint/fire", post(post_copymint_fire))
+        .route("/api/copymint/eligibility", post(post_copymint_eligibility))
         .route("/api/target/resolve", post(post_target_resolve))
         .route("/api/target/set", post(post_target_set))
         .route("/api/target/search", post(post_target_search))
@@ -293,6 +294,34 @@ async fn post_copymint_fire(
     match copymint::verify_and_fire(&state, nft_contract, fee_recipient).await {
         Ok(value) => (StatusCode::ACCEPTED, format!("firing — verified value {value} wei")).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CopymintEligibilityRequest {
+    nft_contract: String,
+}
+
+/// STEP 31b — a distinct, explicit pre-fire "check eligibility" action:
+/// read-only (no `require_step_up`, same reasoning as `/api/target/resolve`
+/// — nothing is committed), never trusts anything from the client beyond
+/// which contract to check. Reads every one of the bot's OWN configured
+/// wallet addresses fresh from `state.wallet_status` and every stat fresh
+/// from the chain (`getPublicDrop` + `getMintStats`, live, never cached)
+/// — see `copymint::check_eligibility`'s own doc comment for the exact
+/// per-wallet gate and why it's an estimate, not a guarantee.
+async fn post_copymint_eligibility(
+    State(state): State<SharedState>,
+    Json(req): Json<CopymintEligibilityRequest>,
+) -> impl IntoResponse {
+    let nft_contract: Address = match req.nft_contract.parse() {
+        Ok(a) => a,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad nft_contract: {e}")).into_response(),
+    };
+
+    match copymint::check_eligibility(&state, nft_contract).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response(),
     }
 }
 

@@ -118,3 +118,70 @@
   border-color: var(--color-success);
   color: var(--color-success);
 }
+
+/* --- STEP 31b: skip cards (structured, named reasons) --- */
+.skipped {
+  background: color-mix(in srgb, var(--color-text-tertiary) 8%, var(--color-surface-1));
+  border-color: var(--border-hairline);
+}
+.skipped .badge {
+  background: var(--color-surface-3);
+  color: var(--color-text-secondary);
+}
+
+.hint {
+  font-size: var(--text-xs);
+  color: var(--color-accent);
+  margin-top: 2px;
+}
+
+.eligibilityLine {
+  font-size: var(--text-xs);
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  margin-top: 2px;
+}
+
+/* --- STEP 31b: per-card action buttons (CHECK ELIGIBILITY + FIRE) --- */
+.cardActions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  align-items: stretch;
+}
+
+.eligibilityBtn {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.06em;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-surface-4);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.eligibilityBtn:hover:not(:disabled) {
+  border-color: var(--color-accent-dim);
+  color: var(--color-text-primary);
+}
+.eligibilityBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* STEP 31b/31c — same "stack instead of crush a narrow auto column"
+   precedent as TargetResolver.module.css (step 16) and
+   DelegatedRunStatus.module.css (31a): a card's action column has grown
+   to two stacked buttons plus (once checked) an eligibility line under
+   the contract address — give it full width below a breakpoint rather
+   than squeezing it against the auto-sized grid column. */
+@media (max-width: 480px) {
+  .card {
+    grid-template-columns: 1fr;
+  }
+  .cardActions {
+    flex-direction: row;
+  }
+}
