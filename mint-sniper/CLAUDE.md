@@ -3570,3 +3570,84 @@ cargo build/test/clippy: 122/122 tests passing, clean clippy under CI's
 actual `-D warnings` flags. UI: `npm run typecheck`/`npm test` (3/3
 passing)/`npm run build`/`npm audit --omit=dev --audit-level=moderate`
 (0 vulnerabilities) all clean.
+
+## Step 31 — operator panel visual verification (31a) + copymint UX (31b)
+
+### 31a — see the "Step 31a" commit for the real Playwright-verified
+mobile overflow fix (operator balance display + `DelegatedRunStatus`'s
+per-receiver row). Otherwise a clean bill of health, confirmed via a
+temporary (not committed) Playwright harness rendering every
+`OperatorPanel` state at desktop + 390x844: zero overflow, no
+mnemonic/private-key material visible in any state including both
+preflight failure modes, `DELEGATED_SERIAL` prominent everywhere, no
+"batch"/"one transaction" copy anywhere.
+
+### 31b — copymint UX: structured skip reasons + eligibility check
+
+Two independently-scoped additions, both copymint-specific (`copymint.rs`,
+`api.rs`'s `/api/copymint/*` routes, `CopyOpportunities.tsx`) — neither
+touches `executor.rs`/`fire_prepared` or anything the parallel-EOA hot
+fire path depends on.
+
+**Structured, named skip reasons** (`CopymintSkipReason` in
+`copymint.rs`, `#[serde(tag = "code")]`): `DropLookupFailed`,
+`NotCurrentlyLive`, `ExceedsPriceCeiling`, `CalldataEncodingFailed` —
+replacing what used to be `bus::log`-only free text at four call sites
+in `handle_candidate`. Each carries an `actionable_hint()` — a concrete
+next step where one genuinely exists (`ExceedsPriceCeiling` names the
+exact `max_copymint_price_wei` value needed) and `None` where it doesn't
+(waiting for a drop to go live isn't a config change this bot can make
+on the operator's behalf — no hint is fabricated for it). New
+`ServerEvent::CopymintSkipped` carries the reason plus the precomputed
+hint; `CopyOpportunities.tsx` renders these as real cards (named badge,
+detail line, hint line), not another line in the log feed.
+`ExceedsPriceCeiling` is emitted ALONGSIDE the existing `CopyOpportunity`
+event, not instead of it — the over-ceiling opportunity card still
+renders exactly as before; this adds a second, more actionable surface
+for the same information, per the actual instruction ("mirror this
+codebase's own existing free/paid gate", not replace it).
+
+**"Check eligibility" pre-fire action**
+(`copymint::check_eligibility`/`POST /api/copymint/eligibility`, no
+step-up — read-only, nothing committed, same reasoning as
+`/api/target/resolve`): reads every one of the bot's OWN configured
+wallet addresses from `state.wallet_status` (addresses only — no private
+key material touched) and checks each against the target's real,
+live `getPublicDrop` (`maxTotalMintableByWallet`) and a NEW
+`seadrop::fetch_mint_stats` call — `IERC721SeaDrop.getMintStats(minter)`,
+confirmed real via a live `eth_call` against mainnet EVERYBODYS (selector
+`0x840e15d4`, independently computed via keccak256, not guessed) before
+writing any parsing logic against it, same "verify, don't guess"
+standard as every other seadrop.rs function. Returns
+`(minterNumMinted, currentTotalSupply, maxSupply)`; `CopyOpportunities.tsx`
+shows a "CHECK ELIGIBILITY" button per opportunity card, surfacing the
+precomputed `N/M wallets eligible` ratio plus remaining supply before
+the operator commits to firing — the exact `38/40 wallets eligible`
+example the task specified, confirmed via Playwright screenshot.
+`compute_wallet_eligibility` (the actual gate: per-wallet cap room AND
+remaining global supply) is a pure function, unit-tested directly (8
+tests covering the boundary case, the "under cap but supply gone" case
+matching the real, live EVERYBODYS 10000/10000-sold-out state confirmed
+during this step's research, and a `saturating_add` overflow guard) —
+explicitly documented as a live ESTIMATE, not a guarantee: real on-chain
+execution order, not this function, decides which wallets actually land
+if the parallel path fires.
+
+Real overflow bug found and fixed WHILE building this (same class 31a's
+fix addressed, found via the same Playwright harness): the new
+per-opportunity-card action column (two stacked buttons + an eligibility
+line) squeezed against `.card`'s existing `1fr auto` grid at 390px.
+Fixed with the same stack-below-a-breakpoint pattern
+(`CopyOpportunities.module.css`, `@media (max-width: 480px)`) already
+established in `TargetResolver.module.css` (step 16) and
+`DelegatedRunStatus.module.css` (31a) — confirmed zero overflow via the
+same Playwright harness before removing it.
+
+10 new Rust tests (132 total): `compute_wallet_eligibility`'s 6 boundary
+cases, `CopymintSkipReason::actionable_hint()`'s 4 cases (hint-present
+and hint-absent, both directions). `audit.rs`'s exhaustive
+`ServerEvent` match required (and got) a new `copymint_skipped` arm —
+the compiler forced correct coverage, not a wildcard.
+
+cargo build/test (132/132)/clippy --all-targets -- -D warnings clean.
+npm run typecheck/test (3/3)/build clean.

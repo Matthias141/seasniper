@@ -5,7 +5,7 @@ import { WalletGrid } from './components/WalletGrid';
 import { EventFeed, type FeedLine } from './components/EventFeed';
 import { ConfigPanel } from './components/ConfigPanel';
 import { TriggerConsole } from './components/TriggerConsole';
-import { CopyOpportunities, type CopyOpportunity } from './components/CopyOpportunities';
+import { CopyOpportunities, type CopyOpportunity, type CopymintSkip } from './components/CopyOpportunities';
 import { OperatorPanel, type DelegatedRunState } from './components/OperatorPanel';
 import { TargetResolver } from './components/TargetResolver';
 import { LoginScreen } from './components/LoginScreen';
@@ -101,6 +101,10 @@ function Control({ onSignOut }: { onSignOut?: () => void }) {
   const [copyOpportunities, setCopyOpportunities] = useState<Map<string, CopyOpportunity>>(
     new Map(),
   );
+  // step 31b — structured, named skip reasons; capped the same way the
+  // event feed is (this is a live control panel, not an archive of
+  // every skip a busy tracked wallet ever produces).
+  const [copymintSkips, setCopymintSkips] = useState<CopymintSkip[]>([]);
   // Delegated mint mode (v1, DELEGATED_SERIAL) — lifted up here rather
   // than owned inside OperatorPanel.tsx so it drives off the same single
   // WS connection every other panel already shares (see
@@ -183,6 +187,28 @@ function Control({ onSignOut }: { onSignOut?: () => void }) {
             }`,
           );
           break;
+        // step 31b — a real, named reason a candidate was skipped (or,
+        // for exceeds_price_ceiling, ALSO surfaced here alongside the
+        // copy_opportunity card above — see CopymintSkipReason's own doc
+        // comment), rendered as a structured card with an actionable
+        // next step where one exists, not just this feed line.
+        case 'copymint_skipped':
+          setCopymintSkips((prev) => [
+            ...prev.slice(-49),
+            {
+              trackedWallet: event.tracked_wallet,
+              nftContract: event.nft_contract,
+              reason: event.reason,
+              actionableHint: event.actionable_hint,
+            },
+          ]);
+          pushLine(
+            'warn',
+            `copymint skipped (${event.reason.code}): ${event.nft_contract}${
+              event.actionable_hint ? ` — ${event.actionable_hint}` : ''
+            }`,
+          );
+          break;
         // --- delegated mint mode (v1, DELEGATED_SERIAL) --- see
         // bus.rs's ServerEvent doc comment. Never carries anything
         // beyond a receiver's public address.
@@ -253,6 +279,7 @@ function Control({ onSignOut }: { onSignOut?: () => void }) {
           <WalletGrid wallets={wallets} />
           <CopyOpportunities
             opportunities={[...copyOpportunities.values()]}
+            skips={copymintSkips}
             allowManualFire={config?.copymint_auto_fire_paid ?? false}
           />
           <EventFeed lines={lines} />
