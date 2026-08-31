@@ -63,6 +63,18 @@
 #        FIRE_COUNT           - STEP 32a: default 15 (same as the N
 #                                positional arg's own default) — see
 #                                "Usage:" above for how the two combine
+#        RACE_MODE_BENCHMARK  - STEP 28 (final): default "true". Forces
+#                                race_mode=true + the real Robinhood
+#                                Chain testnet sequencer_http_url (+
+#                                zeroes jitter, required by
+#                                Config::validate()'s race_mode
+#                                invariant) into the swapped testnet
+#                                config — this determines whether the
+#                                run actually tests sequencer racing at
+#                                all, so it's no longer left to whatever
+#                                the pre-swap config happened to have.
+#                                Set to "false" for a deliberate non-
+#                                race-mode comparison run.
 #        SERVICE_NAME          - default "mint-sniper"
 #        SERVICE_USER           - default "mint-sniper"
 #
@@ -134,6 +146,13 @@ INTER_FIRE_DELAY_SECS="${INTER_FIRE_DELAY_SECS:-3}"
 FIRE_TIMEOUT_SECS="${FIRE_TIMEOUT_SECS:-40}"  # generous over inclusion_timeout_ms's 30000ms default
 HEALTH_TIMEOUT_SECS="${HEALTH_TIMEOUT_SECS:-30}"
 MIN_BALANCE_ETH="${MIN_BALANCE_ETH:-0.01}"
+# STEP 28 (final) — default true: the testnet swap forces race_mode on
+# (and sequencer_http_url/jitter fields alongside it — see
+# swap_config_to_testnet.py's own header) unless explicitly overridden.
+# Set RACE_MODE_BENCHMARK=false for a deliberate non-race-mode baseline
+# run (e.g. to compare against one WITH race_mode, same night, per the
+# still-open step 28 follow-up).
+RACE_MODE_BENCHMARK="${RACE_MODE_BENCHMARK:-true}"
 
 # STEP 32d — a large run failing 60% of the way through because a
 # wallet ran dry wastes real wall-clock time; the balance gate below
@@ -345,8 +364,11 @@ fi
 
 echo
 echo "==> swapping $CONFIG_PATH to Robinhood Chain testnet + this benchmark contract"
+echo "    (race_mode=$RACE_MODE_BENCHMARK — STEP 28 (final): forced by this script now,"
+echo "    not left to whatever the pre-swap config happened to have. See"
+echo "    deploy/lib/swap_config_to_testnet.py's own header for why.)"
 python3 "$SCRIPT_DIR/lib/swap_config_to_testnet.py" \
-  "$CONFIG_PATH" "$TESTNET_WS_RPC_URL" "$TESTNET_HTTP_RPC_URL" "$NFT_CONTRACT"
+  "$CONFIG_PATH" "$TESTNET_WS_RPC_URL" "$TESTNET_HTTP_RPC_URL" "$NFT_CONTRACT" "$RACE_MODE_BENCHMARK"
 chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_PATH"
 
 # --- 3. restart and wait for real health, not a fixed sleep ---
@@ -362,30 +384,38 @@ fi
 echo "==> service healthy on testnet config"
 
 # STEP 28 — real gap found while writing up a benchmark result: this
-# script's config swap (swap_config_to_testnet.py) never touches
-# race_mode/sequencer_http_url at all — it only rewrites the network/
-# target fields it explicitly lists (ws_rpc_url, http_rpc_urls,
+# script's config swap (swap_config_to_testnet.py) used to never touch
+# race_mode/sequencer_http_url at all — it only rewrote the network/
+# target fields it explicitly listed (ws_rpc_url, http_rpc_urls,
 # mint_mode, nft_contract, fee_recipient, quantity_per_wallet,
 # block_time_ms). Whatever race_mode/sequencer_http_url the config
-# already had BEFORE the swap carries through unchanged, silently. A
+# already had BEFORE the swap carried through unchanged, silently. A
 # ~5.5x dispatch_to_inclusion improvement was observed between two
 # benchmark runs, and the leading hypothesis was PR #9's sequencer-racing
 # feature — but neither this script's own output NOR audit.log's
-# persisted MintResult records say which submission path (sequencer vs.
-# backup RPC) actually acked each fire (that detail only ever reaches
+# persisted MintResult records said which submission path (sequencer vs.
+# backup RPC) actually acked each fire (that detail only ever reached
 # `tracing::info!`/journalctl, per executor.rs's "using this URL's ack"
 # log line — never the durable audit trail), so the cause could not be
-# confirmed after the fact. Same class of bug as steps 26/27: a script
-# silently blind to a newer feature. Fixed here by making this explicit
-# and printed, so a FUTURE run's own console output is self-sufficient
-# evidence — no more "which mode was this actually running under?"
-# ambiguity. NOT fixed: forcing race_mode to a specific value here would
-# change this script's behavior beyond what was asked and isn't needed —
-# reporting what's actually configured is the real gap.
+# confirmed after the fact — and by the time anyone went looking,
+# journalctl's own retention window had already rolled past that run,
+# so even the one durable-ish source available at the time was gone too.
+#
+# STEP 28 (final) — the "NOT fixed: forcing race_mode here would change
+# this script's behavior beyond what was asked" call from the earlier
+# round of this investigation is REVERSED, deliberately: that reasoning
+# held when this script was a general-purpose speed benchmark. It
+# doesn't hold now that the specific, stated purpose of the next run is
+# testing whether race_mode/sequencer racing itself is the cause —
+# leaving that to whatever the pre-swap config happened to have is
+# exactly the mechanism that made the LAST attempt at this
+# unconfirmable. See swap_config_to_testnet.py's own header for the
+# full reasoning and the RACE_MODE_BENCHMARK override for a deliberate
+# non-race-mode comparison run.
 echo
 echo "==> race_mode / sequencer_http_url as the bot is ACTUALLY running (GET /api/config,"
 echo "    read post-swap-restart — this is what this run's numbers should be attributed to,"
-echo "    not assumed from the swap script, which never touches either field):"
+echo "    confirming the swap above actually took, not just assuming it did):"
 RUNTIME_CONFIG=$(curl -sS -H "Authorization: Bearer $API_TOKEN" "$BOT_URL/api/config")
 RACE_MODE_REPORT=$(echo "$RUNTIME_CONFIG" | jq '{race_mode, sequencer_http_url}')
 echo "$RACE_MODE_REPORT"

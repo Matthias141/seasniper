@@ -1946,6 +1946,98 @@ simply forgetting to scroll up. The script also prints the file's path
 and an explicit reminder to paste it into any future write-up, rather
 than trusting scrollback.
 
+**Step 28 (final) — the evidence loss is now genuinely permanent for
+the OLD run (journalctl for that time window checked directly and
+confirmed empty, log rotation/reboot since — nothing to reconstruct),
+so this section moves to making the NEXT run unambiguous by
+construction rather than trying to salvage the last one.**
+
+**28a — per-fire submission-path attribution moved from journalctl-only
+to the durable audit trail itself.** The config-level report
+(`race_mode`/`sequencer_http_url`, above) was already fixed; what
+wasn't is that the config report alone doesn't say which path *each
+individual fire* actually used — that detail (`executor.rs`'s "using
+this URL's ack" line) still only ever reached `tracing::info!`/
+journalctl. Fixed directly in the event/data model, not just the
+benchmark script: `ServerEvent::MintResult` (`bus.rs`) gained two new
+fields, `ack_source: Option<&'static str>` (`"sequencer"` | `"backup"`
+| `None` if nothing ever acked) and `acked_url: Option<String>` (the
+redacted, scheme+host-only URL that acked, via the existing
+`config::redact_rpc_url` — never the raw URL/API key). Computed at all
+four `executor.rs` call sites that can produce a real ack via a new
+`classify_ack_source` helper (exact string equality against the
+configured `sequencer_http_url`, not a host-heuristic — see the
+function's own doc comment for why), and wired through
+`audit.rs`'s persistence so `audit.log`'s `mint_result` records now
+carry `ack_source`/`acked_url` directly — no journalctl access needed
+to answer "sequencer or backup" for any past fire, ever again. Also
+surfaced live in the UI's event feed (`App.tsx`, `via sequencer`/`via
+backup` appended to the existing timing line) so it's visible without
+even opening `audit.log`. 4 new unit tests
+(`classify_ack_source_*`, `executor.rs`) — 136 tests total, cargo
+build/test/clippy clean.
+
+**28b — race_mode/sequencer_http_url are no longer left to chance; the
+swap forces them.** Re-confirmed directly (again) that
+`swap_config_to_testnet.py` previously never touched either field —
+this was the actual mechanism that made the earlier run unattributable:
+whatever the operator's baseline `config.toml` happened to have before
+ever running a benchmark is what silently determined whether the
+feature under test was even active. This is now reversed, deliberately
+— see `swap_config_to_testnet.py`'s own header for the full reasoning,
+including exactly why the earlier "NOT fixed: forcing race_mode here
+would change this script's behavior beyond what was asked" call no
+longer applies now that confirming race_mode's effect IS the stated
+goal. The swap now defaults to forcing `race_mode = true`,
+`sequencer_http_url = "https://sequencer.testnet.chain.robinhood.com"`
+(the real, confirmed testnet sequencer endpoint), and zeroing
+`jitter_ms_min`/`jitter_ms_max`/`gas_jitter_pct` (required by
+`Config::validate()`'s own race_mode invariant — a race_mode-forced
+swap that left nonzero jitter in place would produce a config.toml the
+bot refuses to boot on at all). `race_mode`/`sequencer_http_url` use
+new set-or-APPEND semantics (`set_or_append_line`, distinct from the
+strict must-already-exist `set_line` every other field uses) since
+both are optional `#[serde(default)]` `Config` fields an older
+config.toml may genuinely lack entirely — the jitter fields have no
+such default, so any config.toml that boots at all already has all
+three, and keep using the strict form. Overridable via
+`run-benchmark.sh`'s new `RACE_MODE_BENCHMARK` env var (default
+`true`) for a deliberate non-race-mode comparison run. 8 new/extended
+test assertions in `test-swap-config-to-testnet.py` covering the
+default-append path, the explicit-`false` path, and the already-set
+(strict-replace, not duplicate) path — all 10 `deploy/tests/*` pass.
+
+**28c — handed to the operator; not run by this session.** Exact
+commands and what to capture live in the response to this task, not
+duplicated here to avoid the two drifting — see the session's own
+reply for the precise `sudo ... RACE_MODE_BENCHMARK=true FIRE_COUNT=100
+./run-benchmark.sh` invocation and the explicit "screenshot the
+config-report line the moment it prints" instruction (in case 28a's
+durability fix has any gap this session didn't anticipate).
+
+**28d — not yet done.** The real n=100 numbers, the full p50/p90/p99/
+mean spread (32c), and an evidence-backed (not inferred) statement of
+whether race_mode caused the improvement all wait on 28c's real live
+run actually happening. **Until then: do not credit PR #9, and do not
+treat the 169ms/385ms n=15 figures above as confirmed-repeatable** —
+they are the most recent real data point, kept as such, not deleted,
+same convention as every other superseded figure in this project.
+
+**Restated, because this must not resurface a third time:** the OLD,
+much-earlier ~2127ms `dispatch_to_inclusion_ms` figure (15f's own
+PUSH-confirmed baseline, several steps before this one) is confirmed
+genuine on-chain delay — step 19's `diagnose_inclusion_delay.py` read
+real on-chain receipt `blockNumber`s (chain-consensus data, independent
+of any RPC provider's own notification timing) and found 21, 22, and 28
+real blocks elapsed on the three checked transactions. **Not** Alchemy
+RPC head-notification lag, **not** a measurement artifact — already
+tested and disproven once, directly, not theorized. Nothing in this
+step reopens that.
+
+cargo build/test (136/136)/clippy --all-targets -- -D warnings clean.
+All 10 `deploy/tests/*` pass. `npm run typecheck`/`test` (3/3)/`build`
+clean.
+
 ### 15g — a new, separate open question: real sequencer delay, or
 Alchemy-specific indexing lag? (does NOT change 15f's verdict above)
 
