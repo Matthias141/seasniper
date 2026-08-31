@@ -83,7 +83,160 @@ use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use alloy::rpc::types::TransactionTrait;
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use serde::Serialize;
 use tracing::{error, info, warn};
+
+/// STEP 31b — a real, named reason a candidate copymint opportunity was
+/// skipped or a manual fire attempt was refused, instead of only a
+/// free-text `bus::log` line. Mirrors this file's own existing
+/// `fireable`/`is_free` structured-gate pattern (step 6c): the UI gets a
+/// typed code it can render a specific card/badge for, plus (via
+/// `ServerEvent::CopymintSkipped::actionable_hint`) a concrete next step
+/// where one genuinely exists, rather than expecting an operator to
+/// parse a log line.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum CopymintSkipReason {
+    /// getPublicDrop reverted, the RPC call itself failed, or this
+    /// nftContract has no public SeaDrop stage configured at all.
+    DropLookupFailed { detail: String },
+    /// getPublicDrop succeeded but start_time/end_time show this drop
+    /// isn't currently in its live window.
+    NotCurrentlyLive { start_time: u64, end_time: u64, now: u64 },
+    /// A paid opportunity whose total value exceeds `max_copymint_price_wei`.
+    /// Still surfaces as a `CopyOpportunity` card too (fireable: false) —
+    /// this is the same event, structured for a second, more actionable
+    /// UI treatment, not a replacement for the existing one.
+    ExceedsPriceCeiling { total_value_wei: String, ceiling_wei: String },
+    /// Building the replicated mintPublic calldata failed — should not
+    /// normally happen; surfaced structurally rather than only logged so
+    /// it isn't silently invisible if it ever does.
+    CalldataEncodingFailed { detail: String },
+}
+
+impl CopymintSkipReason {
+    /// A concrete "what would fix this" string where one exists — `None`
+    /// when the real fix is external state this bot has no lever over
+    /// (waiting for a drop to go live isn't a config change; a genuine
+    /// RPC/lookup failure could be several different underlying causes).
+    pub fn actionable_hint(&self) -> Option<String> {
+        match self {
+            CopymintSkipReason::ExceedsPriceCeiling { total_value_wei, ceiling_wei } => Some(format!(
+                "raise max_copymint_price_wei to at least {total_value_wei} (currently {ceiling_wei}) to allow this to fire"
+            )),
+            CopymintSkipReason::DropLookupFailed { .. } => Some(
+                "check seadrop_address and RPC connectivity, or this nftContract may not have a public SeaDrop stage configured".to_string(),
+            ),
+            CopymintSkipReason::NotCurrentlyLive { .. } | CopymintSkipReason::CalldataEncodingFailed { .. } => None,
+        }
+    }
+}
+
+fn emit_skip(state: &SharedState, tracked_wallet: Address, nft_contract: Address, reason: CopymintSkipReason) {
+    let actionable_hint = reason.actionable_hint();
+    let _ = state.bus.send(ServerEvent::CopymintSkipped {
+        tracked_wallet: format!("{tracked_wallet:#x}"),
+        nft_contract: format!("{nft_contract:#x}"),
+        reason,
+        actionable_hint,
+    });
+}
+
+/// STEP 31b — per-wallet, per-collection eligibility report.
+#[derive(Debug, Clone, Serialize)]
+pub struct WalletEligibility {
+    pub address: String,
+    pub already_minted: u64,
+    pub eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CopymintEligibilityReport {
+    pub nft_contract: String,
+    pub max_per_wallet: u16,
+    pub current_total_supply: u64,
+    pub max_supply: u64,
+    pub remaining_supply: u64,
+    pub eligible_count: u32,
+    pub total_count: u32,
+    pub wallets: Vec<WalletEligibility>,
+}
+
+/// Pure eligibility check for ONE wallet — no RPC, so this is the piece
+/// that's actually unit-tested (see tests below). `remaining_supply` is
+/// read once, shared across every wallet in the report — this is a
+/// pre-fire ESTIMATE against the collection's state at the moment of the
+/// check, not a guarantee: if the parallel-EOA path actually fires N
+/// wallets, on-chain execution order (not this function) decides which
+/// ones land before global supply is exhausted. Never used by, and has
+/// no bearing on, that hot fire path itself — this exists purely to
+/// inform a human before they click "check eligibility" / commit to a
+/// copymint fire.
+pub fn compute_wallet_eligibility(
+    already_minted: u64,
+    quantity_per_wallet: u64,
+    max_per_wallet: u16,
+    remaining_supply: u64,
+) -> bool {
+    let would_have = already_minted.saturating_add(quantity_per_wallet);
+    would_have <= max_per_wallet as u64 && remaining_supply >= quantity_per_wallet
+}
+
+/// Checks every one of the bot's OWN configured wallets (`state.wallet_status`
+/// — read-only addresses, no private key material touched) against a
+/// detected copymint target's real `getPublicDrop`
+/// (`maxTotalMintableByWallet`) and `getMintStats`
+/// (`minterNumMinted`/`currentTotalSupply`/`maxSupply`) fields, live —
+/// never cached, never guessed. Explicitly a read-only pre-fire check:
+/// this function never sends `ControlMsg::FireCopymint` or touches
+/// anything the parallel-EOA hot fire path depends on.
+pub async fn check_eligibility(state: &SharedState, nft_contract: Address) -> Result<CopymintEligibilityReport> {
+    let cfg = state.config.read().await.clone();
+    let seadrop_address = resolve_seadrop_address(&cfg)?;
+    let http_rpc_url = state.best_http_rpc_url().await.unwrap_or_else(|| cfg.http_rpc_urls[0].clone());
+
+    let drop = seadrop::fetch_public_drop(&http_rpc_url, seadrop_address, nft_contract)
+        .await
+        .context("getPublicDrop failed")?;
+
+    let wallet_addresses: Vec<String> = state.wallet_status.read().await.iter().map(|w| w.address.clone()).collect();
+    if wallet_addresses.is_empty() {
+        anyhow::bail!("no wallets configured — nothing to check eligibility for");
+    }
+
+    let mut wallets = Vec::with_capacity(wallet_addresses.len());
+    let mut current_total_supply = 0u64;
+    let mut max_supply = 0u64;
+    for addr_str in &wallet_addresses {
+        let addr: Address = addr_str.parse().context("parsing configured wallet address")?;
+        let stats = seadrop::fetch_mint_stats(&http_rpc_url, nft_contract, addr)
+            .await
+            .with_context(|| format!("getMintStats failed for wallet {addr_str}"))?;
+        current_total_supply = stats.current_total_supply;
+        max_supply = stats.max_supply;
+        let remaining_supply = max_supply.saturating_sub(current_total_supply);
+        let eligible = compute_wallet_eligibility(stats.minter_num_minted, cfg.quantity_per_wallet, drop.max_per_wallet, remaining_supply);
+        wallets.push(WalletEligibility {
+            address: addr_str.clone(),
+            already_minted: stats.minter_num_minted,
+            eligible,
+        });
+    }
+
+    let remaining_supply = max_supply.saturating_sub(current_total_supply);
+    let eligible_count = wallets.iter().filter(|w| w.eligible).count() as u32;
+
+    Ok(CopymintEligibilityReport {
+        nft_contract: format!("{nft_contract:#x}"),
+        max_per_wallet: drop.max_per_wallet,
+        current_total_supply,
+        max_supply,
+        remaining_supply,
+        eligible_count,
+        total_count: wallets.len() as u32,
+        wallets,
+    })
+}
 
 /// mintPublic(address,address,address,uint256) — same signature
 /// `seadrop.rs`'s `encode_mint_public` builds calldata for.
@@ -319,6 +472,7 @@ async fn handle_candidate(
                      getPublicDrop failed ({e:#}) — not treating as an opportunity"
                 ),
             );
+            emit_skip(state, tracked_wallet, nft_contract, CopymintSkipReason::DropLookupFailed { detail: format!("{e:#}") });
             return;
         }
     };
@@ -334,6 +488,12 @@ async fn handle_candidate(
                  treating as an opportunity",
                 drop.start_time, drop.end_time, now
             ),
+        );
+        emit_skip(
+            state,
+            tracked_wallet,
+            nft_contract,
+            CopymintSkipReason::NotCurrentlyLive { start_time: drop.start_time, end_time: drop.end_time, now },
         );
         return;
     }
@@ -369,6 +529,17 @@ async fn handle_candidate(
             }
         ),
     );
+    if !is_free && !fireable {
+        emit_skip(
+            state,
+            tracked_wallet,
+            nft_contract,
+            CopymintSkipReason::ExceedsPriceCeiling {
+                total_value_wei: total_value.to_string(),
+                ceiling_wei: cfg.max_copymint_price_wei.to_string(),
+            },
+        );
+    }
 
     if should_auto_fire(is_free, cfg.copymint_auto_fire_free) {
         match seadrop::encode_mint_public(nft_contract, fee_recipient, cfg.quantity_per_wallet) {
@@ -382,11 +553,14 @@ async fn handle_candidate(
                     })
                     .await;
             }
-            Err(e) => bus::log(
-                &state.bus,
-                "error",
-                format!("copymint: failed to encode mintPublic calldata for {nft_contract:#x}: {e:#}"),
-            ),
+            Err(e) => {
+                bus::log(
+                    &state.bus,
+                    "error",
+                    format!("copymint: failed to encode mintPublic calldata for {nft_contract:#x}: {e:#}"),
+                );
+                emit_skip(state, tracked_wallet, nft_contract, CopymintSkipReason::CalldataEncodingFailed { detail: format!("{e:#}") });
+            }
         }
     }
 }
@@ -521,5 +695,82 @@ mod tests {
     fn free_opportunities_auto_fire_only_when_enabled() {
         assert!(should_auto_fire(true, true));
         assert!(!should_auto_fire(true, false));
+    }
+
+    // --- STEP 31b: eligibility check + structured skip reasons ---
+
+    #[test]
+    fn wallet_under_cap_with_supply_remaining_is_eligible() {
+        assert!(compute_wallet_eligibility(3, 1, 20, 500));
+    }
+
+    #[test]
+    fn wallet_at_cap_is_not_eligible() {
+        // already_minted (20) + quantity_per_wallet (1) > max_per_wallet (20)
+        assert!(!compute_wallet_eligibility(20, 1, 20, 500));
+    }
+
+    #[test]
+    fn wallet_exactly_at_the_boundary_is_eligible() {
+        // already_minted (19) + quantity_per_wallet (1) == max_per_wallet (20)
+        assert!(compute_wallet_eligibility(19, 1, 20, 500));
+    }
+
+    #[test]
+    fn wallet_under_cap_but_no_supply_remaining_is_not_eligible() {
+        // This is the real EVERYBODYS state confirmed live in step 31b's
+        // research: currentTotalSupply == maxSupply == 10000, so
+        // remaining_supply is 0 regardless of any wallet's own cap room.
+        assert!(!compute_wallet_eligibility(0, 1, 20, 0));
+    }
+
+    #[test]
+    fn requesting_more_than_one_quantity_is_checked_against_both_gates() {
+        // Room under the per-wallet cap (18+5=23 > 20 cap) fails even
+        // though supply alone would allow it.
+        assert!(!compute_wallet_eligibility(18, 5, 20, 500));
+        // Enough cap room but not enough remaining supply for the full
+        // requested quantity.
+        assert!(!compute_wallet_eligibility(0, 5, 20, 3));
+    }
+
+    #[test]
+    fn already_minted_does_not_overflow_on_saturating_add() {
+        // A pathological already_minted (shouldn't happen from a real
+        // getMintStats read, but the function must not panic) never
+        // wraps back around to "eligible".
+        assert!(!compute_wallet_eligibility(u64::MAX, 1, 20, 500));
+    }
+
+    #[test]
+    fn exceeds_price_ceiling_has_an_actionable_hint() {
+        let reason = CopymintSkipReason::ExceedsPriceCeiling {
+            total_value_wei: "5000000000000000".to_string(),
+            ceiling_wei: "1000000000000000".to_string(),
+        };
+        let hint = reason.actionable_hint().expect("should have a concrete next step");
+        assert!(hint.contains("max_copymint_price_wei"));
+        assert!(hint.contains("5000000000000000"));
+    }
+
+    #[test]
+    fn not_currently_live_has_no_actionable_hint() {
+        // Waiting for a drop to go live (or accepting it already ended)
+        // isn't a config change this bot can make on the operator's
+        // behalf — no hint should be fabricated for it.
+        let reason = CopymintSkipReason::NotCurrentlyLive { start_time: 100, end_time: 200, now: 50 };
+        assert!(reason.actionable_hint().is_none());
+    }
+
+    #[test]
+    fn calldata_encoding_failed_has_no_actionable_hint() {
+        let reason = CopymintSkipReason::CalldataEncodingFailed { detail: "bad abi".to_string() };
+        assert!(reason.actionable_hint().is_none());
+    }
+
+    #[test]
+    fn drop_lookup_failed_has_an_actionable_hint() {
+        let reason = CopymintSkipReason::DropLookupFailed { detail: "rpc timeout".to_string() };
+        assert!(reason.actionable_hint().is_some());
     }
 }

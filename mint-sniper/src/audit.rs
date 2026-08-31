@@ -151,6 +151,15 @@ pub async fn run_audit_writer(bus: EventBus, path: String) {
                     "fireable": fireable,
                 }),
             ),
+            ServerEvent::CopymintSkipped { tracked_wallet, nft_contract, reason, actionable_hint } => (
+                "copymint_skipped",
+                serde_json::json!({
+                    "tracked_wallet": tracked_wallet,
+                    "nft_contract": nft_contract,
+                    "reason": reason,
+                    "actionable_hint": actionable_hint,
+                }),
+            ),
             ServerEvent::DelegatedRunStarted { delegate_count, estimated_max_spend_wei } => (
                 "delegated_run_started",
                 serde_json::json!({

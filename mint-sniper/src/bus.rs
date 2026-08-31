@@ -82,6 +82,27 @@ pub enum ServerEvent {
         is_free: bool,
         fireable: bool,
     },
+    /// STEP 31b — a candidate copymint opportunity that never became a
+    /// `CopyOpportunity` at all (or, for `ExceedsPriceCeiling`, one that
+    /// did but is worth a structured, actionable UI item too — that
+    /// specific reason is emitted ALONGSIDE the existing `CopyOpportunity`
+    /// event, not instead of it, so the over-ceiling card in
+    /// CopyOpportunities.tsx keeps rendering exactly as before). Named,
+    /// structured reason codes rather than free-text `Log` lines
+    /// specifically so the UI can render a real card with a concrete next
+    /// step, mirroring this file's own `fireable`/`is_free` structured-gate
+    /// pattern instead of expecting an operator to read a log line and
+    /// infer what to do. See `copymint::CopymintSkipReason`.
+    CopymintSkipped {
+        tracked_wallet: String,
+        nft_contract: String,
+        reason: crate::copymint::CopymintSkipReason,
+        /// Computed once here (not re-derived in the UI) so there is one
+        /// source of truth for "what does an operator do about this" —
+        /// `None` when the fix genuinely isn't a config change (e.g.
+        /// "wait for the drop to go live" isn't actionable in that sense).
+        actionable_hint: Option<String>,
+    },
     /// --- Delegated mint mode (v1) --- see `delegated/executor.rs`'s own
     /// doc comment for why every one of these is explicitly labeled
     /// DELEGATED_SERIAL rather than implying single-transaction batching.

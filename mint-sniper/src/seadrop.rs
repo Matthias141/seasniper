@@ -144,6 +144,46 @@ pub async fn is_fee_recipient_allowed(
     decoded[0].as_bool().context("decoding bool result")
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MintStats {
+    pub minter_num_minted: u64,
+    pub current_total_supply: u64,
+    pub max_supply: u64,
+}
+
+/// Reads IERC721SeaDrop.getMintStats(minter) from the NFT contract itself
+/// (NOT the SeaDrop singleton — this is a per-collection function every
+/// ERC721SeaDrop-family contract implements). Confirmed live, not
+/// assumed: `eth_call` against a real mainnet SeaDrop collection
+/// (EVERYBODYS, the same one seadrop.rs's own encode_mint_public test
+/// uses) with selector 0x840e15d4 (keccak256("getMintStats(address)")[..4],
+/// independently computed) returned a real, well-formed 3-word response —
+/// decoded here as (minterNumMinted, currentTotalSupply, maxSupply), per
+/// step 23's own design note on this function. Used by copymint's
+/// pre-fire eligibility check (31b) — never on the parallel-EOA hot fire
+/// path, which has no eligibility-check concept and isn't touched by
+/// this function existing.
+pub async fn fetch_mint_stats(http_rpc: &str, nft_contract: Address, minter: Address) -> Result<MintStats> {
+    let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_rpc.parse()?);
+    let func = Function::parse("getMintStats(address) returns (uint256,uint256,uint256)")
+        .context("parsing getMintStats signature")?;
+    let calldata = func.abi_encode_input(&[DynSolValue::Address(minter)])?;
+    let tx = TransactionRequest::default().to(nft_contract).input(calldata.into());
+    let raw = provider
+        .call(tx)
+        .await
+        .context("getMintStats call failed — nft_contract may not implement IERC721SeaDrop")?;
+    let decoded = func.abi_decode_output(&raw).context("decoding getMintStats result")?;
+    let minter_num_minted = decoded[0].as_uint().map(|(v, _)| v.to::<u64>()).context("minterNumMinted field")?;
+    let current_total_supply = decoded[1].as_uint().map(|(v, _)| v.to::<u64>()).context("currentTotalSupply field")?;
+    let max_supply = decoded[2].as_uint().map(|(v, _)| v.to::<u64>()).context("maxSupply field")?;
+    Ok(MintStats {
+        minter_num_minted,
+        current_total_supply,
+        max_supply,
+    })
+}
+
 /// Builds calldata for ISeaDrop.mintPublic(nftContract, feeRecipient,
 /// minterIfNotPayer, quantity). minterIfNotPayer = Address::ZERO means
 /// "mint to msg.sender" — each wallet mints to itself, the normal case for
