@@ -17,6 +17,22 @@ function weiToEth(wei: string): string {
   }
 }
 
+// STEP 31a — the backend's operator_balance_eth comes straight from
+// alloy's format_units(bal, "ether"), which can carry up to 18 decimal
+// places with no truncation (e.g. "0.428431920000000000"). Rendered
+// un-truncated in a nowrap flex item, this real value was wide enough
+// to overflow a 390px viewport by ~2px — confirmed live via Playwright,
+// not a hypothetical. String-truncated here (never parseFloat/toFixed,
+// same "no float precision loss on a real balance" reasoning as
+// weiToEth above) to a fixed number of decimals for display only; the
+// full-precision value is still what's used anywhere non-display.
+function truncateDecimalDisplay(decimalStr: string, maxDecimals = 6): string {
+  if (decimalStr === '?') return decimalStr;
+  const dot = decimalStr.indexOf('.');
+  if (dot === -1 || decimalStr.length - dot - 1 <= maxDecimals) return decimalStr;
+  return decimalStr.slice(0, dot + 1 + maxDecimals);
+}
+
 function truncateAddress(addr: string): string {
   return addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
 }
@@ -152,7 +168,9 @@ export function OperatorPanel({
           <div className={styles.label}>OPERATOR (only funded wallet)</div>
           <div className={styles.address}>{status.operator_address}</div>
         </div>
-        <div className={styles.balance}>{status.operator_balance_eth} ETH</div>
+        <div className={styles.balance} title={`${status.operator_balance_eth} ETH`}>
+          {truncateDecimalDisplay(status.operator_balance_eth)} ETH
+        </div>
       </div>
 
       <div className={styles.capacityLine}>

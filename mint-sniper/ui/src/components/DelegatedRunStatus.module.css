@@ -46,6 +46,20 @@
   align-items: center;
 }
 
+/* STEP 31a — no viewport overflow at 390px (the address column wraps,
+   same as every other address display in this app), but the tx-hash
+   meta column was getting squeezed into a very narrow strip next to a
+   wrapping address, hurting legibility. Same "stack instead of crush"
+   fix as TargetResolver.module.css's step 16 precedent. */
+@media (max-width: 480px) {
+  .row {
+    grid-template-columns: 1fr;
+  }
+  .meta {
+    text-align: left;
+  }
+}
+
 /* Same visual grammar as CopyOpportunities.tsx's free/paid split: color
    carries the meaning, not just the text badge. */
 .queued {
