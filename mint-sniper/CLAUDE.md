@@ -3651,3 +3651,83 @@ the compiler forced correct coverage, not a wildcard.
 
 cargo build/test (132/132)/clippy --all-targets -- -D warnings clean.
 npm run typecheck/test (3/3)/build clean.
+
+### 31c — UI consistency audit
+
+Scoped audit: every `.tsx`/`.module.css` component added or modified
+since step 16 (confirmed via `git log --diff-filter=AM` against that
+commit, not assumed from memory) — `OperatorPanel.tsx`/`.module.css`,
+`DelegatedRunStatus.tsx`/`.module.css`, `CopyOpportunities.tsx`/
+`.module.css`. `App.module.css`/`global.css`/`tokens.css` had NOT been
+touched since step 16 going in — that mattered, see below.
+
+**Real bug found and fixed — NOT in any of those three files.** A
+Playwright harness rendering the full page (`StatusBar` + every left/
+right-column component together, the way `App.tsx`'s `Control`
+component actually composes them, not each new component in isolation
+the way 31a/31b tested them) found `main`'s `getBoundingClientRect().top`
+hundreds of pixels NEGATIVE despite `window.scrollY === 0` — real
+content, fully present and correctly styled in the DOM, not reliably
+reachable by a normal page-level scroll. Root cause, confirmed via
+`getComputedStyle` (not guessed): `global.css`'s `body { height: 100%;
+overflow-x: hidden; }`, combined with `html`'s own `overflow-x: hidden`
+(step 16), triggers the CSS Overflow spec's computed-value correction
+rule — setting overflow-x to anything but `visible` while overflow-y
+stays at its default forces overflow-y to compute as `auto` too. Both
+html AND body ended up as independent, disagreeing scroll containers
+(`document.body.scrollTop` was a large nonzero value on initial load
+with nothing having scrolled it). This is a genuinely pre-existing
+latent defect in code untouched since step 16 — this session's own new,
+taller content (step 30/31) is what finally made total page height
+diverge enough between the two nested scroll boxes for it to visibly
+matter. **Fixed without touching either of step 16's real,
+iPhone-verified `overflow-x: hidden` declarations**: `body`'s `height:
+100%` became `min-height: 100%` (matching `.shell`'s own existing
+pattern in `App.module.css`, not a new convention) — body's height now
+tracks its real content instead of being clamped to the viewport, so it
+never has its own overflow to independently scroll; html alone becomes
+the single real scrolling container. Re-verified via the same
+Playwright harness: `getBoundingClientRect()` reports correct positions
+again, and horizontal overflow is still fully prevented at 390px — this
+fix does not weaken step 16's finding at all, it only stops fighting it.
+
+**Separate, lower-severity, NOT fixed — flagged for a follow-up, not
+chased further under this audit's scope.** After the fix above, page
+layout is internally correct, but the page can still land at a nonzero
+initial `scrollY` on load in a sufficiently long page. Traced to
+`EventFeed.tsx`'s pre-existing (unmodified since before step 16)
+`useEffect(() => bottomRef.current?.scrollIntoView({ block: 'end' }),
+[lines.length])` — this fires on mount as well as on new lines, and
+`scrollIntoView` escalates to the nearest ACTUALLY-overflowing
+scrollable ancestor. `.feed`'s own `overflow-y: auto` box only clips
+when its content exceeds `min-height: 220px`; with few lines (the
+common real-world case — a freshly armed bot), it doesn't, so the call
+escalates all the way to the page-level scroll container instead,
+landing the page scrolled to reveal the event feed's latest line rather
+than its own top. Not touched here: `EventFeed.tsx` is unmodified since
+before step 16, out of this audit's "touched since step 16" scope, and
+this is existing, working-as-designed behavior that only becomes a
+noticeable wrinkle on an unusually tall page — a real product decision
+(should mount-time auto-scroll happen at all, should it target
+something other than the whole page) belongs in its own scoped step,
+not folded into this audit.
+
+**Consistency check against `tokens.css` and established conventions —
+no genuine inconsistencies found.** Grepped all three touched/new
+`.module.css` files for hardcoded hex colors (zero — every color is
+`var(--color-*)`), non-token `border-radius`/`font-family` (zero — all
+`var(--radius-*)`/`var(--font-*)`), and non-token spacing. The
+remaining hardcoded px values (`gap: 2px` in a dense receiver list,
+`padding: 4px var(--space-1)` on a data-dense row, `font-size: 0.65rem`
+badge text) all mirror PRE-EXISTING exceptions already present in
+untouched files (`EventFeed.module.css`'s own `.line { padding: 2px 0 }`
+on its dense log rows; `CopyOpportunities.module.css`'s original,
+pre-31b `.badge { font-size: 0.65rem }`) — not new deviations invented
+for this work. `.badge { font-size: 0.65rem }` itself is a very
+slightly off-token value (`--text-xs` is `0.64rem`) but that mismatch
+predates this session; new badges were made to match their siblings
+exactly, not "fixed" to the token unilaterally, which would have made
+this session's badges visually inconsistent with the ones next to them.
+
+cargo build/test (132/132)/clippy clean (no Rust changes this
+sub-step). npm run typecheck/test (3/3)/build clean.
