@@ -216,6 +216,44 @@ pub async fn prepare_fire(
     Ok(prepared)
 }
 
+/// STEP 33 — `send_raw_transaction(...).await` has no timeout of its own
+/// anywhere in this codebase; alloy's underlying reqwest client is built
+/// with no `.timeout()` set (`ProviderBuilder::new().connect_http`, see
+/// `warm_connections`/`warm_sequencer`). A stalled TCP connection (no
+/// response, no RST — a real failure mode, not a hypothetical) would
+/// previously hang this `.await` forever, with nothing bounding it and
+/// nothing ever logged, since the log call for that attempt happens only
+/// AFTER the `.await` resolves. 10s is far above every latency this
+/// project has ever measured for a send (n=100 p99 was 414ms — see
+/// CLAUDE.md's step 28 (final close, corrected)) and far below "hang
+/// forever" — generous enough to never fire on a slow-but-real network
+/// path, tight enough to turn a genuine stall into a loud, logged
+/// timeout instead of silence.
+const SEND_RAW_TX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// STEP 33 — outcome of one timeout-wrapped `send_raw_transaction` call.
+/// Shared by both the sequencer and backup send paths (they were near-
+/// identical inline `match`es before this — real duplication, not a
+/// premature abstraction) and independently unit-testable with a short
+/// `timeout` in tests, without needing to wait out the real
+/// `SEND_RAW_TX_TIMEOUT` (10s) to prove the timeout branch works.
+enum SendAttempt {
+    Acked,
+    RpcError(anyhow::Error),
+    TimedOut,
+}
+
+/// Never hangs longer than `timeout`, regardless of how the underlying
+/// connection behaves — this is the actual fix for STEP 33's silent hang:
+/// previously nothing bounded `send_raw_transaction(...).await` at all.
+async fn send_raw_tx_with_timeout(provider: &HttpProvider, raw_tx: &[u8], timeout: std::time::Duration) -> SendAttempt {
+    match tokio::time::timeout(timeout, provider.send_raw_transaction(raw_tx)).await {
+        Ok(Ok(_)) => SendAttempt::Acked,
+        Ok(Err(e)) => SendAttempt::RpcError(e.into()),
+        Err(_elapsed) => SendAttempt::TimedOut,
+    }
+}
+
 enum SendAttemptOutcome {
     Included {
         receipt: Box<TransactionReceipt>,
@@ -292,7 +330,8 @@ pub async fn fire_prepared(
         let bus = bus.clone();
         let block_ticker = block_ticker.clone();
 
-        handles.push(tokio::spawn(async move {
+        let handle_address = address;
+        handles.push((handle_address, tokio::spawn(async move {
             // P0.1 — jitter_ms_max == 0 skips gen_range and skips sleep entirely. Do not sleep(0).
             if let Some(jitter_ms) = sample_fire_jitter_ms(jitter_ms_min, jitter_ms_max) {
                 if jitter_ms > 0 {
@@ -330,8 +369,13 @@ pub async fn fire_prepared(
             let sequencer_fut = async {
                 if let Some(seq) = sequencer.as_ref() {
                     let attempt_started = std::time::Instant::now();
-                    match seq.send_raw_transaction(raw_tx.as_ref()).await {
-                        Ok(_) => {
+                    // STEP 33 — timeout-wrapped: send_raw_transaction has no
+                    // timeout of its own (see SEND_RAW_TX_TIMEOUT's doc
+                    // comment) — a stalled connection here used to hang
+                    // this future, and the whole per-wallet fire with it,
+                    // forever with nothing ever logged.
+                    match send_raw_tx_with_timeout(seq, raw_tx.as_ref(), SEND_RAW_TX_TIMEOUT).await {
+                        SendAttempt::Acked => {
                             let ms = dispatch_started.elapsed().as_millis() as u64;
                             info!(
                                 url = %config::redact_rpc_url(&sequencer_url),
@@ -342,13 +386,23 @@ pub async fn fire_prepared(
                             );
                             Some((ms, sequencer_url.clone()))
                         }
-                        Err(e) => {
+                        SendAttempt::RpcError(e) => {
                             warn!(
                                 url = %config::redact_rpc_url(&sequencer_url),
                                 latency_ms = attempt_started.elapsed().as_millis() as u64,
                                 ok = false,
                                 error = %e,
                                 "sequencer send attempt; fanning out to backup RPCs"
+                            );
+                            None
+                        }
+                        SendAttempt::TimedOut => {
+                            warn!(
+                                url = %config::redact_rpc_url(&sequencer_url),
+                                latency_ms = attempt_started.elapsed().as_millis() as u64,
+                                ok = false,
+                                timeout_ms = SEND_RAW_TX_TIMEOUT.as_millis() as u64,
+                                "sequencer send attempt timed out; fanning out to backup RPCs"
                             );
                             None
                         }
@@ -366,15 +420,37 @@ pub async fn fire_prepared(
                     async move {
                         let result: Result<SendAttemptOutcome, anyhow::Error> = async {
                             let attempt_started = std::time::Instant::now();
-                            if let Err(e) = provider.send_raw_transaction(raw_tx.as_ref()).await {
-                                warn!(
-                                    url = %config::redact_rpc_url(&url),
-                                    latency_ms = attempt_started.elapsed().as_millis() as u64,
-                                    ok = false,
-                                    error = %e,
-                                    "backup RPC send attempt"
-                                );
-                                return Err(e.into());
+                            // STEP 33 — same timeout-wrapping as the
+                            // sequencer path above, for the same reason:
+                            // an unbounded send_raw_transaction().await
+                            // here used to be able to hang this wallet's
+                            // entire fire forever, silently.
+                            match send_raw_tx_with_timeout(provider, raw_tx.as_ref(), SEND_RAW_TX_TIMEOUT).await {
+                                SendAttempt::Acked => {}
+                                SendAttempt::RpcError(e) => {
+                                    warn!(
+                                        url = %config::redact_rpc_url(&url),
+                                        latency_ms = attempt_started.elapsed().as_millis() as u64,
+                                        ok = false,
+                                        error = %e,
+                                        "backup RPC send attempt"
+                                    );
+                                    return Err(e);
+                                }
+                                SendAttempt::TimedOut => {
+                                    warn!(
+                                        url = %config::redact_rpc_url(&url),
+                                        latency_ms = attempt_started.elapsed().as_millis() as u64,
+                                        ok = false,
+                                        timeout_ms = SEND_RAW_TX_TIMEOUT.as_millis() as u64,
+                                        "backup RPC send attempt timed out"
+                                    );
+                                    anyhow::bail!(
+                                        "send_raw_transaction to {} timed out after {}ms",
+                                        config::redact_rpc_url(&url),
+                                        SEND_RAW_TX_TIMEOUT.as_millis()
+                                    );
+                                }
                             }
                             let send_to_ack_ms = dispatch_started.elapsed().as_millis() as u64;
                             info!(
@@ -610,11 +686,48 @@ pub async fn fire_prepared(
                     acked_url: None,
                 });
             }
-        }));
+        })));
     }
 
-    join_all(handles).await;
+    await_all_and_report_panics(handles, bus).await;
     Ok(())
+}
+
+/// STEP 33 — `join_all(handles).await` (the prior form here) discarded
+/// each task's `JoinError` outright. A panic inside a per-wallet task
+/// (e.g. one of the `prefer_sequencer_ack(...).expect(...)` calls above,
+/// or any future one) previously ended that wallet's fire with NO log
+/// line and NO `MintResult` at all — completely indistinguishable, from
+/// the outside, from the task never having run at all. Extracted into
+/// its own function (rather than left inline) specifically so this
+/// behavior is independently unit-testable against a handle that
+/// genuinely panics, not just inspectable by reading the code. Every
+/// handle's outcome is checked explicitly: a panic is loud (a logged
+/// `error!` plus a real `MintResult`) instead of silent, closing the
+/// "every fire-path outcome must be a result or a logged error, no
+/// exceptions" gap this bug exposed.
+async fn await_all_and_report_panics(handles: Vec<(Address, tokio::task::JoinHandle<()>)>, bus: &EventBus) {
+    for (address, handle) in handles {
+        if let Err(join_err) = handle.await {
+            error!(%address, error = %join_err, "wallet's fire task panicked — this is an internal bug, not a network failure");
+            let _ = bus.send(ServerEvent::MintResult {
+                address: format!("{address:#x}"),
+                success: false,
+                detail: format!("internal panic during fire (this wallet's task crashed before producing a result): {join_err}"),
+                trigger_to_dispatch_ms: None,
+                // Not meaningful here — the task panicked before this
+                // could be computed reliably, and there is no "unknown"
+                // representation for this field (unlike the Option<u64>
+                // timing fields above). success: false + detail already
+                // make this branch unambiguous.
+                prepare_age_ms: 0,
+                send_to_ack_ms: None,
+                dispatch_to_inclusion_ms: None,
+                ack_source: None,
+                acked_url: None,
+            });
+        }
+    }
 }
 
 fn apply_pct_jitter(value: u128, pct: i64) -> u128 {
@@ -625,7 +738,8 @@ fn apply_pct_jitter(value: u128, pct: i64) -> u128 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pct_jitter, classify_ack_source, fire_prepared, sample_fire_jitter_ms, warm_sequencer, HttpProvider, PreparedWallet,
+        apply_pct_jitter, await_all_and_report_panics, classify_ack_source, fire_prepared, sample_fire_jitter_ms,
+        send_raw_tx_with_timeout, warm_sequencer, HttpProvider, PreparedWallet, SendAttempt,
     };
     use crate::bus;
     use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
@@ -891,5 +1005,92 @@ mod tests {
         let seq = "https://chain.robinhood.com/sequencer".to_string();
         let backup = "https://chain.robinhood.com/rpc".to_string();
         assert_eq!(classify_ack_source(&seq, &backup), "backup");
+    }
+
+    // --- STEP 33: silent fire-path hang, root-caused and regression-tested ---
+
+    /// Never responds to any request — simulates a stalled TCP/RPC
+    /// connection with no timeout of its own, the exact real-world shape
+    /// this step's fix targets (see `SEND_RAW_TX_TIMEOUT`'s doc comment:
+    /// `send_raw_transaction(...).await` previously had nothing bounding
+    /// it at all). Sleeps far longer than any timeout used against it
+    /// below, so the test genuinely exercises "never responds," not
+    /// "responds slowly."
+    async fn spawn_mock_hanging_rpc() -> String {
+        let handler = |Json(_body): Json<Value>| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Json(json!({"jsonrpc": "2.0", "id": 0, "result": "unreachable — timeout should fire first"}))
+        };
+        let app = Router::new().route("/", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    /// STEP 33 regression test — the actual root-caused bug: nothing in
+    /// this codebase bounded `send_raw_transaction(...).await`, so a
+    /// stalled connection (this mock: a handler that never responds)
+    /// hung the calling future forever, with nothing ever logged. A
+    /// short 200ms timeout here (not the real 10s `SEND_RAW_TX_TIMEOUT`
+    /// used at fire time) proves the bounding mechanism itself works
+    /// without making this test slow.
+    #[tokio::test]
+    async fn send_raw_tx_with_timeout_never_hangs_on_a_stalled_connection() {
+        let mock_url = spawn_mock_hanging_rpc().await;
+        let provider: HttpProvider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(mock_url.parse().unwrap());
+
+        let started = std::time::Instant::now();
+        let outcome = send_raw_tx_with_timeout(&provider, &[0xde, 0xad, 0xbe, 0xef], std::time::Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, SendAttempt::TimedOut),
+            "a stalled connection must resolve to SendAttempt::TimedOut, not hang or silently succeed"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "send_raw_tx_with_timeout took {elapsed:?} against a 200ms timeout — it did not actually bound the wait, \
+             which is the exact regression this test exists to catch"
+        );
+    }
+
+    /// STEP 33 regression test — the other real gap the same bug report
+    /// surfaced: `join_all(handles).await` used to discard every per-
+    /// wallet task's `JoinError`, so a genuine panic inside one wallet's
+    /// fire task previously vanished completely — no log, no
+    /// `MintResult`, indistinguishable from the task never having run.
+    /// `await_all_and_report_panics` must turn that into a loud, logged
+    /// failure with a real `MintResult` instead.
+    #[tokio::test]
+    async fn a_panicking_wallet_task_produces_a_logged_result_not_silence() {
+        let bus = bus::new_bus();
+        let mut rx = bus.subscribe();
+
+        let handle = tokio::spawn(async {
+            panic!("deliberate test panic — simulates a genuine bug inside a per-wallet fire task");
+        });
+
+        await_all_and_report_panics(vec![(Address::ZERO, handle)], &bus).await;
+
+        let mut saw_result = false;
+        while let Ok(event) = rx.try_recv() {
+            if let bus::ServerEvent::MintResult { success, detail, .. } = event {
+                saw_result = true;
+                assert!(!success, "a panicked wallet task must never be reported as a success");
+                assert!(
+                    detail.contains("panic"),
+                    "the MintResult detail should say this was an internal panic, not a network failure: {detail}"
+                );
+            }
+        }
+        assert!(
+            saw_result,
+            "a panicking wallet task must still produce a MintResult — STEP 33's whole point is no silent failures"
+        );
     }
 }

@@ -46,7 +46,25 @@ const SESSION_KEY_PATH: &str = ".session-key";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // STEP 33 — tracing_subscriber::fmt::init() (the prior form here) wires
+    // the default MakeWriter straight to std::io::stdout(), which does a
+    // synchronous, blocking write() on whatever thread calls info!/warn!/
+    // error!. Under journald (this project's real deployment target) that
+    // pipe can back up; on a small VPS's #[tokio::main] worker pool,
+    // enough concurrent blocked writers stall the entire tokio runtime —
+    // every task, not just the one logging — with zero error output
+    // anywhere, a genuinely silent hang. tracing_appender::non_blocking
+    // hands each formatted line to a bounded channel drained by one
+    // dedicated OS thread; no tokio worker thread ever performs the I/O
+    // itself, so a slow or stalled log sink can no longer stall the
+    // runtime. The returned guard must stay alive for the process
+    // lifetime (dropping it stops the writer thread and can silently
+    // truncate buffered lines) — leaked deliberately, not a bug: this
+    // process runs until killed, and a `main`-scope local would need an
+    // explicit hold anyway for the exact same lifetime.
+    let (non_blocking_stdout, guard) = tracing_appender::non_blocking(std::io::stdout());
+    Box::leak(Box::new(guard));
+    tracing_subscriber::fmt().with_writer(non_blocking_stdout).init();
 
     let mut cfg = config::Config::load(CONFIG_PATH).context("loading config.toml")?;
     let event_bus = bus::new_bus();
