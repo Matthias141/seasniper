@@ -238,6 +238,23 @@ fn prefer_sequencer_ack(
     sequencer_ack.or(backup)
 }
 
+/// STEP 28 (final) — classifies which path actually acked a send, for
+/// `ServerEvent::MintResult`'s `ack_source` field. Compares the RAW
+/// (unredacted) acked URL against the RAW configured `sequencer_url` —
+/// exact string equality, not a substring/host heuristic, since that's
+/// the only way to be certain rather than guessed (a backup RPC could
+/// coincidentally share a host with the sequencer on some future
+/// config). Never logs or persists the raw URLs it compares — only this
+/// function's own `&'static str` return value crosses into the bus
+/// event; the caller separately redacts `acked_url` before sending it.
+fn classify_ack_source(sequencer_url: &str, acked_url: &str) -> &'static str {
+    if !sequencer_url.is_empty() && acked_url == sequencer_url {
+        "sequencer"
+    } else {
+        "backup"
+    }
+}
+
 pub async fn fire_prepared(
     cfg: &Config,
     prepared: &[PreparedWallet],
@@ -428,6 +445,9 @@ pub async fn fire_prepared(
                     "using this URL's ack for send_to_ack_ms"
                 );
 
+                let ack_source = Some(classify_ack_source(&sequencer_url, &acked_url));
+                let acked_url_redacted = Some(config::redact_rpc_url(&acked_url));
+
                 if receipt.status() {
                     info!(%address, %tx_hash, send_to_ack_ms, dispatch_to_inclusion_ms, method, "mint confirmed");
                     let _ = bus.send(ServerEvent::MintResult {
@@ -438,6 +458,8 @@ pub async fn fire_prepared(
                         prepare_age_ms,
                         send_to_ack_ms: Some(send_to_ack_ms),
                         dispatch_to_inclusion_ms: Some(dispatch_to_inclusion_ms),
+                        ack_source,
+                        acked_url: acked_url_redacted,
                     });
                 } else {
                     let detail = format!(
@@ -454,6 +476,8 @@ pub async fn fire_prepared(
                         prepare_age_ms,
                         send_to_ack_ms: Some(send_to_ack_ms),
                         dispatch_to_inclusion_ms: Some(dispatch_to_inclusion_ms),
+                        ack_source,
+                        acked_url: acked_url_redacted,
                     });
                 }
             } else if let Some((backup_ack_ms, method, backup_url)) = results.iter().find_map(|r| match r.as_ref().ok() {
@@ -484,6 +508,8 @@ pub async fn fire_prepared(
                     prepare_age_ms,
                     send_to_ack_ms: Some(send_to_ack_ms),
                     dispatch_to_inclusion_ms: None,
+                    ack_source: Some(classify_ack_source(&sequencer_url, &acked_url)),
+                    acked_url: Some(config::redact_rpc_url(&acked_url)),
                 });
             } else if let Some((send_to_ack_ms, acked_url)) = sequencer_ack {
                 // P0 follow-up 18b — this branch should no longer be
@@ -514,6 +540,12 @@ pub async fn fire_prepared(
                     prepare_age_ms,
                     send_to_ack_ms: Some(send_to_ack_ms),
                     dispatch_to_inclusion_ms: None,
+                    // This branch only reaches here when acked_url IS the
+                    // sequencer (see the P0 follow-up 18b comment above —
+                    // sequencer_ack is the only source in scope), so
+                    // classify_ack_source isn't needed to know the answer.
+                    ack_source: Some("sequencer"),
+                    acked_url: Some(config::redact_rpc_url(&acked_url)),
                 });
             } else {
                 let detail = results
@@ -533,6 +565,9 @@ pub async fn fire_prepared(
                     prepare_age_ms,
                     send_to_ack_ms: None,
                     dispatch_to_inclusion_ms: None,
+                    // Nothing ever acked — there is no path to attribute.
+                    ack_source: None,
+                    acked_url: None,
                 });
             }
         }));
@@ -549,7 +584,9 @@ fn apply_pct_jitter(value: u128, pct: i64) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_pct_jitter, fire_prepared, sample_fire_jitter_ms, warm_sequencer, HttpProvider, PreparedWallet};
+    use super::{
+        apply_pct_jitter, classify_ack_source, fire_prepared, sample_fire_jitter_ms, warm_sequencer, HttpProvider, PreparedWallet,
+    };
     use crate::bus;
     use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::primitives::{Address, Log, TxHash};
@@ -780,5 +817,39 @@ mod tests {
             Some("warn"),
             "a genuine connection failure (no JSON-RPC error payload possible) must still log warn"
         );
+    }
+
+    // --- STEP 28 (final): classify_ack_source ---
+
+    #[test]
+    fn classify_ack_source_matches_the_configured_sequencer_exactly() {
+        let seq = "https://sequencer.testnet.chain.robinhood.com/".to_string();
+        assert_eq!(classify_ack_source(&seq, &seq), "sequencer");
+    }
+
+    #[test]
+    fn classify_ack_source_is_backup_when_url_differs_from_sequencer() {
+        let seq = "https://sequencer.testnet.chain.robinhood.com/".to_string();
+        let backup = "https://rpc.testnet.chain.robinhood.com/".to_string();
+        assert_eq!(classify_ack_source(&seq, &backup), "backup");
+    }
+
+    #[test]
+    fn classify_ack_source_is_backup_when_no_sequencer_is_configured() {
+        // race_mode off / sequencer_http_url unset — every real ack in
+        // this codebase's own Config default is empty string, never used
+        // as a comparison target that could spuriously match.
+        assert_eq!(classify_ack_source("", "https://rpc.testnet.chain.robinhood.com/"), "backup");
+    }
+
+    #[test]
+    fn classify_ack_source_does_not_match_on_a_shared_host_alone() {
+        // A backup RPC sharing the sequencer's host (e.g. two different
+        // paths/ports on the same domain) must NOT be misclassified as
+        // the sequencer — exact string equality only, not a host
+        // heuristic, per this function's own doc comment.
+        let seq = "https://chain.robinhood.com/sequencer".to_string();
+        let backup = "https://chain.robinhood.com/rpc".to_string();
+        assert_eq!(classify_ack_source(&seq, &backup), "backup");
     }
 }

@@ -150,6 +150,10 @@ function Control({ onSignOut }: { onSignOut?: () => void }) {
             event.trigger_to_dispatch_ms != null ? `trigger→dispatch ${event.trigger_to_dispatch_ms}ms` : null,
             event.send_to_ack_ms != null ? `send→ack ${event.send_to_ack_ms}ms` : null,
             event.dispatch_to_inclusion_ms != null ? `dispatch→inclusion ${event.dispatch_to_inclusion_ms}ms` : null,
+            // step 28 (final) — which path acked this send, live in the
+            // feed, not just in audit.log — the exact evidence a prior
+            // benchmark write-up lost by only ever reaching journalctl.
+            event.ack_source != null ? `via ${event.ack_source}` : null,
           ]
             .filter(Boolean)
             .join(', ');

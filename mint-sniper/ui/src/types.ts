@@ -172,6 +172,15 @@ export type ServerEvent =
       send_to_ack_ms: number | null;
       dispatch_to_inclusion_ms: number | null;
       prepare_age_ms: number;
+      // STEP 28 (final) — which submission path actually acked this
+      // send ("sequencer" | "backup"), and its redacted (scheme+host
+      // only) URL. Both null only when nothing ever acked (every
+      // broadcast attempt failed outright). Previously only reached
+      // tracing::info!/journalctl — now on every mint_result, live and
+      // in audit.log, so a benchmark write-up never again has to rely
+      // on scrollback/journalctl retention to attribute a fire's speed.
+      ack_source: 'sequencer' | 'backup' | null;
+      acked_url: string | null;
     }
   | {
       type: 'copy_opportunity';
