@@ -20,6 +20,18 @@ toml = "0.8"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+# STEP 33 — tracing_subscriber::fmt::init()'s default writer does a
+# synchronous, blocking std::io::stdout() write on whatever thread calls
+# the tracing macro. Under journald (this project's actual deployment —
+# see CLAUDE.md), that write can block on a slow/backpressured pipe; on
+# a small VPS's #[tokio::main] worker pool, enough concurrent blocked
+# writers can stall the ENTIRE async runtime with zero error output —
+# a genuine, previously-undiagnosed silent hang. main.rs now builds its
+# subscriber with tracing_appender::non_blocking, which hands every log
+# line to a bounded channel drained by a dedicated OS thread — no tokio
+# worker thread ever blocks on log I/O again, regardless of how slow the
+# underlying writer is.
+tracing-appender = "0.2"
 rand = "0.8"
 futures = "0.3"
 axum = { version = "0.7", features = ["ws"] }

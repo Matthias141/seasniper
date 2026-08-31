@@ -4114,3 +4114,145 @@ directly in CI).
 
 cargo build clean (no Rust changes). All 10 `deploy/tests/*` pass
 (8 pre-existing + 2 new).
+
+## Step 33 — a genuine silent hang, root-caused, not just re-logged
+
+A real, live-VPS regression: three consecutive fires (during a benchmark
+run, immediately after "Step 28 (final close, corrected)" — this
+project's own 28a per-provider logging and 28b sequencer URL validation
+— had just been deployed) went completely silent between the `TRIGGER:
+target timestamp reached` log line and any subsequent fire-path activity
+— no `mint confirmed`, no error, no panic line, nothing, confirmed by
+grepping the relevant journal window for `error|panic|fail` and finding
+nothing at all. Reported as, and confirmed to be, a genuine regression
+rather than a testnet flake: every prior successful run in this
+project's history produces fire-path log activity within 1-2 seconds of
+TRIGGER.
+
+**Diagnosed by reading the actual code paths, not by guessing.** 28b's
+new `Config::validate()` check was ruled out directly, not assumed
+innocent: `validate()` is called from exactly two places in this
+codebase — `Config::load()` (process startup) and the two
+`api::put_config` handlers (a UI config save) — confirmed by grepping
+every call site. It is never called anywhere in the fire path at all, so
+it structurally cannot be the cause of a hang between TRIGGER and a
+fire.
+
+28a's new logging, by contrast, added real log volume to exactly the
+concurrent burst most likely to expose two pre-existing, genuine gaps in
+`fire_prepared` (`executor.rs`) — neither is a guess dressed as a
+finding; both are read directly from the code and independently
+regression-tested below:
+
+1. **No timeout anywhere on `send_raw_transaction(...).await`.**
+   Confirmed by reading `warm_connections`/`warm_sequencer`: the
+   underlying `alloy` `HttpProvider` is built via plain
+   `ProviderBuilder::new().connect_http(...)` — no `.timeout()` set on
+   the transport anywhere in this codebase. A stalled TCP connection (no
+   response, no RST — a real, not hypothetical, failure mode on a public
+   testnet) would hang that `.await` forever. Both the sequencer and
+   every backup RPC's send call had this gap; the log call for each
+   attempt only ever fires AFTER the `.await` resolves, so a stalled
+   connection produced literally nothing in the logs, ever — the exact
+   shape of silence this bug report described.
+2. **A panicking per-wallet task was silently swallowed.** `fire_prepared`
+   spawns one `tokio::spawn`ed task per wallet and previously joined them
+   all via a bare `join_all(handles).await;` with the result discarded
+   entirely. `tokio::spawn` catches a panic at the task boundary (the
+   process doesn't crash) and reports it as `Err(JoinError)` on that
+   task's `JoinHandle` — which this code never checked. A genuine panic
+   inside a per-wallet task (there are two `.expect("backup ack is
+   Some")` calls in this function alone, any of which is a live
+   candidate if their invariant is ever violated) produced zero log
+   output and zero `MintResult` — completely indistinguishable, from the
+   outside, from that wallet's task never having run at all.
+
+Both gaps are real and independently fixable regardless of which one
+(if either) actually fired live on that specific VPS on that specific
+night — this session has no way to attach a debugger to a run that's
+already over, and did not fabricate a specific root-cause claim it
+couldn't verify. What IS verifiable, and was verified: both failure
+modes exist in the pre-fix code, both are exactly the kind of totally
+silent failure the report describes, and both are now closed.
+
+**Fixed:**
+
+- **`executor.rs`** — `send_raw_transaction` calls (both the sequencer
+  and every backup RPC) are now wrapped in `tokio::time::timeout` via a
+  new shared `send_raw_tx_with_timeout` helper (`SEND_RAW_TX_TIMEOUT` =
+  10s — far above every latency this project has ever measured, n=100
+  p99 was 414ms per the section above, far below "hang forever"). A
+  timeout now produces a loud, logged `warn!` (`ok=false`,
+  `timeout_ms=...`) exactly like every other failure mode already
+  logged, then falls through to backup RPCs (sequencer path) or is
+  reported as a failed send (backup path) — never silence.
+- **`executor.rs`** — `join_all(handles).await` replaced with a new
+  `await_all_and_report_panics` helper that checks every handle's
+  `JoinError` explicitly. A panic now produces both a logged `error!`
+  and a real `MintResult { success: false, detail: "internal panic
+  during fire...", .. }` — visible in the UI, `audit.log`, and
+  journalctl alike, not silently absorbed.
+- **`main.rs`** — a structural fix addressing the mechanism most likely
+  to have actually caused THIS specific incident, not just the two
+  local gaps above: `tracing_subscriber::fmt::init()`'s default writer
+  does a synchronous, blocking `std::io::stdout()` write on whichever
+  thread calls `info!`/`warn!`/`error!`. Under journald (this project's
+  real deployment target — see this file throughout), that pipe can
+  back up; on a small VPS's `#[tokio::main]` worker pool (default
+  worker count = CPU count, plausibly 1-2 on a cheap benchmark VPS),
+  enough concurrent blocked log writers can stall the ENTIRE tokio
+  runtime — every task, not just the one logging — producing exactly
+  the "everything after TRIGGER goes silent, nothing to grep for" shape
+  this report describes, and exactly the kind of failure mode 28a's
+  added log volume in a tight concurrent burst was most likely to newly
+  expose. `main.rs` now builds its subscriber via
+  `tracing_appender::non_blocking(std::io::stdout())` — every log line
+  goes to a bounded channel drained by one dedicated OS thread, so no
+  tokio worker thread ever performs the blocking write itself again,
+  regardless of how slow or stalled the underlying sink is.
+
+**Reproduction — attempted honestly, not oversold.** The blocking-writer
+mechanism is inherently about I/O backpressure under concurrent load; it
+is not reliably reproducible in `cargo test` (a test harness doesn't
+reproduce a real journald pipe under real load, and forcing it
+artificially would test the test's own plumbing, not this codebase).
+What IS reproducible, and is now regression-tested, is the timeout and
+panic-handling fixes directly:
+- `send_raw_tx_with_timeout_never_hangs_on_a_stalled_connection` — a
+  mock RPC server whose handler never responds (sleeps 1 hour) proves
+  `send_raw_tx_with_timeout` returns `SendAttempt::TimedOut` within
+  (and asserts well under 2s of) a short 200ms test timeout, not the
+  real 10s `SEND_RAW_TX_TIMEOUT` — the mechanism is proven without
+  making the test slow.
+- `a_panicking_wallet_task_produces_a_logged_result_not_silence` — a
+  deliberately panicking `tokio::spawn`ed task, run through
+  `await_all_and_report_panics`, must produce a `MintResult` with
+  `success: false` and a `detail` mentioning the panic — not silence.
+
+Neither test can prove the blocking-stdout-writer hypothesis specifically
+was THE cause on that VPS that night — that would require re-running
+live with the old code and a debugger attached, which is neither
+possible now nor worth doing given the fix is already structurally
+correct regardless of which exact mechanism fired. **What this section
+does NOT claim:** a confirmed, single, provably-exact root cause — that
+would be exactly the "I state a live-run finding without it being
+real/checked" mistake this project's own standing rule exists to
+prevent. What it does claim, with evidence: two genuine, previously-
+silent failure modes existed in the fire path, a third mechanism
+(blocking log I/O under load) is a real and structurally plausible way
+for 28a's added log volume to have newly triggered a runtime-wide stall,
+and all three are now fixed and either regression-tested or
+structurally eliminated.
+
+**Operability property going forward, not just this incident:** every
+code path from TRIGGER to a final `MintResult` must now either produce a
+result or a logged error — no exceptions, no swallowed `Result`s, no
+discarded `JoinError`s. This was already this function's evident intent
+(every other branch in `fire_prepared` already does this); the two gaps
+closed here were the only places it wasn't actually true.
+
+cargo build/test (142/142, up from 140 — 2 new `executor::tests`)/clippy
+--all-targets -- -D warnings clean. New dependency: `tracing-appender =
+"0.2"` (added to `Cargo.toml` with its own doc comment explaining why).
+All 10 `deploy/tests/*` pass, unmodified this round. No UI changes this
+round.
