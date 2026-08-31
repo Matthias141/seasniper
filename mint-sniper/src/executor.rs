@@ -126,6 +126,49 @@ pub(crate) fn sample_fire_jitter_ms(jitter_ms_min: u64, jitter_ms_max: u64) -> O
     }
 }
 
+/// STEP 34 — `prepare_fire`'s three read calls (`get_chain_id`,
+/// `get_gas_price`, `estimate_gas`) had no timeout of their own, same gap
+/// class as STEP 33's `send_raw_transaction` — but critically EARLIER in
+/// the real call chain: `prepare_fire` runs synchronously inside
+/// `control_loop`'s single `while let Some(msg) = control_rx.recv().await`
+/// loop (called directly from the `ControlMsg::Prepare` handler, from
+/// `FireNow`'s no-prior-prepare fallback, and from `FireCopymint`) — there
+/// is no `tokio::spawn` around it. A stall in any of these three calls
+/// therefore doesn't just hang one task: it hangs the ENTIRE control loop,
+/// which is the only consumer of `state.control_tx` — no further Arm,
+/// Disarm, Prepare, or FireNow message is ever processed again. And
+/// because this function's first log line (`"wallet prepared"`) only
+/// fires AFTER all three reads succeed, a stall here produces genuinely
+/// zero log output — indistinguishable, from the outside, from the
+/// process itself having died. This is a stronger match for a reported
+/// "TRIGGER logged, then total silence" live regression than STEP 33's
+/// fix alone (which only covers `fire_prepared`, downstream of this
+/// function): STEP 33's own new timeout/logging would have produced
+/// SOME output if that code had ever been reached, and it didn't.
+const PREPARE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Wraps one read-only provider call (`get_chain_id`/`get_gas_price`/
+/// `estimate_gas` — all `Result<T, E>`-returning `Provider` methods) in a
+/// timeout, turning a silent, indefinite stall into a loud, `anyhow`-
+/// context-carrying error the existing `?`-based callers in
+/// `prepare_fire` already know how to propagate and log. Takes `timeout`
+/// as a parameter (rather than hardcoding `PREPARE_READ_TIMEOUT`
+/// internally) so it's independently testable with a short duration —
+/// same reasoning as STEP 33's `send_raw_tx_with_timeout`.
+async fn timed_read<T, E, F>(fut: F, what: &str, timeout: std::time::Duration) -> Result<T>
+where
+    // alloy's provider call builders (e.g. `estimate_gas`'s `EthCall`)
+    // implement `IntoFuture`, not `Future` directly — `.await`ing them
+    // works via that conversion, so this helper accepts the same.
+    F: std::future::IntoFuture<Output = std::result::Result<T, E>>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    match tokio::time::timeout(timeout, fut.into_future()).await {
+        Ok(inner) => inner.with_context(|| what.to_string()),
+        Err(_elapsed) => Err(anyhow::anyhow!("{what} timed out after {}ms", timeout.as_millis())),
+    }
+}
+
 pub async fn prepare_fire(
     cfg: &Config,
     wallets: &[ManagedWallet],
@@ -139,9 +182,9 @@ pub async fn prepare_fire(
         .first()
         .context("prepare_fire called with no warmed RPC providers")?;
 
-    let chain_id = reader.get_chain_id().await.context("fetching chain id")?;
+    let chain_id = timed_read(reader.get_chain_id(), "fetching chain id", PREPARE_READ_TIMEOUT).await?;
 
-    let base_fee = reader.get_gas_price().await.context("fetching gas price")?;
+    let base_fee = timed_read(reader.get_gas_price(), "fetching gas price", PREPARE_READ_TIMEOUT).await?;
     let priority_fee_wei = ((base_fee as f64) * cfg.priority_fee_multiplier) as u128;
     let cap_wei = (cfg.max_priority_fee_gwei_cap * 1e9) as u128;
     let priority_fee_wei = priority_fee_wei.min(cap_wei);
@@ -153,10 +196,7 @@ pub async fn prepare_fire(
     if let Some(from) = wallets.first().map(|w| w.address) {
         probe_tx = probe_tx.from(from);
     }
-    let estimated_gas = reader
-        .estimate_gas(probe_tx)
-        .await
-        .context("estimating gas")?;
+    let estimated_gas = timed_read(reader.estimate_gas(probe_tx), "estimating gas", PREPARE_READ_TIMEOUT).await?;
     let gas_limit = estimated_gas + (estimated_gas * cfg.gas_limit_headroom_pct) / 100;
 
     let mut prepared = Vec::with_capacity(wallets.len());
@@ -739,12 +779,12 @@ fn apply_pct_jitter(value: u128, pct: i64) -> u128 {
 mod tests {
     use super::{
         apply_pct_jitter, await_all_and_report_panics, classify_ack_source, fire_prepared, sample_fire_jitter_ms,
-        send_raw_tx_with_timeout, warm_sequencer, HttpProvider, PreparedWallet, SendAttempt,
+        send_raw_tx_with_timeout, timed_read, warm_sequencer, HttpProvider, PreparedWallet, SendAttempt,
     };
     use crate::bus;
     use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::primitives::{Address, Log, TxHash};
-    use alloy::providers::ProviderBuilder;
+    use alloy::providers::{Provider, ProviderBuilder};
     use alloy::rpc::types::TransactionReceipt;
     use axum::{routing::post, Json, Router};
     use serde_json::{json, Value};
@@ -1056,6 +1096,41 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "send_raw_tx_with_timeout took {elapsed:?} against a 200ms timeout — it did not actually bound the wait, \
              which is the exact regression this test exists to catch"
+        );
+    }
+
+    /// STEP 34 regression test — the real, still-live gap step 33's own
+    /// fix did NOT cover: `prepare_fire`'s `get_chain_id`/`get_gas_price`/
+    /// `estimate_gas` reads had no timeout at all, and this function runs
+    /// synchronously inside `control_loop`'s single message loop (no
+    /// `tokio::spawn` around it) — a stall here doesn't just hang one
+    /// task, it hangs the ENTIRE bot, with zero log output, since
+    /// `prepare_fire`'s first log line only fires after all three reads
+    /// succeed. A mock RPC that never responds to `eth_chainId` proves
+    /// `timed_read` resolves to a loud, "timed out"-labeled Err within a
+    /// short 200ms test timeout, not the real 10s `PREPARE_READ_TIMEOUT` —
+    /// same "prove the mechanism, don't make the test slow" approach as
+    /// step 33's own timeout test above.
+    #[tokio::test]
+    async fn timed_read_never_hangs_on_a_stalled_provider_call() {
+        let mock_url = spawn_mock_hanging_rpc().await;
+        let provider: HttpProvider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(mock_url.parse().unwrap());
+
+        let started = std::time::Instant::now();
+        let result = timed_read(provider.get_chain_id(), "fetching chain id", std::time::Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("a stalled read must resolve to an Err, not hang or silently succeed");
+        assert!(
+            err.to_string().contains("timed out"),
+            "the error should clearly say this was a timeout, not some other failure: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "timed_read took {elapsed:?} against a 200ms timeout — it did not actually bound the wait, \
+             which is the exact regression (step 34's silent bot-wide hang) this test exists to catch"
         );
     }
 

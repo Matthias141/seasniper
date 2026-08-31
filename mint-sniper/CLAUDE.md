@@ -4256,3 +4256,133 @@ cargo build/test (142/142, up from 140 — 2 new `executor::tests`)/clippy
 "0.2"` (added to `Cargo.toml` with its own doc comment explaining why).
 All 10 `deploy/tests/*` pass, unmodified this round. No UI changes this
 round.
+
+## Step 34 — step 33 was incomplete, not wrong: the real culprit is earlier in the call chain
+
+Live evidence, confirmed twice on the real VPS (fresh process each time,
+step 33's commit confirmed genuinely deployed via `git log`), that step
+33's fixes did NOT resolve the silent hang: `TRIGGER: target timestamp
+reached` still logs, then complete silence — no `wallet prepared`, no
+error, nothing — identical to the original symptom. This was the
+correct signal to re-open the investigation rather than declare step 33
+sufficient: step 33's own new timeout/logging inside `fire_prepared`
+would have produced SOME output — a `warn!` on a timed-out send, at
+minimum — if that code had ever been reached. It never logs at all,
+which means the real stall is somewhere EARLIER in the call chain,
+before `fire_prepared`/`send_raw_transaction` is ever invoked. Traced
+that earlier path directly, per every one of the report's specific
+checks:
+
+**1. Locks between TRIGGER and the first broadcast attempt — none
+implicated.** `state.config`'s two `RwLock` write sites (`api.rs`'s
+`put_config`/`post_target_set`) are both tightly scoped (`{ let mut cfg
+= ...write().await; *cfg = new_cfg; }`, dropped immediately, well
+before the disk write) — no long-held write lock that could starve a
+reader on the fire path. `state.wallet_status`'s write lock lives in a
+completely separate background balance-poll loop (`main.rs`, unrelated
+to `control_loop`), also dropped explicitly before any further await.
+Not the mechanism.
+
+**2. Another unbounded `.await` earlier in the path — found, and it's
+the real one.** `executor::prepare_fire`'s three read calls
+(`get_chain_id`, `get_gas_price`, `estimate_gas`) had no timeout of
+their own anywhere in this codebase — the same gap class step 33 fixed
+for `send_raw_transaction`, but critically earlier: `prepare_fire` runs
+*synchronously* inside `control_loop`'s single `while let Some(msg) =
+control_rx.recv().await { match msg { ... } }` loop. There is no
+`tokio::spawn` around it anywhere — it's called directly from the
+`ControlMsg::Prepare` handler, from `FireNow`'s no-prior-prepare
+fallback, and from `FireCopymint`. A stall in any of these three reads
+therefore doesn't hang one task — it hangs `control_loop` itself, the
+single consumer of `state.control_tx`, meaning no further Arm, Disarm,
+Prepare, or FireNow message is EVER processed again for the rest of
+that process's life. And because `prepare_fire`'s first log line
+(`"wallet prepared"`) only fires after all three reads AND signing
+succeed, a stall here produces genuinely zero log output — exactly the
+reported symptom, and a stronger, earlier-in-the-chain match than
+anything step 33 touched.
+
+**3. `ControlMsg`/channel — traced, and it explains a real secondary
+symptom, not the root cause.** `state.control_tx` is a bounded
+`mpsc::channel::<ControlMsg>(8)`; both `/api/arm` and `/api/abort`
+(`api.rs`) send into it via a plain blocking `.send(...).await` with the
+result discarded (`let _ = ...`). Once `control_loop` is stuck inside
+`prepare_fire` (per #2), every subsequent HTTP-triggered control message
+— including the operator's own `/api/abort` sent after
+`run-benchmark.sh`'s 40s `FIRE_TIMEOUT_SECS` — queues up unprocessed
+rather than erroring, so the bot's entire HTTP control surface
+eventually degrades too, not just the one stuck fire. This is real and
+worth knowing, but it is a *consequence* of #2's stall, not an
+independent root cause: the "fresh process, first fire, still hangs"
+detail in the live report rules out a channel-buildup-across-cycles
+explanation specifically, since a freshly restarted process's very
+first fire can't have any stale queued messages from a prior cycle to
+build up in the first place.
+
+**4. Re-checked whether 28a/28b sits anywhere in this earlier path —
+it doesn't, and the timing correlation is most likely coincidental, not
+causal.** `prepare_fire` is untouched by 28a, 28b, and step 33 — all
+three were scoped to `fire_prepared` (28a, 33) and `Config::validate()`
+(28b), confirmed by re-reading `prepare_fire` end to end and comparing
+against those commits' actual diffs. This gap predates all of them.
+The honest read of the evidence: this was always a latent, unbounded-
+read bug in `prepare_fire`, sitting dormant until an ordinary transient
+RPC stall — a real, unremarkable failure mode on any public testnet,
+not something 28a/28b introduced — happened to trigger it around the
+same time those changes landed. Timing correlation was a reasonable
+first hypothesis to chase (this project's own standing rule is to
+verify rather than assume either way), but tracing the actual code does
+not support a causal link, and stating that plainly here is preferable
+to leaving an unsupported correlation standing.
+
+**Fixed:** `executor.rs` — a new `timed_read` helper wraps each of
+`prepare_fire`'s three read calls in a timeout (`PREPARE_READ_TIMEOUT` =
+10s, same generous-but-bounded reasoning as step 33's
+`SEND_RAW_TX_TIMEOUT`; parameterized rather than hardcoded internally,
+so it's independently testable with a short duration). alloy's call-
+builder types (`estimate_gas`'s `EthCall`) implement `IntoFuture` rather
+than `Future` directly, so `timed_read` is generic over `IntoFuture` to
+cover both plain-future and builder-style provider calls with one
+helper. A timeout now produces a loud `anyhow` error — `"{what} timed
+out after {ms}ms"` — that flows through `prepare_fire`'s existing
+`?`-based error propagation into the SAME logging paths its other
+errors (e.g. a revert during `estimate_gas`) already use (`bus::log(...,
+"error", format!("prepare failed: {e:#}"))` for the `Prepare` handler;
+`fire_result`'s `Err` branch for `FireNow`'s fallback) — no new error-
+handling plumbing needed, the existing paths were already correct once
+the stall itself can no longer be silent and indefinite.
+
+**Regression-tested, not just asserted fixed:**
+`timed_read_never_hangs_on_a_stalled_provider_call` — a mock RPC that
+never responds to `eth_chainId` proves `timed_read` resolves to a loud,
+"timed out"-labeled `Err` within a short 200ms test timeout (not the
+real 10s production one), and completes well under 2s real time —
+proving the actual bounding mechanism without making the test slow,
+same approach as step 33's own `send_raw_tx_with_timeout` test.
+
+**What this section does NOT claim:** that a stall specifically inside
+`get_chain_id`/`get_gas_price`/`estimate_gas` is PROVEN to be what
+happened on those two specific live VPS runs — that would require a
+live debugger or a captured stack trace from a run that's already over,
+neither of which exists. What IS established, with evidence: this is a
+real, previously-unfixed, structurally-identical-to-step-33 gap that
+sits earlier in the exact call chain the live symptom points to, is the
+only candidate found (after also checking locks and the channel, both
+ruled out) that fully explains "TRIGGER logs, then genuinely zero
+output, indefinitely," and is now closed and regression-tested. If a
+third live occurrence happens post-fix, `journalctl` will now show
+either a real `"wallet prepared"` line (success) or a loud `"... timed
+out after 10000ms"` error (the exact failure this section targets) —
+either way, never silence again for this specific mechanism.
+
+**Handed to the operator:** the next live benchmark run (whenever the
+operator next runs it) is the actual confirmation this fix works in
+production, same standard step 33 already established — if TRIGGER is
+followed by silence a third time post-fix, that is new information (this
+specific mechanism is ruled out, something else earlier still is,
+narrowed down by exactly what did/didn't log) rather than a regression
+of this fix.
+
+cargo build/test (143/143, up from 142 — 1 new `executor::tests`)/clippy
+--all-targets -- -D warnings clean. All 10 `deploy/tests/*` pass,
+unmodified this round. No UI changes this round.
