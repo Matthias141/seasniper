@@ -112,6 +112,8 @@ pub async fn run_audit_writer(bus: EventBus, path: String) {
                 send_to_ack_ms,
                 dispatch_to_inclusion_ms,
                 prepare_age_ms,
+                ack_source,
+                acked_url,
             } => (
                 "mint_result",
                 serde_json::json!({
@@ -126,6 +128,13 @@ pub async fn run_audit_writer(bus: EventBus, path: String) {
                     "send_to_ack_ms": send_to_ack_ms,
                     "dispatch_to_inclusion_ms": dispatch_to_inclusion_ms,
                     "prepare_age_ms": prepare_age_ms,
+                    // STEP 28 (final) — "sequencer"/"backup"/null and the
+                    // redacted URL that actually acked this send, now in
+                    // the durable audit trail (see bus.rs's own doc
+                    // comment on these two fields for why — this used to
+                    // only ever reach tracing::info!/journalctl).
+                    "ack_source": ack_source,
+                    "acked_url": acked_url,
                 }),
             ),
             ServerEvent::ConfigChanged => ("config_change", serde_json::json!({})),

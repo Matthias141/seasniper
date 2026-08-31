@@ -55,6 +55,26 @@ pub enum ServerEvent {
         /// `POLL_STATE_REPREPARE_INTERVAL_SECS` in poll_state mode. Always
         /// set — every fired wallet has a real `prepared_at`.
         prepare_age_ms: u64,
+        /// STEP 28 (final) — which submission path actually acked this
+        /// send: `"sequencer"` or `"backup"` (an `http_rpc_urls` entry),
+        /// or `None` if no send was ever acked at all (every broadcast
+        /// attempt failed outright). Before this field existed, this
+        /// exact "which path won the race" evidence only ever reached
+        /// `tracing::info!`/journalctl (`executor.rs`'s "using this
+        /// URL's ack" line) — never the durable audit trail, which is
+        /// precisely what made an earlier benchmark's dispatch-to-
+        /// inclusion improvement unattributable after journalctl's
+        /// retention window passed (see CLAUDE.md's step 28 section).
+        /// Every consumer that already receives `MintResult` (the UI,
+        /// `audit.rs`'s persisted `audit.log`) gets this for free now —
+        /// no journalctl access needed to answer "sequencer or backup"
+        /// for any past fire.
+        ack_source: Option<&'static str>,
+        /// The redacted (scheme+host only, via `config::redact_rpc_url`
+        /// — never the raw URL, which may embed an API key in its path)
+        /// URL that actually acked this send. `None` alongside
+        /// `ack_source: None` when nothing acked.
+        acked_url: Option<String>,
     },
     /// Emitted by `api::put_config` after a validated config write. Kept as
     /// its own typed variant, not folded into `Log`, specifically so
