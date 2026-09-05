@@ -41,6 +41,7 @@ use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use anyhow::{Context, Result};
+use std::future::IntoFuture;
 
 pub const SEADROP_1_0_MAINNET: &str = "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5";
 
@@ -59,10 +60,50 @@ pub struct PublicDropInfo {
 ///   mintPrice: uint80, startTime: uint48, endTime: uint48,
 ///   maxTotalMintableByWallet: uint16, feeBps: uint16,
 ///   restrictFeeRecipients: bool
+///
+/// STEP 35 — the read is bounded by `SEADROP_READ_TIMEOUT` (see
+/// `fetch_public_drop_with_timeout`). Signature unchanged; every caller
+/// sees the same `Result` it already handles.
 pub async fn fetch_public_drop(
     http_rpc: &str,
     seadrop: Address,
     nft_contract: Address,
+) -> Result<PublicDropInfo> {
+    fetch_public_drop_with_timeout(http_rpc, seadrop, nft_contract, SEADROP_READ_TIMEOUT).await
+}
+
+/// STEP 35 — generous-but-bounded ceiling for one `getPublicDrop` read,
+/// matching steps 33/34's 10s convention. Every measured read latency in
+/// this project is sub-second (n=100 p99 was 414ms — see CLAUDE.md's step
+/// 28 (final close, corrected)), so 10s is far above a slow-but-real
+/// network path and far below "hang forever". This function runs on
+/// main.rs's boot-time fetch (a stalled read there now fails boot loudly,
+/// see `fetch_public_drop_with_timeout`'s doc below) and on main.rs's
+/// Prepare-time price re-check — the latter runs synchronously inside
+/// `control_loop`, so an unbounded read there could hang the entire bot
+/// the same way `prepare_fire`'s reads did before step 34. (copymint's
+/// own fetch_public_drop calls run in the copymint watcher task and in
+/// axum request handlers — separate tasks, not the synchronous
+/// `control_loop` path — so they are not the whole-bot hang this bound
+/// exists for.)
+const SEADROP_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// STEP 35 — the actual `getPublicDrop` read, bounded by `timeout`. A
+/// timeout returns a loud `anyhow` error in `timed_read`'s shape
+/// ("getPublicDrop timed out after {ms}ms"), which every caller already
+/// handles: main.rs's boot-time `?` (a stalled RPC now fails boot with a
+/// clear context instead of hanging forever), main.rs's Prepare-time
+/// re-check `match` (logs "mint price re-check failed ... using last known
+/// value"), and the copymint/target/delegated callers' existing Err paths —
+/// never silence. Inlined here rather than reusing `executor::timed_read`
+/// to avoid a seadrop→executor module dependency. Takes `timeout` as a
+/// parameter for independent testability with a short duration, same
+/// reasoning as `executor`'s timeout helpers.
+async fn fetch_public_drop_with_timeout(
+    http_rpc: &str,
+    seadrop: Address,
+    nft_contract: Address,
+    timeout: std::time::Duration,
 ) -> Result<PublicDropInfo> {
     let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(http_rpc.parse()?);
 
@@ -74,10 +115,13 @@ pub async fn fetch_public_drop(
     let calldata = func.abi_encode_input(&[DynSolValue::Address(nft_contract)])?;
     let tx = TransactionRequest::default().to(seadrop).input(calldata.into());
 
-    let raw = provider
-        .call(tx)
-        .await
-        .context("getPublicDrop call failed — check seadrop address and chain")?;
+    // `.into_future()` — `provider.call(tx)` is an alloy `IntoFuture`
+    // builder, not a `Future` directly; same conversion `executor`'s
+    // `timed_read` uses before handing the call to `tokio::time::timeout`.
+    let raw = match tokio::time::timeout(timeout, provider.call(tx).into_future()).await {
+        Ok(inner) => inner.context("getPublicDrop call failed — check seadrop address and chain")?,
+        Err(_elapsed) => anyhow::bail!("getPublicDrop timed out after {}ms", timeout.as_millis()),
+    };
 
     let decoded = func
         .abi_decode_output(&raw)
@@ -208,6 +252,7 @@ pub fn encode_mint_public(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::post, Json, Router};
 
     #[test]
     fn encode_mint_public_matches_known_good_calldata() {
@@ -238,5 +283,67 @@ mod tests {
 
         assert_eq!(calldata, expected);
         assert_eq!(calldata.len(), 4 + 4 * 32); // selector + 4 words, no more no less
+    }
+
+    /// A minimal JSON-RPC mock whose handler never responds — simulates a
+    /// stalled TCP/RPC connection with no timeout of its own, the exact
+    /// shape STEP 35's fix targets. Sleeps far longer than any timeout used
+    /// against it below, so the test genuinely exercises "never responds,"
+    /// not "responds slowly." Mirrors executor.rs's own
+    /// `spawn_mock_hanging_rpc` (deliberately replicated, not imported —
+    /// keeps seadrop.rs free of an executor dependency, same reason the
+    /// timeout itself is inlined here).
+    async fn spawn_hanging_rpc() -> String {
+        let handler = |Json(_body): Json<serde_json::Value>| async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            Json(serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": "unreachable — timeout should fire first"}))
+        };
+        let app = Router::new().route("/", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}/")
+    }
+
+    /// STEP 35 regression test — `fetch_public_drop`'s `provider.call(tx)
+    /// .await` had no timeout, and it runs on main.rs's boot-time fetch
+    /// and on main.rs's Prepare-time price re-check inside `control_loop`
+    /// — synchronous there, so a stalled RPC could hang the entire bot the
+    /// same way `prepare_fire`'s reads did before step 34. A mock RPC that
+    /// never responds proves the
+    /// timeout resolves to a loud, "timed out"-labeled Err within a short
+    /// 200ms test timeout (not the real 10s `SEADROP_READ_TIMEOUT`) and
+    /// completes well under 2s — same "prove the mechanism, don't make the
+    /// test slow" approach as executor.rs's step 33/34 timeout tests.
+    /// Reverting the wrapper makes this test hang — the exact regression
+    /// it exists to catch.
+    #[tokio::test]
+    async fn fetch_public_drop_never_hangs_on_a_stalled_rpc() {
+        let mock_url = spawn_hanging_rpc().await;
+        let seadrop: Address = SEADROP_1_0_MAINNET.parse().unwrap();
+        let nft_contract: Address = "0x603a481580c8Cf85ee169b315653bd9D33C39e52".parse().unwrap();
+
+        let started = std::time::Instant::now();
+        let result = fetch_public_drop_with_timeout(
+            &mock_url,
+            seadrop,
+            nft_contract,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("a stalled getPublicDrop read must resolve to an Err, not hang or silently succeed");
+        assert!(
+            err.to_string().contains("timed out"),
+            "the error should clearly say this was a timeout, not some other failure: {err}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "fetch_public_drop took {elapsed:?} against a 200ms timeout — it did not actually bound the wait, \
+             which is the exact regression (step 35's silent bot-wide hang) this test exists to catch"
+        );
     }
 }

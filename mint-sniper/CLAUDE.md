@@ -4386,3 +4386,175 @@ of this fix.
 cargo build/test (143/143, up from 142 — 1 new `executor::tests`)/clippy
 --all-targets -- -D warnings clean. All 10 `deploy/tests/*` pass,
 unmodified this round. No UI changes this round.
+
+## Step 35 — the same silent-hang gap, closed for every remaining synchronous read control_loop can reach: the arm-time warm probes and the Prepare-time getPublicDrop re-check
+
+Steps 33 and 34 established this codebase's one structural single point
+of failure and the rule for guarding it: any unbounded `.await` executed
+*synchronously* inside `control_loop`'s single `while let Some(msg) =
+control_rx.recv().await { match msg { ... } }` loop is a whole-bot hang —
+control_loop is the only consumer of `state.control_tx`, so a stall there
+means no further Arm, Disarm, Prepare, or FireNow message is ever
+processed again for the rest of that process's life. Step 34 closed the
+three `prepare_fire` reads (the then-latest gap found). But applying that
+same audit criterion exhaustively — "every synchronous network operation
+reachable from control_loop must be bounded" — to the rest of the loop's
+synchronous path found three more real, structurally-identical gaps, each
+a plain unbounded `.await` on a code path that runs inside control_loop
+(or on the boot path, with the same silent-hang shape):
+
+**1. `warm_connections`'s per-provider warm probe had no timeout.**
+`executor::warm_connections` probes each configured RPC with a
+`get_block_number()` read to force its TCP/TLS handshake ahead of
+arm-time. It runs synchronously inside control_loop's `Arm` handler
+(main.rs, immediately before the watcher spawns or the UI sees "armed"),
+and *again* in both `FireNow`'s and `FireCopymint`'s just-in-time
+fallback paths (main.rs, when `warmed_providers` is empty). A stalled
+connection — an ordinary transient failure on any public RPC — hung that
+`.await` forever, with zero log output (the probe only logs after the
+`.await` resolves): exactly step 34's "something logged, then silence"
+shape, and via the JIT fallbacks it hung control_loop itself, not just
+arm-time.
+
+**2. `warm_sequencer`'s `eth_chainId` probe had the same no-timeout gap**,
+on the same three call sites (Arm handler + both JIT fallbacks). Identical
+consequence: a stalled sequencer connection silently hung arm-time (or the
+whole bot, via a fallback) with nothing logged.
+
+**3. `seadrop::fetch_public_drop`'s `getPublicDrop` read had no timeout.**
+It runs on main.rs's boot-time fetch (a stall there hung boot forever with
+no log) and — the critical one — on the Prepare-time mint-price re-check
+(main.rs, seadrop mode outside timestamp mode), which runs synchronously
+inside control_loop's `Prepare` handler. A stalled `getPublicDrop` there
+hangs the entire bot exactly the way `prepare_fire`'s reads did before
+step 34.
+
+**Fixed:** three new generous-but-bounded ceilings, all
+`Duration::from_secs(10)`, all matching steps 33/34's established
+convention — far above every latency this project has ever measured (n=100
+p99 was 414ms — see step 28 (final close, corrected) above), far below
+"hang forever" — and all parameterized (not hardcoded internally) so each
+wrapper is independently testable with a short duration, same reasoning as
+`send_raw_tx_with_timeout`/`timed_read`:
+
+- **`WARM_CONNECTION_TIMEOUT` (executor.rs, 10s).** New
+  `warm_connection_with_timeout` wraps one `provider.get_block_number()`
+  probe in `tokio::time::timeout`. alloy's provider calls are
+  `IntoFuture` builders, not `Future`s directly, so the call gets
+  `.into_future()` first — the same conversion `timed_read` already uses.
+  Result classification preserves the existing transport-failure
+  semantics: `Ok(Ok(_))` logs `info` ("connection warmed"); an
+  `Ok(Err(e))` transport error logs `warn` ("will still be used, just
+  cold"); and an `Err(_elapsed)` timeout — a transport-level failure by
+  definition, since a genuine stall produces no response at all — logs
+  `warn` via BOTH `bus::log` (UI event feed) and `warn!` (durable
+  `journalctl`), step 17's "both, not either" standard. In every
+  non-success case the provider is still returned, cold-but-usable,
+  exactly matching the pre-existing transport-failure branch's shape: a
+  cold connection is acceptable, a silent indefinite wait is not.
+- **`WARM_SEQUENCER_TIMEOUT` (executor.rs, 10s).** New
+  `warm_sequencer_with_timeout` wraps the `eth_chainId` probe identically,
+  with one deliberate distinction that preserves step 21b's finding about
+  this write-only endpoint: a well-formed JSON-RPC error response
+  (`is_error_resp()`, the endpoint's expected `-32601`) proves the TCP/TLS
+  handshake and request parsing succeeded and still logs `info` — only a
+  genuine transport-level failure (DNS/connection/TLS/this timeout, none
+  of which produce a JSON-RPC payload) logs `warn`. The `Err(_elapsed)`
+  timeout branch logs `warn` via both channels and still returns the
+  provider.
+- **`SEADROP_READ_TIMEOUT` (seadrop.rs, 10s).** `fetch_public_drop`'s
+  public signature is unchanged — every caller sees the same
+  `Result<PublicDropInfo>` it already handles — and now delegates to a new
+  `fetch_public_drop_with_timeout`, which wraps the `getPublicDrop`
+  `provider.call(tx)` (with the same `.into_future()` conversion) in
+  `tokio::time::timeout`. A timeout is a loud `anyhow` error in
+  `timed_read`'s exact shape — `"getPublicDrop timed out after {ms}ms"` —
+  that every existing caller already handles correctly: the boot-time `?`
+  (a stalled RPC now fails boot loudly with clear context instead of
+  hanging forever), the Prepare-time re-check's `match` (logs "mint price
+  re-check failed ... using last known value" and continues), and the
+  copymint/target callers' existing `Err` paths — never silence. The
+  wrapper is inlined in seadrop.rs rather than reusing
+  `executor::timed_read` to avoid a seadrop→executor module dependency
+  (same reason its test RPC mock below is replicated, not imported).
+
+**Regression-tested, not just asserted fixed** — three new
+stalled-connection tests, each proving the bounding mechanism with a mock
+RPC whose handler sleeps an hour (genuinely "never responds," not "slow"),
+a short 200ms test timeout (not the real 10s production constant), and a
+real-time bound of well under 2s — the same "prove the mechanism, don't
+make the test slow" approach as steps 33/34's own timeout tests. Reverting
+the corresponding wrapper makes each of these tests hang — the exact
+regression each exists to catch:
+
+- `executor::warm_connection_with_timeout_never_hangs_on_a_stalled_connection`
+  — asserts completion < 2s AND that the last `bus` log level is `warn`
+  (STEP 35's whole point: a timed-out warm must be UI-visible, not
+  silent).
+- `executor::warm_sequencer_with_timeout_never_hangs_on_a_stalled_connection`
+  — same shape for the sequencer probe, asserting the timeout logs `warn`
+  (a transport-level warm failure), NOT the write-only endpoint's
+  expected-`info` case — with step 21b's `is_error_resp()` classification
+  untouched (the two existing `warm_sequencer_*` tests pass unmodified).
+- `seadrop::fetch_public_drop_never_hangs_on_a_stalled_rpc` — asserts the
+  stalled `getPublicDrop` resolves to a loud, "timed out"-labeled `Err`
+  within 200ms and completes < 2s.
+
+The existing STEP 33/34 regression tests
+(`send_raw_tx_with_timeout_never_hangs_on_a_stalled_connection`,
+`timed_read_never_hangs_on_a_stalled_provider_call`,
+`a_panicking_wallet_task_produces_a_logged_result_not_silence`) all pass
+unmodified, confirming the earlier protections were preserved, not
+displaced.
+
+**The control_loop liveness guarantee this completes.** Taken together
+with what preceded it, every network read or write executed synchronously
+inside `control_loop`'s single message loop now sits behind an explicit
+timeout: `prepare_fire`'s three reads (`timed_read`,
+`PREPARE_READ_TIMEOUT` = 10s, step 34), every broadcast
+(`send_raw_tx_with_timeout`, `SEND_RAW_TX_TIMEOUT` = 10s, plus
+`await_all_and_report_panics`, step 33), post-dispatch inclusion detection
+(bounded by `inclusion_timeout_ms`, step 14a), the arm-time block ticker's
+own 5s connect ceiling (step 14a), and now the arm-time/JIT-fallback warm
+probes (`WARM_CONNECTION_TIMEOUT`, `WARM_SEQUENCER_TIMEOUT` = 10s) and the
+Prepare-time `getPublicDrop` re-check (`SEADROP_READ_TIMEOUT` = 10s).
+There is no remaining unbounded `.await` on that synchronous path: a
+stalled RPC — a real, unremarkable failure mode on any public testnet —
+can no longer hang the entire bot from inside control_loop, which is the
+only failure mode steps 33/34/35 exist to eliminate.
+
+**What this section does NOT claim:** that every network operation in the
+application is now bounded. It is not, and this step deliberately does not
+bound the rest, because none of the still-unbounded reads run synchronously
+on control_loop's critical path — a stall in any of them degrades only
+that one task or HTTP request, never the single-writer loop:
+
+- `seadrop::is_fee_recipient_allowed` — runs on main.rs's boot-time
+  `restrictFeeRecipients` check and inside `target::resolve_address` (an
+  axum request handler). A stall there hangs boot or one
+  `/api/target/resolve` request, not the bot.
+- `seadrop::fetch_mint_stats` — runs in copymint's per-wallet eligibility
+  check (a spawned/request task), never on the parallel-EOA hot fire path
+  (step 31b's own design note).
+- The background poll loops — `balance_poll_loop`'s `get_balance` and
+  `rpc_health_poll_loop`'s `get_block_number` — run in their own spawned
+  tasks with no control_loop involvement.
+- The copymint watcher task's and the target/copymint axum handlers' own
+  `fetch_public_drop` calls — separate tasks, and a stall there was never
+  a control_loop hang (they do now inherit the 10s bound incidentally,
+  since `fetch_public_drop`'s unchanged signature delegates to the wrapper,
+  but they are not the whole-bot hang this bound exists for),
+  `run_delegated_mint`'s internals (deliberately `tokio::spawn`'d so a
+  long run never blocks control_loop), and `wallet::load_wallets`'s
+  boot-time reads.
+
+Bounding those would be legitimate future work with a different motivation
+(task/request liveness, not control_loop liveness) — out of scope here
+precisely because this step's guarantee is scoped and specific: the
+synchronous control_loop-critical path is now fully bounded.
+
+cargo build/test (146/146, up from 143 — 2 new `executor::tests` + 1 new
+`seadrop::tests`)/clippy --all-targets -- -D warnings clean (no new
+dependency — `std::future::IntoFuture` and `tokio::time` were already
+available). All 10 `deploy/tests/*` pass, unmodified this round. No UI
+changes this round.

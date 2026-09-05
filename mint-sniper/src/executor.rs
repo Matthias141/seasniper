@@ -9,6 +9,7 @@ use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use rand::Rng;
+use std::future::IntoFuture;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -41,19 +42,52 @@ pub async fn warm_connections(cfg: &Config, bus: &EventBus) -> Vec<HttpProvider>
             }
         };
         let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(parsed);
-
-        match provider.get_block_number().await {
-            Ok(_) => bus::log(bus, "info", format!("connection warmed: {url}")),
-            Err(e) => bus::log(
-                bus,
-                "warn",
-                format!("connection warm failed for {url} (will still be used, just cold): {e}"),
-            ),
-        }
-        providers.push(provider);
+        providers.push(warm_connection_with_timeout(bus, provider, url, WARM_CONNECTION_TIMEOUT).await);
     }
 
     providers
+}
+
+/// STEP 35 — generous-but-bounded ceiling for one arm-time connection-warm
+/// `get_block_number` probe, matching steps 33/34's 10s convention. Every
+/// measured latency in this project is sub-second (n=100 p99 was 414ms —
+/// see CLAUDE.md's step 28 (final close, corrected)), so 10s is far above
+/// a slow-but-real network path and far below "hang forever".
+const WARM_CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// STEP 35 — one `get_block_number()` warm probe, bounded so a stalled
+/// connection can never hang arm-time processing (or, via FireNow/
+/// FireCopymint's JIT fallback, `control_loop` itself) forever. Same
+/// generous-but-bounded philosophy and log-and-continue shape as the
+/// existing transport-failure branch: a cold connection is acceptable,
+/// just not a silent indefinite wait. A timeout logs via BOTH `bus::log`
+/// (UI) and `warn!` (durable `journalctl`) — step 17's "both, not either"
+/// standard. Takes `timeout` as a parameter so it's independently testable
+/// with a short duration, same reasoning as
+/// `send_raw_tx_with_timeout`/`timed_read`.
+async fn warm_connection_with_timeout(bus: &EventBus, provider: HttpProvider, url: &str, timeout: std::time::Duration) -> HttpProvider {
+    // `.into_future()` — alloy's provider calls are `IntoFuture` builders,
+    // not `Future`s directly; same conversion `timed_read` uses.
+    match tokio::time::timeout(timeout, provider.get_block_number().into_future()).await {
+        Ok(Ok(_)) => bus::log(bus, "info", format!("connection warmed: {url}")),
+        Ok(Err(e)) => bus::log(
+            bus,
+            "warn",
+            format!("connection warm failed for {url} (will still be used, just cold): {e}"),
+        ),
+        Err(_elapsed) => {
+            warn!(
+                "connection warm timed out after {}ms for {url} (will still be used, just cold)",
+                timeout.as_millis()
+            );
+            bus::log(
+                bus,
+                "warn",
+                format!("connection warm timed out after {}ms for {url} (will still be used, just cold)", timeout.as_millis()),
+            );
+        }
+    }
+    provider
 }
 
 /// Same arm-time TCP/TLS handshake as `warm_connections`, for the optional sequencer URL.
@@ -101,20 +135,55 @@ pub async fn warm_sequencer(cfg: &Config, bus: &EventBus) -> Option<HttpProvider
         }
     };
     let provider = ProviderBuilder::new().disable_recommended_fillers().connect_http(parsed);
-    match provider.raw_request::<_, serde_json::Value>("eth_chainId".into(), [(); 0]).await {
-        Ok(_) => bus::log(bus, "info", format!("sequencer connection warmed: {url}")),
-        Err(e) if e.is_error_resp() => bus::log(
+    Some(warm_sequencer_with_timeout(bus, provider, url, WARM_SEQUENCER_TIMEOUT).await)
+}
+
+/// STEP 35 — generous-but-bounded ceiling for one arm-time sequencer-warm
+/// `eth_chainId` probe, matching steps 33/34's 10s convention (n=100 p99
+/// was 414ms — see CLAUDE.md's step 28 (final close, corrected)).
+const WARM_SEQUENCER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// STEP 35 — one `eth_chainId` warm probe, bounded like
+/// `warm_connection_with_timeout` so a stalled sequencer connection can't
+/// hang arm-time processing forever. A timeout is a transport-level warm
+/// failure (a genuine stall produces no JSON-RPC response at all), so it
+/// logs the same "will still be used, just cold" warning as the existing
+/// transport-error branch — it is NOT the write-only endpoint's expected
+/// `-32601` (`is_error_resp()`), which stays `info` per the step 21b
+/// finding (a JSON-RPC error response proves the TCP/TLS handshake and
+/// request parsing succeeded; only transport-level failures are real warm
+/// failures). Logs via BOTH `bus::log` (UI) and `warn!` (durable
+/// `journalctl`) — step 17's "both, not either" standard. Takes `timeout`
+/// as a parameter for independent testability, same reasoning as
+/// `send_raw_tx_with_timeout`/`timed_read`.
+async fn warm_sequencer_with_timeout(bus: &EventBus, provider: HttpProvider, url: &str, timeout: std::time::Duration) -> HttpProvider {
+    // `.into_future()` — same alloy `IntoFuture`-builder conversion as
+    // `timed_read`/`warm_connection_with_timeout`.
+    match tokio::time::timeout(timeout, provider.raw_request::<_, serde_json::Value>("eth_chainId".into(), [(); 0]).into_future()).await {
+        Ok(Ok(_)) => bus::log(bus, "info", format!("sequencer connection warmed: {url}")),
+        Ok(Err(e)) if e.is_error_resp() => bus::log(
             bus,
             "info",
             format!("sequencer connection warmed: {url} (write-only endpoint, as expected: {e})"),
         ),
-        Err(e) => bus::log(
+        Ok(Err(e)) => bus::log(
             bus,
             "warn",
             format!("sequencer warm failed for {url} (will still be used, just cold): {e}"),
         ),
+        Err(_elapsed) => {
+            warn!(
+                "sequencer warm timed out after {}ms for {url} (will still be used, just cold)",
+                timeout.as_millis()
+            );
+            bus::log(
+                bus,
+                "warn",
+                format!("sequencer warm timed out after {}ms for {url} (will still be used, just cold)", timeout.as_millis()),
+            );
+        }
     }
-    Some(provider)
+    provider
 }
 
 /// `None` means skip gen_range and skip sleep entirely (including sleep(0)).
@@ -779,7 +848,8 @@ fn apply_pct_jitter(value: u128, pct: i64) -> u128 {
 mod tests {
     use super::{
         apply_pct_jitter, await_all_and_report_panics, classify_ack_source, fire_prepared, sample_fire_jitter_ms,
-        send_raw_tx_with_timeout, timed_read, warm_sequencer, HttpProvider, PreparedWallet, SendAttempt,
+        send_raw_tx_with_timeout, timed_read, warm_connection_with_timeout, warm_sequencer,
+        warm_sequencer_with_timeout, HttpProvider, PreparedWallet, SendAttempt,
     };
     use crate::bus;
     use alloy::consensus::{Eip658Value, Receipt, ReceiptEnvelope, ReceiptWithBloom};
@@ -1131,6 +1201,86 @@ mod tests {
             elapsed < std::time::Duration::from_secs(2),
             "timed_read took {elapsed:?} against a 200ms timeout — it did not actually bound the wait, \
              which is the exact regression (step 34's silent bot-wide hang) this test exists to catch"
+        );
+    }
+
+    /// STEP 35 regression test — the same unbounded-`.await` bug class steps
+    /// 33/34 closed, one call earlier in arm-time: `warm_connections`'s
+    /// `get_block_number` probe had no timeout, so a stalled connection
+    /// hung arm-time processing forever with nothing ever logged (and, via
+    /// FireNow/FireCopymint's JIT fallback, the whole `control_loop`). A
+    /// mock RPC that never responds proves the timeout resolves to a loud,
+    /// bus-visible warn within a short 200ms test timeout (not the real 10s
+    /// `WARM_CONNECTION_TIMEOUT`), still returns the provider
+    /// (cold-but-usable, matching the existing transport-failure shape),
+    /// and completes well under 2s. Reverting the wrapper makes this test
+    /// hang — the exact regression it exists to catch.
+    #[tokio::test]
+    async fn warm_connection_with_timeout_never_hangs_on_a_stalled_connection() {
+        let mock_url = spawn_mock_hanging_rpc().await;
+        let provider: HttpProvider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(mock_url.parse().unwrap());
+        let bus = bus::new_bus();
+        let mut rx = bus.subscribe();
+
+        let started = std::time::Instant::now();
+        // Returns HttpProvider (not Option) — the provider is structurally
+        // always returned, cold-but-usable exactly like the existing
+        // transport-failure branch; binding it makes that explicit rather
+        // than leaving the return value silently discarded.
+        let _warmed = warm_connection_with_timeout(&bus, provider, &mock_url, std::time::Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "warm_connection_with_timeout took {elapsed:?} against a 200ms timeout — it did not actually bound the wait, \
+             which is the exact regression (step 35's arm-time hang) this test exists to catch"
+        );
+
+        let level = last_log_level(&mut rx);
+        assert_eq!(
+            level.as_deref(),
+            Some("warn"),
+            "a timed-out warm must log a warn (UI-visible) — STEP 35's whole point is no silent waits"
+        );
+    }
+
+    /// STEP 35 regression test — `warm_sequencer`'s `eth_chainId` probe had
+    /// the same no-timeout gap. A stalled connection must resolve to a loud
+    /// warn (not hang), still return the provider, and stay bounded — while
+    /// the write-only-endpoint `is_error_resp()` classification (step 21b)
+    /// remains untouched (the two existing `warm_sequencer_*` tests above
+    /// cover that and pass unmodified). A timeout is a transport-level warm
+    /// failure (a genuine stall produces no JSON-RPC response at all), so it
+    /// must log `warn`, not the expected-`-32601` `info`. 200ms test timeout
+    /// (not the real 10s `WARM_SEQUENCER_TIMEOUT`); reverting the wrapper
+    /// makes this test hang.
+    #[tokio::test]
+    async fn warm_sequencer_with_timeout_never_hangs_on_a_stalled_connection() {
+        let mock_url = spawn_mock_hanging_rpc().await;
+        let provider: HttpProvider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(mock_url.parse().unwrap());
+        let bus = bus::new_bus();
+        let mut rx = bus.subscribe();
+
+        let started = std::time::Instant::now();
+        let _warmed = warm_sequencer_with_timeout(&bus, provider, &mock_url, std::time::Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "warm_sequencer_with_timeout took {elapsed:?} against a 200ms timeout — it did not actually bound the wait, \
+             which is the exact regression (step 35's arm-time hang) this test exists to catch"
+        );
+
+        let level = last_log_level(&mut rx);
+        assert_eq!(
+            level.as_deref(),
+            Some("warn"),
+            "a timed-out sequencer warm must log a warn — a timeout is a transport-level warm failure, \
+             not the write-only endpoint's info case"
         );
     }
 
